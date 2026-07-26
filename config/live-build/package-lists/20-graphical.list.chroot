@@ -1,0 +1,26 @@
+# --- X server, window manager, boot splash, kiosk UI -------------------------
+xserver-xorg-core
+xserver-xorg
+xserver-xorg-legacy
+xserver-xorg-input-all
+xserver-xorg-video-all
+xinit
+x11-xserver-utils
+x11-utils
+openbox
+unclutter
+feh
+xterm
+xdotool
+yad
+plymouth
+plymouth-label
+plymouth-themes
+fonts-dejavu-core
+fonts-liberation2
+# GPU / video acceleration for the RDP H.264 pipeline
+mesa-va-drivers
+va-driver-all
+libva2
+libva-drm2
+libva-x11-2

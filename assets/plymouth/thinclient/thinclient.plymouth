@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=ThinClient
+Description=ThinClient OS boot splash — dark, silent, appliance-style
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/thinclient
+ScriptFile=/usr/share/plymouth/themes/thinclient/thinclient.script

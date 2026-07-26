@@ -1,0 +1,166 @@
+#!/bin/sh
+# =============================================================================
+#  ThinClient OS — Image customization hook (runs INSIDE the chroot)
+#  Copied by build.sh to config/hooks/live/0100-thinclient-setup.hook.chroot
+#
+#  Turns a plain Debian rootfs into the locked-down RDP appliance:
+#    user + groups, services, security lockdown, plymouth, boot marker.
+#  Idempotent where it can be; failures are fatal (set -e) so a broken image
+#  never ships silently.
+# =============================================================================
+set -e
+echo "I: [thinclient] applying appliance customization"
+
+# ---------------------------------------------------------------------------
+# 1. The single locked-down kiosk user (uid/gid 1000), no interactive login.
+# ---------------------------------------------------------------------------
+if ! getent group thinclient >/dev/null; then
+  groupadd -g 1000 thinclient
+fi
+if ! id thinclient >/dev/null 2>&1; then
+  useradd -m -u 1000 -g 1000 -s /usr/sbin/nologin -c "Thin Client" thinclient
+fi
+# Hardware access for audio/video/input/USB/network — but NOT sudo/adm.
+for g in audio video render input plugdev netdev; do
+  getent group "$g" >/dev/null 2>&1 && usermod -aG "$g" thinclient || true
+done
+# No password can ever log this account in interactively.
+passwd -l thinclient || true
+
+# ---------------------------------------------------------------------------
+# 2. Disable root + guest login entirely.
+# ---------------------------------------------------------------------------
+passwd -l root || true
+usermod -s /usr/sbin/nologin root || true
+
+# ---------------------------------------------------------------------------
+# 3. Boot straight to the graphical (kiosk) target; enable our services.
+# ---------------------------------------------------------------------------
+systemctl set-default graphical.target
+systemctl enable thinclient-firstboot.service
+systemctl enable thinclient-x.service
+systemctl enable thinclient-watchdog.service
+systemctl enable NetworkManager.service || true
+
+# ---------------------------------------------------------------------------
+# 4. No console login prompts anywhere (mask every getty).
+# ---------------------------------------------------------------------------
+for i in 1 2 3 4 5 6; do
+  systemctl mask "getty@tty${i}.service" || true
+done
+systemctl mask serial-getty@ttyS0.service || true
+systemctl mask console-getty.service || true
+systemctl mask getty-static.service || true
+# Prevent logind from spawning gettys on VT switch and cap the VTs.
+mkdir -p /etc/systemd/logind.conf.d
+cat >/etc/systemd/logind.conf.d/10-thinclient.conf <<'EOF'
+[Login]
+NAutoVTs=1
+ReserveVT=7
+KillUserProcesses=no
+HandlePowerKey=poweroff
+HandleLidSwitch=ignore
+EOF
+
+# ---------------------------------------------------------------------------
+# 5. Ensure our scripts are executable and secrets are locked down.
+# ---------------------------------------------------------------------------
+chmod 0755 /opt/thinclient/bin/* 2>/dev/null || true
+chmod 0644 /opt/thinclient/lib/* 2>/dev/null || true
+chmod 0440 /etc/sudoers.d/thinclient 2>/dev/null || true
+chown root:root /etc/sudoers.d/thinclient 2>/dev/null || true
+if [ -f /etc/thinclient/admin.conf ]; then
+  chown root:root /etc/thinclient/admin.conf; chmod 0600 /etc/thinclient/admin.conf
+fi
+if [ -f /etc/thinclient/server.conf ]; then
+  chown root:thinclient /etc/thinclient/server.conf; chmod 0644 /etc/thinclient/server.conf
+fi
+# Validate the sudoers drop-in; abort the build if it is malformed.
+visudo -cf /etc/sudoers.d/thinclient
+
+# ---------------------------------------------------------------------------
+# 6. Log directory + rotation targets.
+# ---------------------------------------------------------------------------
+mkdir -p /var/log/thinclient
+for f in boot rdp watchdog network install thinclient; do
+  : >"/var/log/thinclient/${f}.log"
+done
+chown -R root:thinclient /var/log/thinclient
+chmod 0775 /var/log/thinclient
+
+# ---------------------------------------------------------------------------
+# 7. Security hardening — remove attack surface / avoid pulling a desktop.
+# ---------------------------------------------------------------------------
+# Never run an SSH server; remove if the base pulled one in.
+systemctl disable ssh.service 2>/dev/null || true
+apt-get -y purge openssh-server 2>/dev/null || true
+# Kill magic SysRq (prevents console kill combos on an exposed keyboard).
+mkdir -p /etc/sysctl.d
+cat >/etc/sysctl.d/99-thinclient.conf <<'EOF'
+kernel.sysrq = 0
+kernel.dmesg_restrict = 1
+EOF
+# Blank the message-of-the-day / issue (no info leak on the never-seen console).
+: >/etc/issue || true
+: >/etc/motd || true
+
+# ---------------------------------------------------------------------------
+# 8. NetworkManager owns all interfaces; wired auto-connects.
+# ---------------------------------------------------------------------------
+mkdir -p /etc/NetworkManager/conf.d
+cat >/etc/NetworkManager/conf.d/10-thinclient.conf <<'EOF'
+[main]
+plugins=keyfile
+[device]
+wifi.scan-rand-mac-address=no
+[connection]
+ipv6.ip6-privacy=0
+EOF
+# Ensure NM is not held back by systemd-networkd.
+systemctl disable systemd-networkd.service 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# 9. Xorg wrapper already installed via includes; make sure legacy wrapper set.
+# ---------------------------------------------------------------------------
+# (Xwrapper.config shipped in includes.chroot -> /etc/X11/Xwrapper.config)
+
+# ---------------------------------------------------------------------------
+# 10. Plymouth: use our theme and rebuild the initramfs so it applies at boot.
+# ---------------------------------------------------------------------------
+if command -v plymouth-set-default-theme >/dev/null 2>&1; then
+  plymouth-set-default-theme thinclient || true
+fi
+update-initramfs -u || true
+
+# ---------------------------------------------------------------------------
+# 11. Hostname + locale + timezone defaults.
+# ---------------------------------------------------------------------------
+echo "thinclient" >/etc/hostname
+sed -i 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen 2>/dev/null || true
+locale-gen 2>/dev/null || true
+ln -sf /usr/share/zoneinfo/UTC /etc/localtime || true
+
+# ---------------------------------------------------------------------------
+# 12. Render the branded "Connecting" splash PNG if tooling is available.
+# ---------------------------------------------------------------------------
+if [ -f /opt/thinclient/assets/connecting.svg ]; then
+  if command -v rsvg-convert >/dev/null 2>&1; then
+    rsvg-convert -w 1920 -h 1080 /opt/thinclient/assets/connecting.svg \
+      -o /opt/thinclient/assets/connecting.png || true
+  elif command -v convert >/dev/null 2>&1; then
+    convert -background "#0b1220" /opt/thinclient/assets/connecting.svg \
+      /opt/thinclient/assets/connecting.png || true
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 13. Build marker for diagnostics.
+# ---------------------------------------------------------------------------
+mkdir -p /etc/thinclient
+{
+  echo "product=ThinClient OS"
+  echo "base=Debian $(cat /etc/debian_version 2>/dev/null || echo 13)"
+  echo "built_by=live-build"
+} >/etc/thinclient/build-info
+
+echo "I: [thinclient] customization complete"

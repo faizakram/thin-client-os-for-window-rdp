@@ -1,0 +1,30 @@
+# =============================================================================
+#  ThinClient OS — Test / validation environment
+#  Lightweight Debian 13 image with just enough to lint the scripts, parse
+#  configs, validate FreeRDP argument generation, and exercise the watchdog
+#  and reconnect logic — WITHOUT building a full ISO.
+# =============================================================================
+FROM debian:trixie
+
+ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      bash \
+      shellcheck \
+      freerdp3-x11 \
+      openssl \
+      whois \
+      netcat-openbsd \
+      iproute2 \
+      iputils-ping \
+      gawk \
+      grep \
+      sed \
+      coreutils \
+      procps \
+      ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /project
+
+CMD ["bash", "-lc", "./tests/run-tests.sh"]

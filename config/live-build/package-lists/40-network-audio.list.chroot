@@ -1,0 +1,18 @@
+# --- Networking (NetworkManager + GUI editor for Admin Mode) -----------------
+network-manager
+network-manager-gnome
+iproute2
+iputils-ping
+netcat-openbsd
+wireless-tools
+wpasupplicant
+# --- Audio stack (PipeWire with PulseAudio compat for FreeRDP redirection) ---
+pipewire
+pipewire-pulse
+pipewire-audio
+wireplumber
+libspa-0.2-bluetooth
+# --- USB / camera redirection support ----------------------------------------
+usbutils
+libusb-1.0-0
+v4l-utils

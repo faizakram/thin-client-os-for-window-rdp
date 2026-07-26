@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  ThinClient OS — Configuration CLI
+#  Installed to: /opt/thinclient/bin/thinclient-config
+#
+#  Read/modify /etc/thinclient/server.conf safely from scripts and the admin
+#  GUI. All writes are atomic (temp file + rename) and preserve file mode.
+#
+#  Commands:
+#     get   <KEY> [default]      Print a single value.
+#     set   <KEY> <VALUE>        Set/replace a key (creates it if absent).
+#     list                       Print effective config (PASSWORD redacted).
+#     validate                   Validate the config; exit non-zero on error.
+#     show-command               Print the FreeRDP command (password redacted).
+#     path                       Print the config file path in use.
+# =============================================================================
+set -uo pipefail
+
+source "${TC_LIB_DIR:-/opt/thinclient/lib}"/thinclient-common.sh
+
+usage() {
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-2}"
+}
+
+cmd_get() {
+  local key="${1:?KEY required}"; shift || true
+  conf_get "$key" "${1:-}"
+}
+
+# Atomic, mode-preserving single-key writer.
+cmd_set() {
+  local key="${1:?KEY required}" value="${2-}"
+  [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { log_error "Invalid key name: $key"; return 2; }
+
+  local dir tmp mode
+  dir="$(dirname "$TC_CONF")"
+  mkdir -p "$dir"
+  [[ -f "$TC_CONF" ]] || : >"$TC_CONF"
+  mode="$(stat -c '%a' "$TC_CONF" 2>/dev/null || echo 644)"
+  tmp="$(mktemp "${TC_CONF}.XXXXXX")"
+
+  if grep -qE "^[[:space:]]*${key}[[:space:]]*=" "$TC_CONF" 2>/dev/null; then
+    # Replace the first non-comment occurrence; leave comments intact.
+    awk -v k="$key" -v v="$value" '
+      BEGIN { done=0 }
+      /^[[:space:]]*#/ { print; next }
+      $0 ~ "^[[:space:]]*" k "[[:space:]]*=" && !done { print k "=" v; done=1; next }
+      { print }
+      END { if (!done) print k "=" v }
+    ' "$TC_CONF" >"$tmp"
+  else
+    cat "$TC_CONF" >"$tmp"
+    printf '%s=%s\n' "$key" "$value" >>"$tmp"
+  fi
+
+  chmod "$mode" "$tmp"
+  mv -f "$tmp" "$TC_CONF"
+  log_info "Set ${key} in ${TC_CONF}"
+}
+
+cmd_list() {
+  local key val
+  while IFS= read -r line; do
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+    key="${line%%=*}"; key="$(echo "$key" | tr -d '[:space:]')"
+    val="$(conf_get "$key")"
+    [[ "$key" == "PASSWORD" && -n "$val" ]] && val="********"
+    printf '%s=%s\n' "$key" "$val"
+  done <"$TC_CONF"
+}
+
+cmd_validate() {
+  local ok=0 server port
+  server="$(conf_get SERVER_IP)"
+  port="$(conf_get PORT 3389)"
+  tc_is_valid_host "$server" || { echo "ERROR: SERVER_IP invalid or empty: '$server'"; ok=1; }
+  tc_is_valid_port "$port"   || { echo "ERROR: PORT invalid: '$port'"; ok=1; }
+  [[ -n "$(conf_get USERNAME)" ]] || echo "WARN: USERNAME is empty (user will be prompted)."
+  case "$(conf_get SECURITY nla | tr '[:upper:]' '[:lower:]')" in
+    nla|tls|rdp) : ;;
+    *) echo "WARN: SECURITY should be one of nla|tls|rdp."; ;;
+  esac
+  (( ok == 0 )) && echo "OK: configuration is valid."
+  return $ok
+}
+
+cmd_show_command() {
+  source "${TC_LIB_DIR:-/opt/thinclient/lib}"/rdp-build-args.sh
+  tc_print_rdp_command
+}
+
+case "${1:-}" in
+  get)          shift; cmd_get "$@" ;;
+  set)          shift; cmd_set "$@" ;;
+  list)         cmd_list ;;
+  validate)     cmd_validate ;;
+  show-command) cmd_show_command ;;
+  path)         echo "$TC_CONF" ;;
+  -h|--help|help|"") usage 0 ;;
+  *) echo "Unknown command: $1" >&2; usage 2 ;;
+esac

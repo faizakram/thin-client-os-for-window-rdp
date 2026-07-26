@@ -1,0 +1,478 @@
+<title>ThinClient OS — System Architecture</title>
+<style>
+  :root{
+    color-scheme: dark;
+    --bg:#080d18; --bg-2:#0b1220; --panel:#0e1728; --panel-2:#0b1524;
+    --border:#1b2740; --border-2:#28395c;
+    --ink:#e8eef9; --muted:#8a99b8; --faint:#5f6d8c;
+    --accent:#4c8dff; --accent-2:#38bdf8;
+    --good:#34d399; --warn:#f5b445; --block:#fb7185; --win:#6ea8fe;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",Menlo,Consolas,monospace;
+    --maxw:1120px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;background:
+      radial-gradient(1200px 600px at 80% -10%, #10203a55, transparent 60%),
+      radial-gradient(900px 500px at -10% 10%, #0c1a3355, transparent 55%),
+      var(--bg);
+    color:var(--ink);font-family:var(--sans);line-height:1.55;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 24px}
+  a{color:var(--accent-2);text-decoration:none}
+  a:hover{text-decoration:underline}
+  ::selection{background:#274a86;color:#fff}
+
+  /* ---- top nav ---- */
+  nav.top{position:sticky;top:0;z-index:40;backdrop-filter:blur(10px);
+    background:linear-gradient(#080d18ee,#080d18bb);border-bottom:1px solid var(--border)}
+  nav.top .wrap{display:flex;align-items:center;gap:14px;height:52px;overflow-x:auto}
+  nav.top .brand{font-family:var(--mono);font-size:12.5px;letter-spacing:.14em;
+    color:var(--ink);white-space:nowrap;font-weight:600}
+  nav.top .brand b{color:var(--accent)}
+  nav.top .links{display:flex;gap:4px;margin-left:auto}
+  nav.top .links a{font-family:var(--mono);font-size:11.5px;letter-spacing:.06em;
+    color:var(--muted);padding:5px 9px;border-radius:6px;white-space:nowrap}
+  nav.top .links a:hover{color:var(--ink);background:#16223c;text-decoration:none}
+
+  /* ---- header ---- */
+  header.hero{padding:64px 0 26px;border-bottom:1px solid var(--border)}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.34em;text-transform:uppercase;
+    color:var(--accent-2);margin:0 0 18px}
+  h1{font-size:clamp(30px,5vw,52px);line-height:1.04;margin:0 0 14px;font-weight:750;
+    letter-spacing:-.02em;text-wrap:balance;max-width:15ch}
+  h1 span{color:var(--accent)}
+  .thesis{font-size:clamp(15px,2vw,18.5px);color:#c3cee3;max-width:60ch;margin:0 0 24px;text-wrap:pretty}
+  .chips{display:flex;flex-wrap:wrap;gap:8px}
+  .chip{font-family:var(--mono);font-size:11.5px;letter-spacing:.03em;color:#c8d5ee;
+    background:#101c33;border:1px solid var(--border-2);border-radius:999px;padding:5px 11px}
+  .chip b{color:var(--accent-2);font-weight:600}
+
+  /* ---- legend ---- */
+  .legend{display:flex;flex-wrap:wrap;gap:16px 22px;padding:16px 18px;margin:26px 0 0;
+    background:var(--panel-2);border:1px solid var(--border);border-radius:12px}
+  .legend .lk{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:11.5px;color:#c3cee3}
+  .swatch{width:14px;height:14px;border-radius:4px;border:1.5px solid}
+  .sw-flow{background:#12233f;border-color:var(--accent)}
+  .sw-good{background:#0f2a22;border-color:var(--good)}
+  .sw-warn{background:#2a2110;border-color:var(--warn)}
+  .sw-block{background:#2a1620;border-color:var(--block)}
+  .sw-cfg{background:#101a2e;border-color:var(--accent-2)}
+
+  /* ---- sections / plates ---- */
+  section{padding:44px 0 8px;scroll-margin-top:64px}
+  .plate-head{display:flex;align-items:baseline;gap:14px;margin:0 0 6px;flex-wrap:wrap}
+  .fig{font-family:var(--mono);font-size:12px;letter-spacing:.18em;color:var(--accent);
+    border:1px solid var(--border-2);border-radius:6px;padding:2px 8px}
+  h2{font-size:clamp(21px,3vw,27px);margin:0;font-weight:700;letter-spacing:-.01em}
+  .lead{color:var(--muted);max-width:66ch;margin:8px 0 20px;font-size:15px}
+  .lead code{font-family:var(--mono);font-size:.86em;color:#bcd0f2;background:#111d33;
+    padding:1px 6px;border-radius:5px;border:1px solid var(--border)}
+
+  .plate{background:linear-gradient(#0d1627,#0b1322);border:1px solid var(--border);
+    border-radius:14px;padding:10px;box-shadow:0 1px 0 #ffffff08 inset,0 18px 40px -30px #000}
+  .plate.hero-plate{border-color:#294066;box-shadow:0 0 0 1px #12203a,0 24px 60px -34px #0009}
+  .plate .diagram{overflow-x:auto;padding:16px 8px}
+  .mermaid{min-width:min-content;margin:0 auto;text-align:center}
+  .plate .cap{display:flex;justify-content:space-between;gap:10px;padding:6px 12px 4px;
+    border-top:1px dashed var(--border);margin-top:2px;color:var(--faint);
+    font-family:var(--mono);font-size:11px;letter-spacing:.04em}
+
+  /* ---- lockdown grid ---- */
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:8px}
+  .panel{background:var(--panel-2);border:1px solid var(--border);border-radius:12px;padding:16px 16px 18px}
+  .panel h3{margin:0 0 12px;font-size:13px;font-family:var(--mono);letter-spacing:.12em;text-transform:uppercase}
+  .panel.deny h3{color:var(--block)} .panel.allow h3{color:var(--good)}
+  .taglist{display:flex;flex-wrap:wrap;gap:7px}
+  .tag{font-family:var(--mono);font-size:11.5px;padding:4px 9px;border-radius:7px;border:1px solid}
+  .deny .tag{color:#ffd3db;background:#20121a;border-color:#5a2740}
+  .allow .tag{color:#c9f6e6;background:#0f2119;border-color:#1f5843}
+
+  /* ---- filesystem map ---- */
+  .fsmap{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12.5px;overflow:hidden;
+    border:1px solid var(--border);border-radius:12px}
+  .fsmap td{padding:10px 14px;border-top:1px solid var(--border);vertical-align:top}
+  .fsmap tr:first-child td{border-top:none}
+  .fsmap .path{color:var(--accent-2);white-space:nowrap}
+  .fsmap .desc{color:var(--muted);font-family:var(--sans);font-size:13.5px}
+
+  footer{margin:56px 0 40px;padding-top:22px;border-top:1px solid var(--border);
+    color:var(--faint);font-family:var(--mono);font-size:11.5px;letter-spacing:.04em;
+    display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px}
+
+  @media (max-width:720px){ .grid2{grid-template-columns:1fr} header.hero{padding:40px 0 22px} }
+  @media (prefers-reduced-motion:reduce){ html{scroll-behavior:auto} }
+</style>
+
+<nav class="top">
+  <div class="wrap">
+    <span class="brand"><b>◆</b> ThinClient&nbsp;OS · ARCHITECTURE</span>
+    <span class="links">
+      <a href="#overview">Overview</a>
+      <a href="#boot">Boot</a>
+      <a href="#session">Session</a>
+      <a href="#rdp">RDP</a>
+      <a href="#network">Network</a>
+      <a href="#recovery">Recovery</a>
+      <a href="#admin">Admin</a>
+      <a href="#security">Security</a>
+      <a href="#deploy">Deploy</a>
+      <a href="#fs">Filesystem</a>
+    </span>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <p class="eyebrow">Debian 13 · FreeRDP appliance</p>
+    <h1>How the <span>ThinClient OS</span> works, end to end.</h1>
+    <p class="thesis">A single-purpose operating system that boots straight into a full-screen Windows
+      RDP session and nothing else — no desktop, no shell, no login prompt. Below is the complete
+      architecture: from power-on to the remote desktop, and every supervisor, gate, and lockdown that
+      keeps it there.</p>
+    <div class="chips">
+      <span class="chip"><b>base</b> Debian 13 (Trixie)</span>
+      <span class="chip"><b>client</b> FreeRDP 3 · xfreerdp3</span>
+      <span class="chip"><b>init</b> systemd → graphical.target</span>
+      <span class="chip"><b>wm</b> Openbox on Xorg VT7</span>
+      <span class="chip"><b>boot</b> BIOS + UEFI hybrid</span>
+      <span class="chip"><b>link</b> RDP / TCP 3389 · NLA+TLS</span>
+      <span class="chip"><b>user</b> one locked account, no sudo</span>
+    </div>
+
+    <div class="legend" aria-label="Colour key">
+      <span class="lk"><span class="swatch sw-flow"></span> system / boot</span>
+      <span class="lk"><span class="swatch sw-cfg"></span> config &amp; control</span>
+      <span class="lk"><span class="swatch sw-good"></span> healthy · connected</span>
+      <span class="lk"><span class="swatch sw-warn"></span> supervisor · recovery</span>
+      <span class="lk"><span class="swatch sw-block"></span> blocked · locked</span>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <!-- ================= OVERVIEW / MASTER BOARD ================= -->
+  <section id="overview">
+    <div class="plate-head"><span class="fig">FIG.00</span><h2>The whole system on one board</h2></div>
+    <p class="lead">Four hardware-to-remote layers, wrapped by three supervisors: the
+      <code>server.conf</code> that drives every connection, the <code>watchdog</code> that heals the
+      session, and <code>Admin Mode</code> for maintenance. Solid arrows are the boot/data path; dashed
+      arrows are control and configuration.</p>
+    <div class="plate hero-plate">
+      <div class="diagram">
+<pre class="mermaid">
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-monospace, Menlo, monospace','fontSize':'13px','lineColor':'#4d6a9e','primaryColor':'#12203a','primaryBorderColor':'#2b3c60','primaryTextColor':'#e8eef9','clusterBkg':'#0c1424','clusterBorder':'#26355a','titleColor':'#9fb2d8','edgeLabelBackground':'#0b1220'}}}%%
+flowchart TB
+  subgraph HW["1 · HARDWARE"]
+    direction LR
+    disp["Displays<br/>(multi-monitor)"]:::sys
+    io["Keyboard · Mouse · USB<br/>Audio · Camera"]:::sys
+    nic["NIC · WiFi"]:::sys
+  end
+  subgraph BOOT["2 · FIRMWARE &amp; BOOT"]
+    direction LR
+    grub["GRUB<br/>BIOS + UEFI"]:::sys
+    kern["kernel + initramfs"]:::sys
+    ply["Plymouth splash"]:::sys
+  end
+  subgraph INIT["3 · systemd — graphical.target"]
+    direction LR
+    fb["thinclient-firstboot<br/>dirs · perms · baked WiFi"]:::svc
+    xsvc["thinclient-x<br/>Restart=always"]:::svc
+    wd["thinclient-watchdog"]:::warn
+  end
+  subgraph SESS["4 · KIOSK SESSION — Xorg VT7"]
+    direction TB
+    xorg["Xorg · DontVTSwitch · DontZap"]:::sys
+    ob["Openbox · admin hotkey only"]:::sys
+    loop["thinclient-session<br/>reconnect loop + heartbeat"]:::cfg
+    gate{"network gate<br/>online?"}:::cfg
+    wifi["WiFi picker"]:::warn
+    rdp["xfreerdp3<br/>password via stdin"]:::good
+    xorg --> ob --> loop --> gate
+    gate -- no --> wifi --> gate
+    gate -- yes --> rdp
+  end
+  win["Windows RDP Server<br/>NLA + TLS"]:::win
+
+  HW --> BOOT --> INIT
+  xsvc --> SESS
+  fb -.-> SESS
+  wd == "restart on stale heartbeat" ==> xsvc
+  loop -. heartbeat .-> wd
+  rdp == "RDP · TCP 3389" ==> win
+
+  conf[("/etc/thinclient/server.conf<br/>single source of truth")]:::cfgfile
+  conf -. "read every attempt" .-> loop
+  admin["Admin Mode<br/>hotkey → password → menu"]:::warn
+  admin -. writes .-> conf
+  logs[("/var/log/thinclient")]:::logs
+  loop -.-> logs
+  wd -.-> logs
+
+  classDef sys fill:#111c30,stroke:#33507e,color:#cfe0ff;
+  classDef svc fill:#101a2e,stroke:#4c8dff,color:#dae6ff;
+  classDef cfg fill:#0f1a30,stroke:#5b8bd0,color:#d6e4ff;
+  classDef good fill:#0f2a22,stroke:#34d399,color:#c9f6e6;
+  classDef warn fill:#2a2110,stroke:#f5b445,color:#ffe7bd;
+  classDef win fill:#12233f,stroke:#6ea8fe,color:#dbe7ff;
+  classDef cfgfile fill:#0d1a2c,stroke:#38bdf8,color:#d6f2ff;
+  classDef logs fill:#141b2c,stroke:#5d6b8a,color:#c3cde0;
+</pre>
+      </div>
+      <div class="cap"><span>PLATE 00 — top-level architecture</span><span>solid = boot/data · dashed = control/config</span></div>
+    </div>
+  </section>
+
+  <!-- ================= BOOT ================= -->
+  <section id="boot">
+    <div class="plate-head"><span class="fig">FIG.01</span><h2>Boot flow — power to remote desktop</h2></div>
+    <p class="lead">Target: usable in under 15 seconds on SSD + UEFI. Every stage is silent; the user
+      only ever sees the dark splash and then Windows.</p>
+    <div class="plate"><div class="diagram">
+<pre class="mermaid">
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-monospace, Menlo, monospace','fontSize':'13px','lineColor':'#4d6a9e','primaryTextColor':'#e8eef9','edgeLabelBackground':'#0b1220'}}}%%
+flowchart LR
+  p["Power ON"]:::sys --> g["GRUB<br/>hidden · 1s"]:::sys --> k["kernel<br/>+ initramfs"]:::sys --> pl["Plymouth<br/>dark splash"]:::sys --> t["systemd<br/>graphical.target"]:::sys
+  t --> fb["firstboot<br/>dirs · perms · WiFi"]:::svc --> x["Xorg<br/>VT7"]:::sys --> ob["Openbox"]:::sys --> ln["session loop"]:::cfg --> ng{"network?"}:::cfg
+  ng -- no --> wp["WiFi picker"]:::warn --> ng
+  ng -- yes --> rd["xfreerdp3<br/>fullscreen"]:::good --> win["Windows<br/>desktop"]:::win
+  classDef sys fill:#111c30,stroke:#33507e,color:#cfe0ff;
+  classDef svc fill:#101a2e,stroke:#4c8dff,color:#dae6ff;
+  classDef cfg fill:#0f1a30,stroke:#5b8bd0,color:#d6e4ff;
+  classDef good fill:#0f2a22,stroke:#34d399,color:#c9f6e6;
+  classDef warn fill:#2a2110,stroke:#f5b445,color:#ffe7bd;
+  classDef win fill:#12233f,stroke:#6ea8fe,color:#dbe7ff;
+</pre>
+    </div><div class="cap"><span>PLATE 01 — boot sequence</span><span>getty on every VT is masked → no console</span></div></div>
+  </section>
+
+  <!-- ================= SESSION ================= -->
+  <section id="session">
+    <div class="plate-head"><span class="fig">FIG.02</span><h2>Inside the kiosk session</h2></div>
+    <p class="lead"><code>thinclient-x.service</code> launches <code>xinit</code> as the locked user on
+      VT7. X is hardened, Openbox binds only the secret admin hotkey, and the session loop owns the
+      screen forever — there is no path to a desktop.</p>
+    <div class="plate"><div class="diagram">
+<pre class="mermaid">
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-monospace, Menlo, monospace','fontSize':'13px','lineColor':'#4d6a9e','primaryTextColor':'#e8eef9','edgeLabelBackground':'#0b1220'}}}%%
+flowchart TB
+  svc["thinclient-x.service<br/>User=thinclient · PAM login · VT7"]:::svc --> xi["xinit → thinclient-xsession"]:::sys
+  xi --> hard["harden X<br/>xset s off -dpms · setxkbmap"]:::sys
+  xi --> obx["openbox<br/>rc.xml — only C-A-S-a bound"]:::sys
+  xi --> loop["exec thinclient-session"]:::cfg
+  loop --> sp["thinclient-splash<br/>Connecting to Remote Workspace…"]:::cfg
+  loop --> unc["unclutter<br/>hide cursor"]:::sys
+  loop --> hb["heartbeat + state<br/>/run/thinclient"]:::cfg
+  obx -. "secret hotkey" .-> adm["thinclient-adminmode"]:::warn
+  classDef sys fill:#111c30,stroke:#33507e,color:#cfe0ff;
+  classDef svc fill:#101a2e,stroke:#4c8dff,color:#dae6ff;
+  classDef cfg fill:#0f1a30,stroke:#5b8bd0,color:#d6e4ff;
+  classDef warn fill:#2a2110,stroke:#f5b445,color:#ffe7bd;
+</pre>
+    </div><div class="cap"><span>PLATE 02 — session internals</span><span>X exits ⇒ systemd relaunches (Restart=always)</span></div></div>
+  </section>
+
+  <!-- ================= RDP ================= -->
+  <section id="rdp">
+    <div class="plate-head"><span class="fig">FIG.03</span><h2>Config-driven RDP</h2></div>
+    <p class="lead">The connection is never hard-coded. <code>rdp-build-args.sh</code> reads
+      <code>server.conf</code> on every attempt, validates it, and maps each toggle to an
+      <code>xfreerdp3</code> flag. The password is streamed over <b>stdin</b> — never argv — so it can't
+      appear in <code>ps</code>.</p>
+    <div class="plate"><div class="diagram">
+<pre class="mermaid">
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-monospace, Menlo, monospace','fontSize':'13px','lineColor':'#4d6a9e','primaryTextColor':'#e8eef9','clusterBkg':'#0c1424','clusterBorder':'#26355a','titleColor':'#9fb2d8','edgeLabelBackground':'#0b1220'}}}%%
+flowchart LR
+  conf[("server.conf")]:::cfgfile --> build["rdp-build-args.sh<br/>validate + map"]:::cfg --> args["xfreerdp3<br/>argv"]:::good
+  pw["PASSWORD"]:::block -. "via stdin (never argv)" .-> args
+  args --> chans
+  subgraph chans["Redirected channels &amp; policy"]
+    direction TB
+    d["/f · /multimon · /dynamic-resolution"]:::good
+    a["/sound · /microphone"]:::good
+    v["/video · /camera"]:::good
+    u["/usb · /printer · /clipboard"]:::good
+    gx["/gfx:AVC444 · +gfx-h264 (GPU)"]:::good
+    s["/sec:nla · /cert:tofu · /auto-reconnect"]:::good
+  end
+  chans == "TCP 3389" ==> win["Windows RDP Server"]:::win
+  classDef cfg fill:#0f1a30,stroke:#5b8bd0,color:#d6e4ff;
+  classDef good fill:#0f2a22,stroke:#34d399,color:#c9f6e6;
+  classDef block fill:#2a1620,stroke:#fb7185,color:#ffd9e0;
+  classDef win fill:#12233f,stroke:#6ea8fe,color:#dbe7ff;
+  classDef cfgfile fill:#0d1a2c,stroke:#38bdf8,color:#d6f2ff;
+</pre>
+    </div><div class="cap"><span>PLATE 03 — configuration → FreeRDP</span><span>edit server.conf → applies on next reconnect, no reboot</span></div></div>
+  </section>
+
+  <!-- ================= NETWORK ================= -->
+  <section id="network">
+    <div class="plate-head"><span class="fig">FIG.04</span><h2>Network gate &amp; WiFi</h2></div>
+    <p class="lead">Before hammering RDP, the session confirms it has a network. Ethernet and any baked
+      WiFi get a grace window; if the box is still offline, a locked-down WiFi picker appears — it can
+      <i>only</i> join WiFi, so anyone at the machine can reconnect without exposing a desktop.</p>
+    <div class="plate"><div class="diagram">
+<pre class="mermaid">
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-monospace, Menlo, monospace','fontSize':'13px','lineColor':'#4d6a9e','primaryTextColor':'#e8eef9','edgeLabelBackground':'#0b1220'}}}%%
+flowchart TB
+  s["session attempt"]:::cfg --> q{"have route /<br/>NM connected?"}:::cfg
+  q -- yes --> rdp["connect RDP"]:::good
+  q -- no --> grace["wait NETWORK_GRACE 20s<br/>ethernet · baked WiFi · DHCP"]:::cfg
+  grace --> q2{"online now?"}:::cfg
+  q2 -- yes --> rdp
+  q2 -- no --> pick["WiFi picker · no password<br/>scan → select → connect"]:::warn
+  pick --> q3{"connected?"}:::cfg
+  q3 -- no --> pick
+  q3 -- yes --> rdp
+  eth["Ethernet plugged in"]:::good -. "closes picker" .-> q3
+  classDef cfg fill:#0f1a30,stroke:#5b8bd0,color:#d6e4ff;
+  classDef good fill:#0f2a22,stroke:#34d399,color:#c9f6e6;
+  classDef warn fill:#2a2110,stroke:#f5b445,color:#ffe7bd;
+</pre>
+    </div><div class="cap"><span>PLATE 04 — offline handling</span><span>grace window absorbs transient WiFi blips</span></div></div>
+  </section>
+
+  <!-- ================= RECOVERY ================= -->
+  <section id="recovery">
+    <div class="plate-head"><span class="fig">FIG.05</span><h2>Supervision &amp; self-healing</h2></div>
+    <p class="lead">Four independent safety nets, each catching what the one below it can't. No single
+      failure — network blip, server reboot, hung Openbox, crashed X — ever leaves Linux on screen.</p>
+    <div class="plate"><div class="diagram">
+<pre class="mermaid">
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-monospace, Menlo, monospace','fontSize':'13px','lineColor':'#4d6a9e','primaryTextColor':'#e8eef9','clusterBkg':'#0c1424','clusterBorder':'#26355a','titleColor':'#9fb2d8'}}}%%
+flowchart TB
+  subgraph L1["LAYER 1 · in-session"]
+    a["FreeRDP /auto-reconnect<br/>recovers brief blips"]:::good
+  end
+  subgraph L2["LAYER 2 · session ended"]
+    b["thinclient-session loop<br/>splash + retry every 5s"]:::cfg
+  end
+  subgraph L3["LAYER 3 · session wedged"]
+    c["watchdog: stale heartbeat<br/>systemctl restart thinclient-x"]:::warn
+  end
+  subgraph L4["LAYER 4 · X died"]
+    d["systemd Restart=always<br/>relaunch in 2s"]:::svc
+  end
+  L1 --> L2 --> L3 --> L4
+  classDef svc fill:#101a2e,stroke:#4c8dff,color:#dae6ff;
+  classDef cfg fill:#0f1a30,stroke:#5b8bd0,color:#d6e4ff;
+  classDef good fill:#0f2a22,stroke:#34d399,color:#c9f6e6;
+  classDef warn fill:#2a2110,stroke:#f5b445,color:#ffe7bd;
+</pre>
+    </div><div class="cap"><span>PLATE 05 — recovery layers</span><span>heartbeat freshness, not "is xfreerdp up", drives the watchdog</span></div></div>
+  </section>
+
+  <!-- ================= ADMIN ================= -->
+  <section id="admin">
+    <div class="plate-head"><span class="fig">FIG.06</span><h2>Admin Mode — the hidden door</h2></div>
+    <p class="lead">The only way in is the secret hotkey plus the admin password (stored as a SHA-512
+      hash, with a lockout). Every action returns to the RDP session; closing the menu returns focus to
+      Windows.</p>
+    <div class="plate"><div class="diagram">
+<pre class="mermaid">
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-monospace, Menlo, monospace','fontSize':'13px','lineColor':'#4d6a9e','primaryTextColor':'#e8eef9','edgeLabelBackground':'#0b1220'}}}%%
+flowchart LR
+  hk["Ctrl+Alt+Shift+A"]:::warn --> pw{"admin password<br/>SHA-512 hash"}:::warn
+  pw -- "wrong / locked" --> ret["silently return<br/>to session"]:::block
+  pw -- ok --> menu["Maintenance menu"]:::warn
+  menu --> c1["Configure server<br/>&amp; devices"]:::cfg
+  menu --> c2["Test · Diagnostics"]:::cfg
+  menu --> c3["Network / WiFi"]:::cfg
+  menu --> c4["View logs"]:::cfg
+  menu --> c5["Update packages"]:::cfg
+  menu --> c6["Restart · Reboot"]:::cfg
+  classDef cfg fill:#0f1a30,stroke:#5b8bd0,color:#d6e4ff;
+  classDef warn fill:#2a2110,stroke:#f5b445,color:#ffe7bd;
+  classDef block fill:#2a1620,stroke:#fb7185,color:#ffd9e0;
+</pre>
+    </div><div class="cap"><span>PLATE 06 — maintenance</span><span>locked user has no shell; sudo is a fixed allowlist</span></div></div>
+  </section>
+
+  <!-- ================= SECURITY ================= -->
+  <section id="security">
+    <div class="plate-head"><span class="fig">FIG.07</span><h2>Security lockdown</h2></div>
+    <p class="lead">Deny-by-default. The machine can do exactly one thing — run the RDP client — and
+      everything that could break out of it is removed or masked.</p>
+    <div class="grid2">
+      <div class="panel deny">
+        <h3>■ Blocked / removed</h3>
+        <div class="taglist">
+          <span class="tag">getty@tty1–6 → /dev/null</span>
+          <span class="tag">DontVTSwitch</span>
+          <span class="tag">DontZap</span>
+          <span class="tag">Ctrl+Alt+F1–F12</span>
+          <span class="tag">Alt+Tab · Alt+F4</span>
+          <span class="tag">no terminal</span>
+          <span class="tag">no file manager</span>
+          <span class="tag">no SSH server</span>
+          <span class="tag">root: locked · nologin</span>
+          <span class="tag">user: nologin · no sudo</span>
+          <span class="tag">kernel.sysrq = 0</span>
+          <span class="tag">screen blank / DPMS off</span>
+        </div>
+      </div>
+      <div class="panel allow">
+        <h3>■ Allowed</h3>
+        <div class="taglist">
+          <span class="tag">full-screen RDP session</span>
+          <span class="tag">device redirection (per config)</span>
+          <span class="tag">join WiFi (picker)</span>
+          <span class="tag">admin hotkey → password gate</span>
+          <span class="tag">scoped sudo: session ctl</span>
+          <span class="tag">scoped sudo: reboot/poweroff</span>
+          <span class="tag">scoped sudo: apt update/upgrade</span>
+          <span class="tag">scoped sudo: nmcli / nmtui</span>
+        </div>
+      </div>
+    </div>
+    <p class="lead" style="margin-top:16px">Credentials never travel in cleartext (NLA + TLS) and never
+      hit the process table (password via stdin). A stored password/WiFi key is recoverable from the raw
+      disk — so built images are treated as secrets.</p>
+  </section>
+
+  <!-- ================= DEPLOY ================= -->
+  <section id="deploy">
+    <div class="plate-head"><span class="fig">FIG.08</span><h2>From source to a fleet</h2></div>
+    <p class="lead">One reproducible <code>build.sh</code> produces a hybrid ISO. Image one reference
+      machine, then clone the rest with Clonezilla. A different site only needs a <code>server.conf</code>
+      edit — no re-imaging.</p>
+    <div class="plate"><div class="diagram">
+<pre class="mermaid">
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-monospace, Menlo, monospace','fontSize':'13px','lineColor':'#4d6a9e','primaryTextColor':'#e8eef9','edgeLabelBackground':'#0b1220'}}}%%
+flowchart LR
+  b["build.sh<br/>live-build"]:::sys --> iso["thinclient.iso<br/>BIOS + UEFI"]:::good --> usb["USB · dd"]:::sys --> ref["reference PC<br/>(live)"]:::cfg --> inst["thinclient-install<br/>→ internal disk"]:::cfg --> cz["Clonezilla<br/>capture"]:::sys --> fleet["fleet · N machines"]:::win
+  classDef sys fill:#111c30,stroke:#33507e,color:#cfe0ff;
+  classDef cfg fill:#0f1a30,stroke:#5b8bd0,color:#d6e4ff;
+  classDef good fill:#0f2a22,stroke:#34d399,color:#c9f6e6;
+  classDef win fill:#12233f,stroke:#6ea8fe,color:#dbe7ff;
+</pre>
+    </div><div class="cap"><span>PLATE 08 — deployment pipeline</span><span>build on amd64 host or Docker builder (volume-backed)</span></div></div>
+  </section>
+
+  <!-- ================= FILESYSTEM MAP ================= -->
+  <section id="fs">
+    <div class="plate-head"><span class="fig">MAP</span><h2>Where everything lives</h2></div>
+    <p class="lead">The on-disk layout of the appliance — programs, configuration, logs, and runtime
+      state.</p>
+    <table class="fsmap">
+      <tr><td class="path">/opt/thinclient/bin/</td><td class="desc">Runtime programs — session loop, watchdog, splash, WiFi picker/gate, admin tools, config CLI, diagnostics.</td></tr>
+      <tr><td class="path">/opt/thinclient/lib/</td><td class="desc">Shared Bash libraries — the safe config parser and the FreeRDP argument builder.</td></tr>
+      <tr><td class="path">/etc/thinclient/server.conf</td><td class="desc">The single source of truth: server, credentials, device toggles, WiFi, reconnect.</td></tr>
+      <tr><td class="path">/etc/thinclient/admin.conf</td><td class="desc">Admin password hash + secret hotkey (root-only, 0600).</td></tr>
+      <tr><td class="path">/etc/systemd/system/thinclient-*.service</td><td class="desc">The three units: firstboot, kiosk X session, watchdog.</td></tr>
+      <tr><td class="path">/etc/X11/ · /etc/sudoers.d/thinclient</td><td class="desc">Xorg kiosk hardening, X wrapper policy, and the scoped sudo allowlist.</td></tr>
+      <tr><td class="path">/var/log/thinclient/</td><td class="desc">Rotated logs — boot, rdp, watchdog, network, install.</td></tr>
+      <tr><td class="path">/run/thinclient/</td><td class="desc">Runtime state — heartbeat timestamp and session state for the watchdog.</td></tr>
+    </table>
+  </section>
+
+  <footer>
+    <span>ThinClient OS — production Debian 13 RDP appliance</span>
+    <span>solid = boot/data · dashed = control/config · single locked user · no desktop</span>
+  </footer>
+</main>

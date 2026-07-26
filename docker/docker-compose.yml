@@ -1,0 +1,71 @@
+# =============================================================================
+#  ThinClient OS — Docker development / build orchestration
+#
+#     make iso     ->  builds thinclient.iso via the privileged builder
+#     make test    ->  runs the test suite in a lightweight container
+#     make shell   ->  interactive shell in the build environment
+#
+#  (See the top-level Makefile, which wraps these services.)
+#
+#  IMPORTANT: the live-build root filesystem is created on the `tc-build` Docker
+#  volume (a real Linux ext4 fs inside the VM), NOT on the bind-mounted source
+#  tree. debootstrap cannot create a Linux rootfs (device nodes, hardlinks,
+#  xattrs, ownership) on a macOS-backed bind mount — it fails with "tar failed".
+#  Only the finished ISO is copied back to the bind-mounted ./iso directory.
+# =============================================================================
+services:
+
+  # --- Full ISO builder (needs privileges for loop mounts / debootstrap) -----
+  builder:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.build
+    image: thinclient/builder:latest
+    # Target arch of the produced ISO. Default amd64 (typical thin-client PCs).
+    # On Apple Silicon this runs under Docker's amd64 emulation. For a native
+    # local validation build set TC_PLATFORM=linux/arm64 and TC_ARCH=arm64.
+    platform: ${TC_PLATFORM:-linux/amd64}
+    privileged: true            # live-build requires mount + loop devices
+    working_dir: /project
+    volumes:
+      - ../:/project            # source in; only iso/ is written back
+      - tc-build:/build         # rootfs is built here (real Linux fs, not VirtioFS)
+    environment:
+      - TC_DIST=${TC_DIST:-trixie}
+      - TC_ARCH=${TC_ARCH:-amd64}
+      - TC_BUILD_DIR=/build/live-build
+      - TC_MIRROR=${TC_MIRROR:-http://deb.debian.org/debian/}
+      - TC_VERSION=${TC_VERSION:-1.0.0}
+    command: ["bash", "-lc", "bash ./build.sh ${BUILD_ARGS:-}"]
+
+  # --- Lint + logic tests (no privileges, fast) ------------------------------
+  tester:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.test
+    image: thinclient/tester:latest
+    working_dir: /project
+    volumes:
+      - ../:/project
+    command: ["bash", "-lc", "bash ./tests/run-tests.sh"]
+
+  # --- Interactive shell in the build environment ----------------------------
+  shell:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.build
+    image: thinclient/builder:latest
+    platform: ${TC_PLATFORM:-linux/amd64}
+    privileged: true
+    working_dir: /project
+    volumes:
+      - ../:/project
+      - tc-build:/build
+    environment:
+      - TC_BUILD_DIR=/build/live-build
+    entrypoint: ["/bin/bash"]
+    stdin_open: true
+    tty: true
+
+volumes:
+  tc-build:

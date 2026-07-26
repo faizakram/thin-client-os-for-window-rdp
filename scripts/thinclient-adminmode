@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  ThinClient OS — Admin Mode entrypoint (the hidden maintenance door)
+#  Installed to: /opt/thinclient/bin/thinclient-adminmode
+#
+#  Bound to the secret hotkey (default Ctrl+Alt+Shift+A) in Openbox. Flow:
+#     hotkey -> password prompt -> [OK] -> maintenance menu
+#                                       -> [FAIL/LOCKED] -> silently return
+#
+#  Every maintenance action returns to this menu; closing the menu returns to
+#  the RDP session. The Linux desktop is never exposed — the RDP window sits
+#  underneath and regains focus on exit.
+# =============================================================================
+set -uo pipefail
+
+source "${TC_LIB_DIR:-/opt/thinclient/lib}"/thinclient-common.sh
+export TC_LOGFILE="thinclient"
+
+command -v yad >/dev/null 2>&1 || { log_error "yad missing; admin mode unavailable"; exit 3; }
+
+# --------------------------------------------------------------------------- #
+# Helper functions (defined BEFORE use — Bash does not hoist definitions).
+# --------------------------------------------------------------------------- #
+_view_logs() {
+  local pick
+  pick="$(yad --list --center --width=360 --height=300 --title="Logs" \
+      --column="Log" --print-column=1 --no-headers \
+      "boot.log" "rdp.log" "watchdog.log" "network.log" "install.log" \
+      2>/dev/null)" || return 0
+  pick="${pick%%|*}"
+  local file="${TC_LOG_DIR}/${pick}"
+  if [[ -r "$file" ]]; then
+    tail -n 400 "$file" | yad --text-info --center --width=760 --height=560 \
+        --title="$pick" --fontname="Monospace 9" --button="gtk-close:0" 2>/dev/null || true
+  else
+    yad --info --center --timeout=3 --text="No entries in ${pick} yet." 2>/dev/null || true
+  fi
+}
+
+_run_update() {
+  yad --question --center --title="Update" \
+      --text="Download and install system updates now?\nThe session will pause briefly." 2>/dev/null || return 0
+  ( sudo -n /opt/thinclient/bin/thinclient-adminctl start-session >/dev/null 2>&1 || true
+    sudo -n apt-get update && sudo -n apt-get -y upgrade ) 2>&1 \
+    | tee -a "${TC_LOG_DIR}/install.log" \
+    | yad --text-info --center --width=760 --height=520 --title="Updating..." \
+          --fontname="Monospace 9" --tail --button="gtk-close:0" 2>/dev/null || true
+}
+
+# Prevent two admin dialogs stacking if the hotkey is mashed.
+exec 9>"${TC_RUN_DIR}/adminmode.lock" 2>/dev/null || true
+flock -n 9 || { log_debug "Admin mode already open"; exit 0; }
+
+# ---- 1. Password gate -------------------------------------------------------
+pw="$(yad --entry --hide-text --center --width=360 \
+        --title="Maintenance" --window-icon="dialog-password" \
+        --image="dialog-password" \
+        --text="Administrator password:" \
+        --button="gtk-cancel:1" --button="gtk-ok:0" 2>/dev/null)" || exit 0
+[[ -n "$pw" ]] || exit 0
+
+result="$(printf '%s' "$pw" | /opt/thinclient/bin/thinclient-adminctl check 2>/dev/null || true)"
+unset pw
+case "$result" in
+  OK) : ;;
+  LOCKED)
+    yad --error --center --timeout=5 --title="Locked" \
+        --text="Too many failed attempts.\nTry again later." --button="gtk-ok:0" 2>/dev/null || true
+    exit 0 ;;
+  *)
+    yad --error --center --timeout=4 --title="Denied" \
+        --text="Incorrect password." --button="gtk-ok:0" 2>/dev/null || true
+    exit 0 ;;
+esac
+
+log_info "Admin Mode opened"
+
+# ---- 2. Maintenance menu ----------------------------------------------------
+ADMINCTL="sudo -n /opt/thinclient/bin/thinclient-adminctl"
+
+while :; do
+  choice="$(yad --list --center --width=460 --height=420 \
+      --title="ThinClient — Admin Mode" --window-icon="preferences-system" \
+      --text="<b>Maintenance</b>  (host: $(hostname))\nSelect an action; close to return to the session." \
+      --column="Action" --column="Description" --print-column=1 --no-headers \
+      "Configure"   "Change server, credentials & device settings" \
+      "Test"        "Test connectivity to the current server" \
+      "Network"     "Network settings (Wi-Fi / IP / DNS)" \
+      "Logs"        "View recent logs" \
+      "Diagnostics" "Collect a diagnostics report" \
+      "Update"      "Update system packages (requires network)" \
+      "Restart"     "Restart the RDP session now" \
+      "Reboot"      "Reboot this thin client" \
+      "Return"      "Return to the Remote Workspace" \
+      2>/dev/null)" || break
+
+  action="${choice%%|*}"
+  case "$action" in
+    Configure)   /opt/thinclient/bin/thinclient-admin ;;
+    Test)        report="$(/opt/thinclient/bin/thinclient-test-connection 2>&1)"
+                 yad --text-info --center --width=620 --height=420 --title="Connection Test" \
+                     --fontname="Monospace 10" --wrap <<<"$report" --button="gtk-close:0" 2>/dev/null || true ;;
+    Network)     /opt/thinclient/bin/thinclient-netctl gui ;;
+    Logs)        _view_logs ;;
+    Diagnostics) rpt="$(/opt/thinclient/bin/thinclient-diagnostics 2>&1)"
+                 yad --text-info --center --width=680 --height=500 --title="Diagnostics" \
+                     --fontname="Monospace 9" <<<"$rpt" --button="Save to USB!gtk-save:10" --button="gtk-close:0" 2>/dev/null
+                 [[ $? -eq 10 ]] && /opt/thinclient/bin/thinclient-diagnostics --save ;;
+    Update)      _run_update ;;
+    Restart)     $ADMINCTL restart-session 2>/dev/null || true; break ;;
+    Reboot)      yad --question --center --title="Reboot" --text="Reboot this thin client now?" 2>/dev/null \
+                     && sudo -n systemctl reboot ;;
+    Return|*)    break ;;
+  esac
+done
+
+log_info "Admin Mode closed; returning to session"
+exit 0

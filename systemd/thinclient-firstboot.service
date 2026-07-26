@@ -1,0 +1,21 @@
+# =============================================================================
+#  ThinClient OS — First-boot / every-boot preparation
+#  Installed to: /etc/systemd/system/thinclient-firstboot.service
+#
+#  Ensures runtime directories, log files, and secure permissions exist before
+#  the kiosk session starts. Idempotent — safe to run on every boot.
+# =============================================================================
+[Unit]
+Description=ThinClient environment preparation
+DefaultDependencies=no
+After=local-fs.target
+Before=thinclient-x.service thinclient-watchdog.service
+RequiresMountsFor=/var/log
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/thinclient/bin/thinclient-firstboot
+
+[Install]
+WantedBy=graphical.target

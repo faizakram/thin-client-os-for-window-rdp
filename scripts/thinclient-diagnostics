@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  ThinClient OS — Diagnostics collector
+#  Installed to: /opt/thinclient/bin/thinclient-diagnostics
+#
+#  Produces a single, support-friendly report: OS build, config (secrets
+#  redacted), network, service health, FreeRDP command preview, and recent log
+#  tails. With --save, writes it to an attached USB stick (or /var/log).
+# =============================================================================
+set -uo pipefail
+
+source "${TC_LIB_DIR:-/opt/thinclient/lib}"/thinclient-common.sh
+export TC_LOGFILE="thinclient"
+
+report() {
+  echo "==================== ThinClient Diagnostics ===================="
+  echo "Generated : $(date --iso-8601=seconds 2>/dev/null || date)"
+  echo "Hostname  : $(hostname)"
+  echo "Build     : $(cat /etc/thinclient/build-info 2>/dev/null || echo unknown)"
+  echo "OS        : $(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}")"
+  echo "Kernel    : $(uname -r)"
+  echo "Uptime    : $(uptime -p 2>/dev/null || uptime)"
+  echo
+  echo "-------- Configuration (redacted) --------"
+  /opt/thinclient/bin/thinclient-config list 2>/dev/null
+  echo
+  echo "-------- Config validation --------"
+  /opt/thinclient/bin/thinclient-config validate 2>/dev/null
+  echo
+  echo "-------- FreeRDP command preview --------"
+  /opt/thinclient/bin/thinclient-config show-command 2>/dev/null
+  echo
+  echo "-------- Runtime state --------"
+  echo "Session state : $(tc_get_state)"
+  echo "Heartbeat age : $(( $(date +%s) - $(cat "$TC_HEARTBEAT_FILE" 2>/dev/null || echo 0) )) s"
+  echo
+  echo "-------- Services --------"
+  for s in thinclient-x thinclient-watchdog NetworkManager; do
+    printf '%-26s %s\n' "$s" "$(systemctl is-active "$s" 2>/dev/null || echo n/a) / $(systemctl is-enabled "$s" 2>/dev/null || echo n/a)"
+  done
+  echo
+  echo "-------- Network --------"
+  /opt/thinclient/bin/thinclient-netctl status 2>/dev/null
+  echo
+  echo "-------- Displays --------"
+  DISPLAY="${DISPLAY:-:0}" xrandr --query 2>/dev/null | grep -E ' connected|^Screen' || echo "(no X display query available)"
+  echo
+  echo "-------- Recent watchdog log --------"
+  tail -n 20 "${TC_LOG_DIR}/watchdog.log" 2>/dev/null || echo "(none)"
+  echo
+  echo "-------- Recent rdp log --------"
+  tail -n 30 "${TC_LOG_DIR}/rdp.log" 2>/dev/null || echo "(none)"
+  echo "================================================================"
+}
+
+if [[ "${1:-}" == "--save" ]]; then
+  fname="thinclient-diag-$(hostname)-$(date +%Y%m%d-%H%M%S).txt"
+  # Prefer a mounted USB stick under /media, else /var/log/thinclient.
+  dest=""
+  for m in /media/*/* /media/* /mnt/*; do
+    [[ -d "$m" && -w "$m" ]] && { dest="$m"; break; }
+  done
+  [[ -z "$dest" ]] && dest="${TC_LOG_DIR}"
+  report >"${dest}/${fname}"
+  echo "Diagnostics saved to ${dest}/${fname}"
+else
+  report
+fi

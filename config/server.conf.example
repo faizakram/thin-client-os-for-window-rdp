@@ -1,0 +1,97 @@
+# =============================================================================
+#  ThinClient OS  —  Remote Server Configuration
+#  Location on target system: /etc/thinclient/server.conf
+# =============================================================================
+#
+#  This is the ONLY file an administrator needs to edit to point the thin
+#  client at a different Windows RDP server. Changing a value here and
+#  restarting the session (or rebooting) immediately changes the target.
+#  No code changes are ever required.
+#
+#  Format ......: KEY=VALUE  (INI-style, one per line)
+#  Booleans ....: true / false   (also accepts: 1/0, yes/no, on/off)
+#  Comments ....: lines beginning with '#'
+#  Secrets .....: PASSWORD is optional here; if left blank the user is
+#                 prompted on-screen. If set, this file MUST be root-owned
+#                 and chmod 600 (the installer enforces this).
+# =============================================================================
+
+# ------------------------------- Connection ---------------------------------
+# IPv4/hostname of the Windows Development Server and the RDP port.
+SERVER_IP=192.168.1.20
+PORT=3389
+
+# Credentials. Leave PASSWORD empty to prompt the user interactively.
+# NOTE: a stored password is baked into the image and is recoverable from the
+# raw disk. NLA+TLS below keep it off the wire, but treat any built image as a
+# secret. Prefer a least-privilege RDP account over Administrator where possible.
+USERNAME=developer
+PASSWORD=
+DOMAIN=
+
+# ------------------------------- Network ------------------------------------
+# Wired ethernet always auto-connects (DHCP) with no configuration.
+#
+# WiFi: optionally bake a default network here so every machine auto-joins with
+# zero interaction. Leave blank for wired-only, or to rely purely on the
+# on-screen WiFi picker. WIFI_PSK is stored in the image (root-only), so treat
+# built images as secrets. Leave WIFI_PSK blank for an open network.
+WIFI_SSID=
+WIFI_PSK=
+
+# If there is still no network after this many seconds (ethernet/baked-WiFi/DHCP
+# had their chance), the locked-down WiFi picker appears so anyone at the machine
+# can join a network. The picker can ONLY join WiFi — no desktop is exposed.
+NETWORK_GRACE=20
+
+# ------------------------------- Display ------------------------------------
+# FULLSCREEN   true  -> borderless fullscreen on the primary monitor
+# MULTIMONITOR true  -> span the session across ALL connected monitors
+#                       (overrides FULLSCREEN when more than one is present)
+FULLSCREEN=true
+MULTIMONITOR=true
+
+# Dynamic resolution: the remote desktop resizes with the local display.
+DYNAMIC_RESOLUTION=true
+
+# ------------------------------ Device redirection --------------------------
+CAMERA=true
+MICROPHONE=true
+SPEAKERS=true
+CLIPBOARD=true
+USB=false
+PRINTER=false
+SMARTCARD=false
+
+# ------------------------------ Performance / visuals -----------------------
+# GPU        true -> request server-side H.264/AVC444 GFX pipeline when available
+# BITMAP_CACHE / DESKTOP_COMPOSITION / FONT_SMOOTHING mirror the classic
+# RDP "experience" toggles. Disable on very low-bandwidth links.
+GPU=true
+BITMAP_CACHE=true
+DESKTOP_COMPOSITION=true
+FONT_SMOOTHING=true
+# NETWORK_PROFILE tunes RemoteFX/codec aggressiveness:
+#   auto | modem | broadband | wan | lan
+NETWORK_PROFILE=auto
+
+# ------------------------------ Security ------------------------------------
+# SECURITY  nla | tls | rdp   (NLA strongly recommended)
+# CERT_POLICY  ignore | tofu  (tofu = trust-on-first-use, pins the cert)
+SECURITY=nla
+CERT_POLICY=tofu
+
+# ------------------------------ Reconnect -----------------------------------
+# When the RDP session ends (server reboot, network blip, logoff), the
+# launcher shows "Connecting to Remote Workspace..." and retries forever.
+AUTO_RECONNECT=true
+RECONNECT_INTERVAL=5
+
+# ------------------------------ Watchdog ------------------------------------
+# How often (seconds) the watchdog verifies the session is alive.
+WATCHDOG_INTERVAL=5
+
+# ------------------------------ Extra flags ---------------------------------
+# Any additional raw FreeRDP flags, appended verbatim to the command line.
+# Advanced use only. Example: EXTRA_ARGS="/gfx-progressive /timeout:15000"
+EXTRA_ARGS=

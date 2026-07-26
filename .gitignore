@@ -1,0 +1,14 @@
+# --- Secrets (never commit) --------------------------------------------------
+RDP-creds.txt
+*.creds
+*.secret
+
+# --- Build artifacts ---------------------------------------------------------
+build/
+iso/*.iso
+iso/*.iso.sha256
+
+# --- Editor / OS cruft -------------------------------------------------------
+.DS_Store
+*.swp
+config/server.conf

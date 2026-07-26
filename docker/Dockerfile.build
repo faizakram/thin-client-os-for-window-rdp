@@ -1,0 +1,44 @@
+# =============================================================================
+#  ThinClient OS — ISO build environment
+#  A Debian 13 (Trixie) image with live-build + tooling, so the ISO can be
+#  produced from any host (macOS/Windows/Linux) that runs Docker.
+#
+#  NOTE: live-build needs loop devices and mount privileges, so the builder
+#  container MUST run with --privileged (see docker-compose.yml).
+# =============================================================================
+FROM debian:trixie
+
+ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8
+
+# Arch-independent build tooling.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      live-build \
+      debootstrap \
+      xorriso \
+      squashfs-tools \
+      mtools \
+      dosfstools \
+      ca-certificates \
+      rsync \
+      file \
+      procps \
+      sudo \
+      apt-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# x86-only bootloader helpers (BIOS hybrid ISO needs isolinux/syslinux). Skipped
+# on arm64 so the builder image itself builds on Apple Silicon for the native
+# validation build.
+RUN apt-get update && \
+    if [ "$(dpkg --print-architecture)" = "amd64" ] || [ "$(dpkg --print-architecture)" = "i386" ]; then \
+      apt-get install -y --no-install-recommends \
+        grub-pc-bin grub-efi-amd64-bin isolinux syslinux-common ; \
+    else \
+      apt-get install -y --no-install-recommends grub-efi-arm64-bin || true ; \
+    fi && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /project
+
+# Default: perform a full ISO build. Override the command for a shell.
+CMD ["bash", "-lc", "./build.sh"]

@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  ThinClient OS — Locked-down WiFi picker
+#  Installed to: /opt/thinclient/bin/thinclient-wifi
+#
+#  A deliberately minimal WiFi chooser shown by the network gate when the
+#  machine is offline. It can do ONE thing: scan for WiFi networks, take a
+#  password, and join. There is no desktop, no terminal, no other settings
+#  behind it — so it is safe to expose to whoever is at the machine (this is
+#  how a non-technical user reconnects after a WiFi/password change).
+#
+#  Usage:
+#     thinclient-wifi picker    # interactive; returns 0 once connected
+#     thinclient-wifi status    # exit 0 if the box has network, else 1
+# =============================================================================
+set -uo pipefail
+
+source "${TC_LIB_DIR:-/opt/thinclient/lib}"/thinclient-common.sh
+export TC_LOGFILE="network"
+
+# nmcli connect/rescan need privilege; the scoped sudoers rule allows it with
+# no password so the picker works for anyone at the machine.
+sudo_nmcli() { sudo -n nmcli "$@"; }
+
+_scan_rows() {
+  sudo_nmcli device wifi rescan >/dev/null 2>&1 || true
+  # SSID:SIGNAL:SECURITY  ->  dedupe by SSID keeping the strongest signal,
+  # drop hidden/empty SSIDs, emit yad rows (3 fields per network).
+  nmcli -t -f SSID,SIGNAL,SECURITY device wifi list 2>/dev/null \
+    | awk -F: 'NF>=1 && $1!="" {print}' \
+    | sort -t: -k2 -nr \
+    | awk -F: '!seen[$1]++ { sec=$3; if (sec=="") sec="open"; print $1; print $2"%"; print sec }'
+}
+
+_is_secured() {
+  local ssid="$1"
+  nmcli -t -f SSID,SECURITY device wifi list 2>/dev/null \
+    | awk -F: -v s="$ssid" '$1==s && $2!="" { print "yes"; exit }'
+}
+
+picker() {
+  command -v yad   >/dev/null 2>&1 || { log_error "yad missing; cannot show WiFi picker"; return 3; }
+  command -v nmcli >/dev/null 2>&1 || { log_error "nmcli missing; cannot manage WiFi"; return 3; }
+
+  # Dark root + no leftover splash, so nothing but the picker is visible.
+  command -v xsetroot >/dev/null 2>&1 && xsetroot -solid "#0b1220" 2>/dev/null || true
+  /opt/thinclient/bin/thinclient-splash stop 2>/dev/null || true
+
+  log_info "WiFi picker opened (offline)"
+
+  while :; do
+    # If a route appeared while we were looping (e.g. Ethernet plugged in), stop.
+    tc_have_network && { log_info "Network detected; closing picker"; return 0; }
+
+    local rows; rows="$(_scan_rows)"
+    if [[ -z "$rows" ]]; then
+      yad --info --center --width=480 --title="No WiFi found" \
+          --window-icon="network-wireless" --image="network-wireless" \
+          --text="No WiFi networks found.\n\nPlug in an Ethernet cable, or click Rescan." \
+          --button="Rescan:0" --timeout=30 2>/dev/null || true
+      continue
+    fi
+
+    local ssid rc
+    ssid="$(printf '%s\n' "$rows" | yad --list --center --width=480 --height=470 \
+        --title="Select WiFi Network" --window-icon="network-wireless" \
+        --text="<b>No network connection</b>\nChoose a WiFi network to continue (or plug in Ethernet)." \
+        --column="Network" --column="Signal" --column="Security" \
+        --print-column=1 --separator='|' \
+        --button="Rescan:2" --button="Connect:0" 2>/dev/null)"
+    rc=$?
+    [[ $rc -eq 2 ]] && continue                          # Rescan
+    ssid="${ssid%%|*}"                                   # first column only
+    [[ $rc -ne 0 || -z "$ssid" ]] && { sleep 1; continue; }
+
+    local psk=""
+    if [[ "$(_is_secured "$ssid")" == "yes" ]]; then
+      psk="$(yad --entry --hide-text --center --width=400 \
+          --title="WiFi Password" --window-icon="network-wireless" \
+          --image="network-wireless" \
+          --text="Password for <b>${ssid}</b>:" \
+          --button="Back:1" --button="Connect:0" 2>/dev/null)" || continue
+    fi
+
+    # Attempt the connection with a pulsating "Connecting…" indicator.
+    log_info "Attempting WiFi connection to '${ssid}'"
+    ( if [[ -n "$psk" ]]; then
+        sudo_nmcli device wifi connect "$ssid" password "$psk"
+      else
+        sudo_nmcli device wifi connect "$ssid"
+      fi ) >>"${TC_LOG_DIR}/network.log" 2>&1 &
+    local nmpid=$!
+    ( while kill -0 "$nmpid" 2>/dev/null; do echo 20; sleep 0.3; done ) \
+      | yad --progress --pulsate --auto-close --center --width=380 --no-buttons \
+          --title="Connecting" --text="Connecting to ${ssid}…" 2>/dev/null || true
+    wait "$nmpid"; local crc=$?
+
+    if [[ $crc -eq 0 ]] && tc_have_network; then
+      log_info "WiFi connected: '${ssid}'"
+      yad --info --center --timeout=2 --title="Connected" \
+          --text="Connected to <b>${ssid}</b>." --button="OK:0" 2>/dev/null || true
+      return 0
+    fi
+
+    log_warn "WiFi connection to '${ssid}' failed (rc=${crc})"
+    yad --error --center --timeout=6 --title="Connection failed" \
+        --text="Could not connect to <b>${ssid}</b>.\nCheck the password and try again." \
+        --button="OK:0" 2>/dev/null || true
+    # loop re-scans and re-shows the list
+  done
+}
+
+case "${1:-picker}" in
+  picker) picker ;;
+  status) tc_have_network && { echo "online"; exit 0; } || { echo "offline"; exit 1; } ;;
+  *) echo "Usage: $0 {picker|status}" >&2; exit 2 ;;
+esac

@@ -1,0 +1,53 @@
+# =============================================================================
+#  ThinClient OS — Kiosk X session (systemd-supervised)
+#  Installed to: /etc/systemd/system/thinclient-x.service
+#
+#  systemd itself is the supervisor of the X server + RDP loop. If X crashes,
+#  Openbox dies, or the launcher exits, systemd restarts the whole session
+#  within RestartSec — the user is never dropped to a console. The watchdog
+#  (a higher-level health monitor) restarts THIS service on a stale heartbeat.
+# =============================================================================
+[Unit]
+Description=ThinClient kiosk RDP session (FreeRDP on X)
+Documentation=file:/opt/thinclient/docs/ADMIN.md
+# Come up only once the graphical stack and networking are ready.
+After=systemd-user-sessions.service plymouth-quit-wait.service network-online.target
+Wants=network-online.target
+# Own VT7 exclusively; never let a getty share it.
+After=getty@tty7.service
+Conflicts=getty@tty7.service
+
+[Service]
+Type=simple
+User=thinclient
+Group=thinclient
+# A real PAM login session so logind grants a seat + XDG_RUNTIME_DIR.
+PAMName=login
+# Bind to VT7 and take it over cleanly.
+TTYPath=/dev/tty7
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+UtmpIdentifier=tty7
+UtmpMode=user
+WorkingDirectory=/home/thinclient
+Environment=HOME=/home/thinclient
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=XDG_SESSION_TYPE=x11
+# Ensure runtime dirs exist before X starts (belt-and-suspenders vs logind).
+ExecStartPre=/bin/mkdir -p /run/thinclient /run/user/1000
+ExecStartPre=/bin/chown thinclient:thinclient /run/user/1000
+# Launch X with our session client as the single xinit program on VT7.
+ExecStart=/usr/bin/xinit /opt/thinclient/bin/thinclient-xsession -- :0 vt7 -nolisten tcp -keeptty
+# Always come back, quickly, no matter how the session ended.
+Restart=always
+RestartSec=2
+# Give a crash-looping session a small breather instead of hammering the CPU.
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Install]
+WantedBy=graphical.target

@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  ThinClient OS — Boot preparation (run by thinclient-firstboot.service)
+#  Installed to: /opt/thinclient/bin/thinclient-firstboot
+#
+#  Idempotent setup performed before the kiosk session starts:
+#    * create log + run directories with correct ownership/mode
+#    * enforce secure permissions on secret-bearing config files
+#    * seed empty log files so logrotate + the log viewer always have targets
+#    * record a build/boot marker for diagnostics
+# =============================================================================
+set -uo pipefail
+
+source "${TC_LIB_DIR:-/opt/thinclient/lib}"/thinclient-common.sh
+export TC_LOGFILE="boot"
+
+# --- Directories --------------------------------------------------------------
+mkdir -p "$TC_LOG_DIR" "$TC_RUN_DIR" "$TC_ETC"
+chmod 0755 "$TC_LOG_DIR"
+
+# --- Seed log files -----------------------------------------------------------
+for f in boot rdp watchdog network install thinclient; do
+  touch "${TC_LOG_DIR}/${f}.log"
+  chmod 0640 "${TC_LOG_DIR}/${f}.log"
+done
+# thinclient user must be able to append to the logs it owns.
+chown -R root:thinclient "$TC_LOG_DIR" 2>/dev/null || true
+chmod 0775 "$TC_LOG_DIR"
+
+# --- Secure the secret-bearing config -----------------------------------------
+if [[ -f "$TC_CONF" ]]; then
+  chown root:thinclient "$TC_CONF" 2>/dev/null || true
+  # If a PASSWORD is stored, lock the file to root+group read only.
+  if [[ -n "$(conf_get PASSWORD)" ]]; then
+    chmod 0640 "$TC_CONF"
+  else
+    chmod 0644 "$TC_CONF"
+  fi
+fi
+if [[ -f "$TC_ADMIN_CONF" ]]; then
+  chown root:root "$TC_ADMIN_CONF" 2>/dev/null || true
+  chmod 0600 "$TC_ADMIN_CONF"
+fi
+
+# --- Runtime dir --------------------------------------------------------------
+chown thinclient:thinclient "$TC_RUN_DIR" 2>/dev/null || true
+tc_set_state "BOOT"
+
+# --- Build marker -------------------------------------------------------------
+if [[ ! -f "$TC_ETC/build-info" ]]; then
+  {
+    echo "build_date=unknown"
+    echo "first_boot=$(date --iso-8601=seconds 2>/dev/null || date)"
+  } >"$TC_ETC/build-info"
+fi
+
+# --- Baked WiFi (optional) ----------------------------------------------------
+# If WIFI_SSID is set, (re)generate a NetworkManager keyfile so the machine
+# auto-joins that network. Regenerated each boot so editing the config takes
+# effect; removed if the SSID is cleared. The on-screen picker still handles
+# any network the baked one can't reach.
+WIFI_KEYFILE="/etc/NetworkManager/system-connections/thinclient-wifi.nmconnection"
+wifi_ssid="$(conf_get WIFI_SSID)"
+if [[ -n "$wifi_ssid" ]]; then
+  wifi_psk="$(conf_get WIFI_PSK)"
+  mkdir -p /etc/NetworkManager/system-connections
+  {
+    printf '[connection]\nid=thinclient-wifi\ntype=wifi\nautoconnect=true\nautoconnect-priority=10\n\n'
+    printf '[wifi]\nmode=infrastructure\nssid=%s\n\n' "$wifi_ssid"
+    if [[ -n "$wifi_psk" ]]; then
+      printf '[wifi-security]\nkey-mgmt=wpa-psk\npsk=%s\n\n' "$wifi_psk"
+    fi
+    printf '[ipv4]\nmethod=auto\n\n[ipv6]\nmethod=auto\n'
+  } >"$WIFI_KEYFILE"
+  chmod 600 "$WIFI_KEYFILE"; chown root:root "$WIFI_KEYFILE" 2>/dev/null || true
+  nmcli connection reload 2>/dev/null || true
+  log_info "Baked WiFi connection configured for SSID '${wifi_ssid}'"
+else
+  rm -f "$WIFI_KEYFILE" 2>/dev/null || true
+fi
+
+log_info "First-boot preparation complete."
+exit 0

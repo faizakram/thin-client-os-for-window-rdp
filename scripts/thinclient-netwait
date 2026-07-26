@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  ThinClient OS — Network gate
+#  Installed to: /opt/thinclient/bin/thinclient-netwait
+#
+#  Called by the session loop before each RDP attempt. Guarantees the machine
+#  has a network before we hammer the RDP server, and drives the WiFi picker
+#  when it doesn't:
+#
+#     online now?  -> return immediately
+#     no network?  -> wait NETWORK_GRACE seconds for ethernet/baked-WiFi/DHCP
+#     still none?  -> show the WiFi picker until a connection is established
+#
+#  A transient WiFi blip is absorbed by the grace window (NetworkManager
+#  auto-reconnects), so the picker only appears on a genuine, sustained outage.
+# =============================================================================
+set -uo pipefail
+
+source "${TC_LIB_DIR:-/opt/thinclient/lib}"/thinclient-common.sh
+export TC_LOGFILE="network"
+
+# Fast path: already online — the overwhelmingly common case.
+tc_have_network && exit 0
+
+grace="$(conf_get NETWORK_GRACE 20)"
+[[ "$grace" =~ ^[0-9]+$ ]] || grace=20
+
+# Grace window: give ethernet / the baked WiFi / DHCP a chance before bothering
+# anyone. The "Connecting…" splash from the caller stays up during this time.
+log_info "No network; waiting up to ${grace}s for auto-connect"
+i=0
+while (( i < grace )); do
+  tc_have_network && { log_info "Network came up during grace (${i}s)"; exit 0; }
+  sleep 1
+  i=$((i + 1))
+done
+
+# Sustained outage: hand over to the WiFi picker until we have a route. The
+# picker also returns immediately if Ethernet is plugged in mid-way.
+log_warn "Still offline after ${grace}s; launching WiFi picker"
+while ! tc_have_network; do
+  /opt/thinclient/bin/thinclient-wifi picker || true
+  tc_have_network && break
+  sleep 2
+done
+
+log_info "Network is up; proceeding to RDP"
+exit 0

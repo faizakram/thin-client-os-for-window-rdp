@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  ThinClient OS — Network control helper
+#  Installed to: /opt/thinclient/bin/thinclient-netctl
+#
+#  Thin wrapper over NetworkManager for the admin. Provides a GUI editor
+#  (nm-connection-editor) and a text status/summary. Only reachable from
+#  authenticated Admin Mode — the locked user cannot invoke network changes.
+#
+#  Usage: thinclient-netctl {gui|status|wifi <SSID> <PSK>|dhcp|ip <A/CIDR> <GW> <DNS>}
+# =============================================================================
+set -uo pipefail
+
+source "${TC_LIB_DIR:-/opt/thinclient/lib}"/thinclient-common.sh
+export TC_LOGFILE="network"
+
+cmd_gui() {
+  if command -v nm-connection-editor >/dev/null 2>&1; then
+    nm-connection-editor &
+  elif command -v nmtui >/dev/null 2>&1 && command -v xterm >/dev/null 2>&1; then
+    # Controlled, transient terminal ONLY for network config (admin-gated).
+    xterm -class ThinClientAdmin -title "Network Settings" -geometry 90x28 \
+          -e "sudo -n nmtui" &
+  else
+    log_error "No network configuration UI available"
+    return 3
+  fi
+}
+
+cmd_status() {
+  echo "== Network status =="
+  if command -v nmcli >/dev/null 2>&1; then
+    nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status
+    echo
+    nmcli -t -f IP4.ADDRESS,IP4.GATEWAY,IP4.DNS device show 2>/dev/null | grep -E 'ADDRESS|GATEWAY|DNS'
+  else
+    ip -brief addr 2>/dev/null || ifconfig 2>/dev/null
+  fi
+}
+
+cmd_wifi() {
+  local ssid="${1:?SSID required}" psk="${2:-}"
+  command -v nmcli >/dev/null 2>&1 || { log_error "nmcli missing"; return 3; }
+  if [[ -n "$psk" ]]; then
+    sudo -n nmcli device wifi connect "$ssid" password "$psk"
+  else
+    sudo -n nmcli device wifi connect "$ssid"
+  fi
+  log_info "Wi-Fi connect requested for SSID '${ssid}'"
+}
+
+cmd_dhcp() {
+  local con; con="$(nmcli -t -f NAME connection show --active | head -n1)"
+  [[ -n "$con" ]] || { log_error "No active connection"; return 1; }
+  sudo -n nmcli connection modify "$con" ipv4.method auto
+  sudo -n nmcli connection up "$con"
+  log_info "Switched '${con}' to DHCP"
+}
+
+cmd_ip() {
+  local addr="${1:?address/CIDR required}" gw="${2:?gateway required}" dns="${3:-1.1.1.1}"
+  local con; con="$(nmcli -t -f NAME connection show --active | head -n1)"
+  [[ -n "$con" ]] || { log_error "No active connection"; return 1; }
+  sudo -n nmcli connection modify "$con" ipv4.method manual \
+      ipv4.addresses "$addr" ipv4.gateway "$gw" ipv4.dns "$dns"
+  sudo -n nmcli connection up "$con"
+  log_info "Set static IP ${addr} gw ${gw} dns ${dns} on '${con}'"
+}
+
+case "${1:-status}" in
+  gui)    cmd_gui ;;
+  status) cmd_status ;;
+  wifi)   shift; cmd_wifi "$@" ;;
+  dhcp)   cmd_dhcp ;;
+  ip)     shift; cmd_ip "$@" ;;
+  *) echo "Usage: $0 {gui|status|wifi <SSID> [PSK]|dhcp|ip <A/CIDR> <GW> [DNS]}" >&2; exit 2 ;;
+esac

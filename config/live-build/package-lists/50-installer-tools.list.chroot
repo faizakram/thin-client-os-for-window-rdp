@@ -1,0 +1,21 @@
+# --- Tools required by the disk installer + diagnostics ----------------------
+parted
+gdisk
+dosfstools
+e2fsprogs
+rsync
+squashfs-tools
+grub2-common
+grub-common
+efibootmgr
+pciutils
+lshw
+htop
+# Bootloader binaries are architecture-specific.
+#if ARCHITECTURES amd64 i386
+grub-efi-amd64-bin
+grub-pc-bin
+#endif
+#if ARCHITECTURES arm64
+grub-efi-arm64-bin
+#endif

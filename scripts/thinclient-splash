@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  ThinClient OS — Full-screen "Connecting..." splash overlay
+#  Installed to: /opt/thinclient/bin/thinclient-splash
+#
+#  Usage:
+#     thinclient-splash start ["message"]   # show fullscreen splash (async)
+#     thinclient-splash stop                # remove the splash
+#
+#  The splash is a borderless, always-on-top, task-bar-less window with a
+#  pulsating indicator. It masks the bare X root so the user NEVER sees a
+#  blank Linux screen between RDP attempts.
+# =============================================================================
+set -uo pipefail
+
+source /opt/thinclient/lib/thinclient-common.sh 2>/dev/null || \
+  source "$(dirname "$(readlink -f "$0")")/lib/thinclient-common.sh"
+
+SPLASH_PID_FILE="${TC_RUN_DIR}/splash.pid"
+DEFAULT_MSG="Connecting to Remote Workspace..."
+
+_splash_stop() {
+  if [[ -f "$SPLASH_PID_FILE" ]]; then
+    local pid; pid="$(cat "$SPLASH_PID_FILE" 2>/dev/null || true)"
+    [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+    rm -f "$SPLASH_PID_FILE"
+  fi
+  # Belt-and-suspenders: clear any stray splash windows.
+  pkill -f 'yad .*--class=ThinClientSplash' 2>/dev/null || true
+}
+
+_splash_start() {
+  local msg="${1:-$DEFAULT_MSG}"
+  mkdir -p "$TC_RUN_DIR" 2>/dev/null || true
+  _splash_stop
+
+  # Dark, calm root color behind everything.
+  command -v xsetroot >/dev/null 2>&1 && xsetroot -solid "#0b1220" 2>/dev/null || true
+
+  # Prefer a branded splash image if present; else fall back to a text splash.
+  local img="/opt/thinclient/assets/connecting.png"
+  if command -v feh >/dev/null 2>&1 && [[ -f "$img" ]]; then
+    feh --fullscreen --hide-pointer --no-menus --zoom fill \
+        --title "ThinClientSplash" "$img" &
+    echo $! >"$SPLASH_PID_FILE"
+    return 0
+  fi
+
+  if command -v yad >/dev/null 2>&1; then
+    # Pulsating progress bar reads as "working / connecting".
+    yad --class=ThinClientSplash --fullscreen --undecorated --skip-taskbar \
+        --on-top --sticky --no-buttons --center \
+        --window-icon="network-workgroup" \
+        --title="Remote Workspace" \
+        --image="network-workgroup" --image-on-top \
+        --text="<span font='22' foreground='#e6edf7'>${msg}</span>" \
+        --progress --pulsate --auto-close --no-escape \
+        --css='window { background-color: #0b1220; }' \
+        < <(while :; do echo "#${msg}"; sleep 1; done) &
+    echo $! >"$SPLASH_PID_FILE"
+    return 0
+  fi
+
+  # Last-resort text splash (no GTK): centered xmessage on a dark root.
+  if command -v xmessage >/dev/null 2>&1; then
+    xmessage -center -bg "#0b1220" -fg "#e6edf7" "$msg" &
+    echo $! >"$SPLASH_PID_FILE"
+  fi
+}
+
+case "${1:-}" in
+  start) shift; _splash_start "${1:-}" ;;
+  stop)  _splash_stop ;;
+  *) echo "Usage: $0 {start [message]|stop}" >&2; exit 2 ;;
+esac

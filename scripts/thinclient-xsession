@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  ThinClient OS — X session entrypoint
+#  Installed to: /opt/thinclient/bin/thinclient-xsession
+#
+#  This is the single client that `xinit` execs (see thinclient-x.service).
+#  It hardens the X environment, starts a minimal window manager for focus /
+#  fullscreen / the admin hotkey, then hands off to the RDP reconnect loop.
+#
+#  When thinclient-session returns (only on shutdown/restart), X tears down and
+#  systemd restarts the whole service — the user never reaches a shell.
+# =============================================================================
+set -uo pipefail
+
+export TC_LOGFILE="boot"
+source "${TC_LIB_DIR:-/opt/thinclient/lib}"/thinclient-common.sh
+
+log_info "X session entrypoint starting on DISPLAY=${DISPLAY:-?}"
+
+# --- Screen power management: never blank to a black Linux console -----------
+if command -v xset >/dev/null 2>&1; then
+  xset s off       || true
+  xset -dpms       || true
+  xset s noblank   || true
+fi
+
+# --- Keyboard: disable the X server "zap" (Ctrl+Alt+Backspace kills X) -------
+if command -v setxkbmap >/dev/null 2>&1; then
+  # Do NOT map terminate:ctrl_alt_bksp — leaving it unset disables the zap.
+  setxkbmap -option || true
+fi
+
+# --- Root appearance while things spin up ------------------------------------
+command -v xsetroot >/dev/null 2>&1 && xsetroot -solid "#0b1220" || true
+
+# --- Render the Openbox config from the template (honors ADMIN_HOTKEY) -------
+render_openbox_config() {
+  local tmpl="/opt/thinclient/share/openbox/rc.xml.in"
+  local out="$HOME/.config/openbox/rc.xml"
+  local hotkey; hotkey="$(admin_get ADMIN_HOTKEY 'C-A-S-a')"
+  # Refuse obviously-broken hotkeys; fall back to the default.
+  [[ "$hotkey" =~ ^[A-Za-z0-9CASWcasw-]+$ ]] || hotkey='C-A-S-a'
+  mkdir -p "$HOME/.config/openbox"
+  if [[ -r "$tmpl" ]]; then
+    sed "s|@@ADMIN_HOTKEY@@|${hotkey}|g" "$tmpl" >"$out"
+    log_info "Rendered Openbox config with admin hotkey '${hotkey}'"
+  fi
+}
+render_openbox_config
+
+# --- Window manager (provides the admin hotkey + proper fullscreen focus) ----
+if command -v openbox >/dev/null 2>&1; then
+  openbox --config-file "$HOME/.config/openbox/rc.xml" &
+  TC_WM_PID=$!
+  log_info "Started Openbox (pid ${TC_WM_PID})"
+  # Give the WM a beat to own the root window before FreeRDP maps its window.
+  sleep 0.5
+else
+  log_warn "Openbox not installed; running WM-less."
+fi
+
+# --- Hand off to the RDP reconnect loop (runs forever) -----------------------
+exec /opt/thinclient/bin/thinclient-session

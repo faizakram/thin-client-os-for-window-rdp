@@ -1,0 +1,12 @@
+# --- Firmware for broad hardware support (needs non-free-firmware component) --
+firmware-linux
+firmware-linux-nonfree
+firmware-misc-nonfree
+firmware-iwlwifi
+firmware-realtek
+firmware-atheros
+# CPU microcode is x86-only.
+#if ARCHITECTURES amd64 i386
+intel-microcode
+amd64-microcode
+#endif

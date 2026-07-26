@@ -1,0 +1,29 @@
+# =============================================================================
+#  ThinClient OS — Session watchdog
+#  Installed to: /etc/systemd/system/thinclient-watchdog.service
+#
+#  Independent health monitor. Restarts thinclient-x.service when the session
+#  heartbeat goes stale (hung Openbox, deadlocked launcher, crashed X). Runs
+#  as root so it can drive systemctl.
+# =============================================================================
+[Unit]
+Description=ThinClient session watchdog
+Documentation=file:/opt/thinclient/docs/RECOVERY.md
+After=thinclient-x.service
+Wants=thinclient-x.service
+
+[Service]
+Type=simple
+ExecStart=/opt/thinclient/bin/thinclient-watchdog
+Restart=always
+RestartSec=3
+# Watchdog must survive OOM pressure so it can recover the box.
+OOMScoreAdjust=-500
+# Least privilege: it only needs to read config, write its log, and systemctl.
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/log/thinclient /run/thinclient /run
+NoNewPrivileges=no
+
+[Install]
+WantedBy=graphical.target

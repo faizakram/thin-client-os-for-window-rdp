@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  ThinClient OS — RDP session launcher (the outer reconnect loop)
+#  Installed to: /opt/thinclient/bin/thinclient-session
+#
+#  Started by the Openbox autostart inside the kiosk X session. Responsible
+#  for the ENTIRE user-visible lifecycle:
+#
+#     [splash] -> launch xfreerdp -> (session ends) -> [splash] -> retry ...
+#
+#  It runs forever. There is no path that drops the user to a Linux desktop.
+#  Password (if configured) is streamed to FreeRDP via stdin so it never
+#  appears in the process table.
+# =============================================================================
+set -uo pipefail
+
+export TC_LOGFILE="rdp"
+source "${TC_LIB_DIR:-/opt/thinclient/lib}"/thinclient-common.sh
+source "${TC_LIB_DIR:-/opt/thinclient/lib}"/rdp-build-args.sh
+
+log_info "===== ThinClient session launcher starting (pid $$) ====="
+tc_set_state "STARTING"
+
+# ---------------------------------------------------------------------------
+# Environment prep inside the X session.
+# ---------------------------------------------------------------------------
+# Disable screen blanking / DPMS — a thin client screen must never sleep to a
+# black Linux console.
+if command -v xset >/dev/null 2>&1; then
+  xset s off        2>/dev/null || true
+  xset -dpms        2>/dev/null || true
+  xset s noblank    2>/dev/null || true
+fi
+# Hide the mouse pointer after a short idle so no Linux cursor lingers.
+command -v unclutter >/dev/null 2>&1 && { unclutter -idle 3 -root & disown; }
+
+RDP_BIN="$(tc_rdp_binary)" || { log_error "No FreeRDP binary installed"; }
+
+RECONNECT="$(tc_bool "$(conf_get AUTO_RECONNECT true)")"
+INTERVAL="$(conf_get RECONNECT_INTERVAL 5)"
+[[ "$INTERVAL" =~ ^[0-9]+$ ]] || INTERVAL=5
+
+# Clean shutdown handling: on SIGTERM/SIGINT, tear down splash + child RDP.
+CURRENT_RDP_PID=""
+cleanup() {
+  log_info "Session launcher received termination signal; cleaning up"
+  tc_set_state "STOPPING"
+  [[ -n "$CURRENT_RDP_PID" ]] && kill "$CURRENT_RDP_PID" 2>/dev/null || true
+  /opt/thinclient/bin/thinclient-splash stop 2>/dev/null || true
+  exit 0
+}
+trap cleanup TERM INT
+
+# ---------------------------------------------------------------------------
+# The reconnect loop.
+# ---------------------------------------------------------------------------
+attempt=0
+while :; do
+  attempt=$((attempt + 1))
+  tc_heartbeat
+
+  # Show the connecting overlay so the bare X root is never visible.
+  tc_set_state "CONNECTING"
+  /opt/thinclient/bin/thinclient-splash start "Connecting to Remote Workspace..." || true
+
+  # Network gate: make sure we actually have a network before hammering RDP.
+  # If offline past the grace window, this shows the locked-down WiFi picker
+  # and only returns once a connection exists. It may tear down the splash
+  # (to show the picker), so re-assert the splash afterwards.
+  /opt/thinclient/bin/thinclient-netwait || true
+  /opt/thinclient/bin/thinclient-splash start "Connecting to Remote Workspace..." || true
+
+  # (Re)build the FreeRDP argv from the current config on EVERY attempt, so an
+  # admin editing server.conf takes effect on the next reconnect with no reboot.
+  if ! tc_build_rdp_args; then
+    log_error "Configuration invalid; cannot build RDP command. Retrying in ${INTERVAL}s."
+    sleep "$INTERVAL"
+    continue
+  fi
+
+  if [[ -z "$RDP_BIN" ]]; then
+    RDP_BIN="$(tc_rdp_binary)" || { sleep "$INTERVAL"; continue; }
+  fi
+
+  log_info "Attempt #${attempt}: connecting to $(conf_get SERVER_IP):$(conf_get PORT 3389) as '$(conf_get USERNAME)'"
+  log_debug "RDP command: ${RDP_BIN} ${TC_RDP_ARGS[*]}"
+
+  # Launch FreeRDP. Password (if any) goes over stdin via /from-stdin:force.
+  # We keep the splash up until FreeRDP paints; FreeRDP draws over it and we
+  # drop the splash a moment later so there is never a visible gap.
+  start_ts=$(date +%s)
+  if [[ -n "$TC_RDP_PASSWORD" ]]; then
+    printf '%s\n' "$TC_RDP_PASSWORD" | "$RDP_BIN" "${TC_RDP_ARGS[@]}" \
+        >>"${TC_LOG_DIR}/rdp.log" 2>&1 &
+  else
+    "$RDP_BIN" "${TC_RDP_ARGS[@]}" </dev/null \
+        >>"${TC_LOG_DIR}/rdp.log" 2>&1 &
+  fi
+  CURRENT_RDP_PID=$!
+  tc_set_state "CONNECTED"
+
+  # Give FreeRDP a moment to grab the screen, then drop the splash.
+  ( sleep 4; /opt/thinclient/bin/thinclient-splash stop 2>/dev/null ) &
+
+  # Heartbeat while the session is alive (feeds the watchdog).
+  while kill -0 "$CURRENT_RDP_PID" 2>/dev/null; do
+    tc_heartbeat
+    sleep "$(conf_get WATCHDOG_INTERVAL 5)"
+  done
+  wait "$CURRENT_RDP_PID" 2>/dev/null
+  rc=$?
+  CURRENT_RDP_PID=""
+  end_ts=$(date +%s)
+  duration=$(( end_ts - start_ts ))
+
+  log_info "RDP session ended after ${duration}s (exit ${rc})"
+  tc_set_state "DISCONNECTED"
+  /opt/thinclient/bin/thinclient-splash stop 2>/dev/null || true
+
+  if [[ "$RECONNECT" != "true" ]]; then
+    log_warn "AUTO_RECONNECT disabled; showing reconnect splash and holding."
+    /opt/thinclient/bin/thinclient-splash start "Session ended. Reconnecting is disabled." || true
+    # Never expose the desktop even when reconnect is off — hold on the splash.
+    while :; do sleep 3600; done
+  fi
+
+  # Guard against a hot crash loop hammering the CPU: if RDP died almost
+  # instantly, back off a little more; otherwise honor the configured interval.
+  if (( duration < 3 )); then
+    log_warn "RDP exited almost immediately; backing off ${INTERVAL}s before retry."
+  fi
+  sleep "$INTERVAL"
+done

@@ -1,0 +1,29 @@
+# --- Base system, init, live tooling -----------------------------------------
+# Kernel metapackage is architecture-specific.
+#if ARCHITECTURES amd64
+linux-image-amd64
+#endif
+#if ARCHITECTURES arm64
+linux-image-arm64
+#endif
+#if ARCHITECTURES i386
+linux-image-686-pae
+#endif
+live-boot
+live-config
+live-config-systemd
+systemd-sysv
+systemd-timesyncd
+dbus
+sudo
+locales
+keyboard-configuration
+console-setup
+ca-certificates
+less
+psmisc
+procps
+util-linux
+logrotate
+openssl
+whois

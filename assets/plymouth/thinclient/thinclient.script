@@ -1,0 +1,68 @@
+// =============================================================================
+//  ThinClient OS — Plymouth boot splash (pure script; no binary assets)
+//  Installed to: /usr/share/plymouth/themes/thinclient/thinclient.script
+//
+//  Renders a calm, dark, appliance-style splash: solid background, product
+//  title, an animated "Connecting..." style status line, and a password box
+//  IF the boot ever needs one (e.g. LUKS). Uses Image.Text(), which requires
+//  the plymouth-label (pango) plugin — pulled in by the package list.
+// =============================================================================
+
+// --- Background --------------------------------------------------------------
+// #0b1220 -> normalized RGB.
+Window.SetBackgroundTopColor(0.043, 0.071, 0.125);
+Window.SetBackgroundBottomColor(0.043, 0.071, 0.125);
+
+screen_w = Window.GetWidth();
+screen_h = Window.GetHeight();
+
+// --- Title -------------------------------------------------------------------
+title.image  = Image.Text("Remote Workspace", 0.90, 0.93, 0.97, 1, "Sans Bold 30");
+title.sprite = Sprite(title.image);
+title.sprite.SetX(screen_w / 2 - title.image.GetWidth()  / 2);
+title.sprite.SetY(screen_h / 2 - title.image.GetHeight() / 2 - 30);
+title.sprite.SetZ(10);
+
+// --- Animated status line ("Starting" + growing ellipsis) --------------------
+status_tick = 0;
+fun make_status(text) {
+    img = Image.Text(text, 0.62, 0.70, 0.82, 1, "Sans 14");
+    spr = Sprite(img);
+    spr.SetX(screen_w / 2 - img.GetWidth() / 2);
+    spr.SetY(screen_h / 2 + 24);
+    spr.SetZ(10);
+    return spr;
+}
+status.sprite = make_status("Starting");
+
+fun refresh_callback() {
+    status_tick++;
+    dots = Math.Int((status_tick / 8)) ;
+    dots = dots - Math.Int(dots / 4) * 4;   // cycle 0..3
+    line = "Starting";
+    if (dots >= 1) line = line + ".";
+    if (dots >= 2) line = line + ".";
+    if (dots >= 3) line = line + ".";
+    status.sprite = make_status(line);
+}
+Plymouth.SetRefreshFunction(refresh_callback);
+
+// --- Progress message hook (systemd/plymouthd may push messages) -------------
+fun message_callback(text) {
+    msg.image  = Image.Text(text, 0.55, 0.62, 0.74, 1, "Sans 11");
+    msg.sprite = Sprite(msg.image);
+    msg.sprite.SetX(screen_w / 2 - msg.image.GetWidth() / 2);
+    msg.sprite.SetY(screen_h - 60);
+    msg.sprite.SetZ(10);
+}
+Plymouth.SetMessageFunction(message_callback);
+
+// --- Optional password prompt (only appears if the boot requests one) --------
+fun display_password_callback(prompt, bullets) {
+    box = Image.Text(prompt + "  " + bullets, 0.90, 0.93, 0.97, 1, "Sans 14");
+    pw.sprite = Sprite(box);
+    pw.sprite.SetX(screen_w / 2 - box.GetWidth() / 2);
+    pw.sprite.SetY(screen_h / 2 + 70);
+    pw.sprite.SetZ(20);
+}
+Plymouth.SetDisplayPasswordFunction(display_password_callback);

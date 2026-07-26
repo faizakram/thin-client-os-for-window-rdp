@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  ThinClient OS — GUI Configuration Tool
+#  Installed to: /opt/thinclient/bin/thinclient-admin
+#
+#  A lightweight yad-based admin panel. Requires NO Linux knowledge: an admin
+#  edits the server target and device toggles through a form, tests the
+#  connection, and saves. Assumes it was launched AFTER successful password
+#  auth (thinclient-adminmode handles the gate).
+#
+#  Writes go through thinclient-config (atomic, validated). Service actions go
+#  through thinclient-adminctl via the scoped sudoers rule.
+# =============================================================================
+set -uo pipefail
+
+source "${TC_LIB_DIR:-/opt/thinclient/lib}"/thinclient-common.sh
+export TC_LOGFILE="thinclient"
+
+CFG=/opt/thinclient/bin/thinclient-config
+ADMINCTL="sudo -n /opt/thinclient/bin/thinclient-adminctl"
+
+if ! command -v yad >/dev/null 2>&1; then
+  log_error "yad not installed; cannot show admin GUI"
+  exit 3
+fi
+
+# yad boolean helper: prints TRUE/FALSE for the checkbox default.
+yb() { [[ "$(tc_bool "$("$CFG" get "$1" "$2")")" == "true" ]] && echo TRUE || echo FALSE; }
+
+main_form() {
+  yad --form --center --width=560 --height=640 \
+      --title="ThinClient — Configuration" \
+      --window-icon="preferences-system" \
+      --text="<b>Remote Server &amp; Device Settings</b>\nChanges apply on the next reconnect." \
+      --field="Server IP / Host":TEXT      "$("$CFG" get SERVER_IP)" \
+      --field="Port":NUM                    "$("$CFG" get PORT 3389)!1..65535!1" \
+      --field="Username":TEXT               "$("$CFG" get USERNAME)" \
+      --field="Domain":TEXT                 "$("$CFG" get DOMAIN)" \
+      --field="Password (blank = prompt)":H "" \
+      --field="Security":CB                 "$(_cb SECURITY nla 'nla!tls!rdp')" \
+      --field="Fullscreen":CHK              "$(yb FULLSCREEN true)" \
+      --field="Multi-monitor":CHK           "$(yb MULTIMONITOR true)" \
+      --field="Dynamic resolution":CHK      "$(yb DYNAMIC_RESOLUTION true)" \
+      --field="Clipboard":CHK               "$(yb CLIPBOARD true)" \
+      --field="Speakers":CHK                "$(yb SPEAKERS true)" \
+      --field="Microphone":CHK              "$(yb MICROPHONE true)" \
+      --field="Camera":CHK                  "$(yb CAMERA false)" \
+      --field="USB redirection":CHK         "$(yb USB false)" \
+      --field="Printer":CHK                 "$(yb PRINTER false)" \
+      --field="GPU acceleration":CHK        "$(yb GPU true)" \
+      --field="Auto-reconnect":CHK          "$(yb AUTO_RECONNECT true)" \
+      --field="Reconnect interval (s)":NUM  "$("$CFG" get RECONNECT_INTERVAL 5)!1..120!1" \
+      --button="Test Connection!network-wired:2" \
+      --button="gtk-cancel:1" \
+      --button="Save & Apply!gtk-save:0"
+}
+
+# Build a yad CB field string with the current value first (yad shows first as selected).
+_cb() {
+  local key="$1" def="$2" choices="$3" cur
+  cur="$("$CFG" get "$key" "$def")"
+  # Move current value to the front.
+  local out="$cur"
+  IFS='!' read -r -a arr <<<"$choices"
+  for c in "${arr[@]}"; do [[ "$c" == "$cur" ]] || out="$out!$c"; done
+  echo "$out"
+}
+
+save_form() {
+  local IFS='|'; read -r -a f <<<"$1"
+  "$CFG" set SERVER_IP          "${f[0]}"
+  "$CFG" set PORT               "${f[1]%.*}"
+  "$CFG" set USERNAME           "${f[2]}"
+  "$CFG" set DOMAIN             "${f[3]}"
+  # Only overwrite the password if the admin typed a new one.
+  [[ -n "${f[4]}" ]] && "$CFG" set PASSWORD "${f[4]}"
+  "$CFG" set SECURITY           "${f[5]}"
+  "$CFG" set FULLSCREEN         "$([[ ${f[6]}  == TRUE ]] && echo true || echo false)"
+  "$CFG" set MULTIMONITOR       "$([[ ${f[7]}  == TRUE ]] && echo true || echo false)"
+  "$CFG" set DYNAMIC_RESOLUTION "$([[ ${f[8]}  == TRUE ]] && echo true || echo false)"
+  "$CFG" set CLIPBOARD          "$([[ ${f[9]}  == TRUE ]] && echo true || echo false)"
+  "$CFG" set SPEAKERS           "$([[ ${f[10]} == TRUE ]] && echo true || echo false)"
+  "$CFG" set MICROPHONE         "$([[ ${f[11]} == TRUE ]] && echo true || echo false)"
+  "$CFG" set CAMERA             "$([[ ${f[12]} == TRUE ]] && echo true || echo false)"
+  "$CFG" set USB                "$([[ ${f[13]} == TRUE ]] && echo true || echo false)"
+  "$CFG" set PRINTER            "$([[ ${f[14]} == TRUE ]] && echo true || echo false)"
+  "$CFG" set GPU                "$([[ ${f[15]} == TRUE ]] && echo true || echo false)"
+  "$CFG" set AUTO_RECONNECT     "$([[ ${f[16]} == TRUE ]] && echo true || echo false)"
+  "$CFG" set RECONNECT_INTERVAL "${f[17]%.*}"
+  log_info "Configuration saved via admin GUI"
+}
+
+while :; do
+  out="$(main_form)"; rc=$?
+  case "$rc" in
+    0)  # Save & Apply
+        save_form "$out"
+        yad --info --center --timeout=4 --title="Saved" \
+            --text="Configuration saved.\nApplying on next reconnect..." --button="gtk-ok:0" || true
+        # Apply immediately by restarting the session.
+        $ADMINCTL restart-session 2>/dev/null || true
+        break ;;
+    2)  # Test Connection — save first so the probe uses the new values.
+        save_form "$out"
+        report="$(/opt/thinclient/bin/thinclient-test-connection 2>&1)"
+        yad --text-info --center --width=620 --height=420 --title="Connection Test" \
+            --fontname="Monospace 10" --wrap --button="gtk-close:0" <<<"$report" || true
+        ;;
+    *)  # Cancel / closed
+        break ;;
+  esac
+done

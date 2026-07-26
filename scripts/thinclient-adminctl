@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  ThinClient OS — Admin control / authentication backend
+#  Installed to: /opt/thinclient/bin/thinclient-adminctl
+#
+#  Central authority for:
+#    * Verifying the admin password against the salted hash in admin.conf
+#    * Setting/changing the admin password
+#    * Privileged service actions invoked by the admin GUI (restart/stop/start
+#      the session, view logs, run diagnostics)
+#
+#  Password verification uses the SHA-512 crypt hash (openssl passwd -6) and a
+#  simple attempt-lockout to blunt brute force from the on-screen prompt.
+#
+#  Privileged actions are gated so ONLY this tool (run via a tightly-scoped
+#  sudoers rule) can restart the kiosk — the locked user has no general sudo.
+# =============================================================================
+set -uo pipefail
+
+source "${TC_LIB_DIR:-/opt/thinclient/lib}"/thinclient-common.sh
+export TC_LOGFILE="thinclient"
+
+X_SERVICE="thinclient-x.service"
+WD_SERVICE="thinclient-watchdog.service"
+LOCK_STATE="${TC_RUN_DIR}/admin.lock"
+
+# ---------------------------------------------------------------------------
+# Password verification against ADMIN_PASSWORD_HASH ($6$ SHA-512 crypt).
+# Reads the candidate password from stdin (never argv).
+# ---------------------------------------------------------------------------
+_verify_password() {
+  local hash candidate salt computed
+  hash="$(admin_get ADMIN_PASSWORD_HASH)"
+  [[ -n "$hash" ]] || { log_error "No ADMIN_PASSWORD_HASH configured"; return 3; }
+  IFS= read -r candidate || true
+
+  # Extract "$6$salt$" prefix and recompute with the same salt.
+  salt="$(printf '%s' "$hash" | awk -F'\\$' '{print "$"$2"$"$3"$"}')"
+  if command -v openssl >/dev/null 2>&1; then
+    computed="$(printf '%s' "$candidate" | openssl passwd -6 -salt "$(printf '%s' "$hash" | cut -d'$' -f3)" -stdin 2>/dev/null)"
+  elif command -v mkpasswd >/dev/null 2>&1; then
+    computed="$(printf '%s' "$candidate" | mkpasswd -m sha-512 -S "$(printf '%s' "$hash" | cut -d'$' -f3)" -s 2>/dev/null)"
+  else
+    log_error "Neither openssl nor mkpasswd available for password check"; return 3
+  fi
+
+  [[ "$computed" == "$hash" ]]
+}
+
+_locked_out() {
+  local max lock_secs attempts locked_at now
+  max="$(admin_get ADMIN_MAX_ATTEMPTS 5)"
+  lock_secs="$(admin_get ADMIN_LOCKOUT_SECONDS 300)"
+  [[ -r "$LOCK_STATE" ]] || return 1
+  attempts="$(sed -n '1p' "$LOCK_STATE" 2>/dev/null || echo 0)"
+  locked_at="$(sed -n '2p' "$LOCK_STATE" 2>/dev/null || echo 0)"
+  [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
+  [[ "$locked_at" =~ ^[0-9]+$ ]] || locked_at=0
+  now=$(date +%s)
+  if (( attempts >= max )) && (( now - locked_at < lock_secs )); then
+    return 0   # still locked
+  fi
+  (( now - locked_at >= lock_secs )) && rm -f "$LOCK_STATE"
+  return 1
+}
+
+_record_failure() {
+  mkdir -p "$TC_RUN_DIR"
+  local attempts=0
+  [[ -r "$LOCK_STATE" ]] && attempts="$(sed -n '1p' "$LOCK_STATE" 2>/dev/null || echo 0)"
+  [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
+  attempts=$((attempts + 1))
+  printf '%s\n%s\n' "$attempts" "$(date +%s)" >"$LOCK_STATE"
+}
+
+cmd_check() {
+  if _locked_out; then
+    log_warn "Admin auth attempted during lockout"
+    echo "LOCKED"; return 4
+  fi
+  if _verify_password; then
+    rm -f "$LOCK_STATE"
+    log_info "Admin authentication succeeded"
+    echo "OK"; return 0
+  fi
+  _record_failure
+  log_warn "Admin authentication FAILED"
+  echo "FAIL"; return 1
+}
+
+cmd_set_password() {
+  # Interactive: prompt twice, write $6$ hash into admin.conf.
+  local p1 p2 salt hash
+  read -r -s -p "New admin password: " p1; echo
+  read -r -s -p "Confirm password:  " p2; echo
+  [[ "$p1" == "$p2" ]] || { echo "Passwords do not match." >&2; return 1; }
+  [[ -n "$p1" ]] || { echo "Password cannot be empty." >&2; return 1; }
+  salt="$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n' | cut -c1-12)"
+  hash="$(printf '%s' "$p1" | openssl passwd -6 -salt "$salt" -stdin)"
+  /opt/thinclient/bin/thinclient-config >/dev/null 2>&1 || true
+  # Write directly into admin.conf (root-owned, 0600).
+  local tmp; tmp="$(mktemp)"
+  if grep -qE '^[[:space:]]*ADMIN_PASSWORD_HASH[[:space:]]*=' "$TC_ADMIN_CONF" 2>/dev/null; then
+    sed -E "s|^[[:space:]]*ADMIN_PASSWORD_HASH[[:space:]]*=.*|ADMIN_PASSWORD_HASH=${hash}|" "$TC_ADMIN_CONF" >"$tmp"
+  else
+    cat "$TC_ADMIN_CONF" 2>/dev/null >"$tmp" || true
+    printf 'ADMIN_PASSWORD_HASH=%s\n' "$hash" >>"$tmp"
+  fi
+  chmod 600 "$tmp"; chown root:root "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$TC_ADMIN_CONF"
+  log_info "Admin password changed"
+  echo "Admin password updated."
+}
+
+# --- Privileged service actions (called by the admin GUI via sudo) ----------
+cmd_stop_session()    { log_info "Admin: stopping session";  systemctl stop "$X_SERVICE" "$WD_SERVICE"; }
+cmd_start_session()   { log_info "Admin: starting session";  systemctl start "$WD_SERVICE" "$X_SERVICE"; }
+cmd_restart_session() { log_info "Admin: restarting session"; systemctl restart "$X_SERVICE"; }
+
+case "${1:-}" in
+  check)            cmd_check ;;                 # reads password on stdin
+  set-password)     cmd_set_password ;;
+  stop-session)     cmd_stop_session ;;
+  start-session)    cmd_start_session ;;
+  restart-session)  cmd_restart_session ;;
+  *) echo "Usage: $0 {check|set-password|stop-session|start-session|restart-session}" >&2; exit 2 ;;
+esac

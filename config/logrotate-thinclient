@@ -1,0 +1,20 @@
+# =============================================================================
+#  ThinClient OS — Log rotation
+#  Installed to: /etc/logrotate.d/thinclient
+#
+#  copytruncate is used because the launcher and watchdog hold their log files
+#  open for the lifetime of the session; truncating in place avoids having to
+#  signal or restart them to reopen a new file.
+# =============================================================================
+/var/log/thinclient/*.log {
+    daily
+    rotate 7
+    size 5M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root thinclient
+    create 0640 root thinclient
+}

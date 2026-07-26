@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ThinClient OS — Openbox configuration TEMPLATE
+  Rendered to ~/.config/openbox/rc.xml at session start by thinclient-xsession.
+  @@ADMIN_HOTKEY@@ is substituted from ADMIN_HOTKEY in /etc/thinclient/admin.conf.
+
+  Design goals:
+    * The ONLY keybinding is the hidden admin hotkey. Everything else
+      (Alt+Tab, Alt+F4, window menus, workspace switching) is intentionally
+      absent, so those shortcuts do nothing.
+    * The desktop right-click menu is disabled — there is no menu to reach.
+    * Every window is undecorated, maximized, focused and kept below-nothing,
+      so the FreeRDP window is effectively borderless fullscreen.
+-->
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+
+  <resistance>
+    <strength>0</strength>
+    <screen_edge_strength>0</screen_edge_strength>
+  </resistance>
+
+  <focus>
+    <focusNew>yes</focusNew>
+    <followMouse>no</followMouse>
+    <focusLast>yes</focusLast>
+    <underMouse>no</underMouse>
+  </focus>
+
+  <placement>
+    <policy>Smart</policy>
+    <center>yes</center>
+  </placement>
+
+  <theme>
+    <name>Clearlooks</name>
+    <titleLayout>NLIMC</titleLayout>
+    <keepBorder>no</keepBorder>
+    <animateIconify>no</animateIconify>
+  </theme>
+
+  <desktops>
+    <number>1</number>
+    <firstdesk>1</firstdesk>
+    <popupTime>0</popupTime>
+  </desktops>
+
+  <resize>
+    <drawContents>yes</drawContents>
+    <popupShow>Never</popupShow>
+  </resize>
+
+  <!-- Keyboard: ONLY the hidden admin hotkey exists. -->
+  <keyboard>
+    <chainQuitKey>C-g</chainQuitKey>
+    <keybind key="@@ADMIN_HOTKEY@@">
+      <action name="Execute">
+        <command>/opt/thinclient/bin/thinclient-adminmode</command>
+      </action>
+    </keybind>
+  </keyboard>
+
+  <!-- Mouse: no desktop menu, no window controls, no drag-to-move. -->
+  <mouse>
+    <dragThreshold>8</dragThreshold>
+    <doubleClickTime>0</doubleClickTime>
+    <screenEdgeWarpTime>0</screenEdgeWarpTime>
+    <context name="Desktop"></context>
+    <context name="Root"></context>
+    <context name="Titlebar"></context>
+    <context name="Frame"></context>
+    <context name="Client">
+      <mousebind button="Left" action="Press">
+        <action name="Focus"/>
+      </mousebind>
+    </context>
+  </mouse>
+
+  <!-- Force every mapped window to fullscreen, undecorated, focused. -->
+  <applications>
+    <application class="*">
+      <decor>no</decor>
+      <focus>yes</focus>
+      <fullscreen>yes</fullscreen>
+      <maximized>true</maximized>
+      <layer>normal</layer>
+      <iconic>no</iconic>
+    </application>
+  </applications>
+
+</openbox_config>

@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  ThinClient OS — Watchdog
+#  Installed to: /opt/thinclient/bin/thinclient-watchdog
+#  Runs as a root systemd service (thinclient-watchdog.service).
+#
+#  Every WATCHDOG_INTERVAL seconds it answers the question:
+#     "Is the kiosk RDP session healthy?"
+#
+#  Health is judged from a HEARTBEAT that thinclient-session refreshes both
+#  while connected AND while waiting to reconnect. Using the heartbeat (rather
+#  than a naive "is xfreerdp running?" check) means the watchdog does NOT fight
+#  the launcher's own intentional reconnect pauses — but it DOES catch a hung
+#  Openbox, a deadlocked launcher, or a crashed X server, and force-restarts
+#  the whole graphical session so the desktop is never left exposed.
+# =============================================================================
+set -uo pipefail
+
+export TC_LOGFILE="watchdog"
+source "${TC_LIB_DIR:-/opt/thinclient/lib}"/thinclient-common.sh
+
+X_SERVICE="thinclient-x.service"
+
+interval="$(conf_get WATCHDOG_INTERVAL 5)"
+[[ "$interval" =~ ^[0-9]+$ ]] && (( interval >= 1 )) || interval=5
+
+# Consider the session dead if the heartbeat is older than this. Generous
+# enough to never false-positive on a slow reconnect, tight enough to recover
+# a truly wedged session within a few seconds.
+stale_threshold=$(( interval * 3 ))
+(( stale_threshold < 15 )) && stale_threshold=15
+
+# After a forced restart, wait for the session to come back before judging again.
+restart_grace=20
+
+log_info "Watchdog started: interval=${interval}s stale_threshold=${stale_threshold}s"
+
+service_active() { systemctl is-active --quiet "$X_SERVICE" 2>/dev/null; }
+
+while :; do
+  sleep "$interval"
+
+  # Only supervise when the session service is actually enabled/active. During
+  # Admin Mode (which stops thinclient-x.service) we must stay hands-off.
+  if ! service_active; then
+    log_debug "Session service not active; watchdog idle."
+    continue
+  fi
+
+  now=$(date +%s)
+  hb=0
+  [[ -r "$TC_HEARTBEAT_FILE" ]] && hb="$(cat "$TC_HEARTBEAT_FILE" 2>/dev/null || echo 0)"
+  [[ "$hb" =~ ^[0-9]+$ ]] || hb=0
+  age=$(( now - hb ))
+
+  launcher_alive=0
+  pgrep -f '/opt/thinclient/bin/thinclient-session' >/dev/null 2>&1 && launcher_alive=1
+
+  if (( age > stale_threshold )) || (( launcher_alive == 0 )); then
+    log_warn "Unhealthy session: heartbeat_age=${age}s (>${stale_threshold}s) launcher_alive=${launcher_alive} state=$(tc_get_state). Restarting ${X_SERVICE}."
+    # Reap any orphaned FreeRDP first so it cannot linger and grab the screen.
+    pkill -TERM -f 'xfreerdp' 2>/dev/null || true
+    systemctl restart "$X_SERVICE" 2>/dev/null || log_error "Failed to restart ${X_SERVICE}"
+    log_info "Restart issued; holding ${restart_grace}s for recovery."
+    sleep "$restart_grace"
+  else
+    log_debug "Healthy: heartbeat_age=${age}s state=$(tc_get_state)"
+  fi
+done

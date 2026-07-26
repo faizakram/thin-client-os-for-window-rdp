@@ -1,0 +1,32 @@
+# =============================================================================
+#  ThinClient OS — Scoped privileges for the locked kiosk user
+#  Installed to: /etc/sudoers.d/thinclient   (mode 0440, root:root)
+#
+#  The 'thinclient' user has NO general sudo. It may run ONLY the exact
+#  maintenance commands below, and ONLY without a password so Admin-Mode
+#  actions work after the admin-password gate. Because the session exposes no
+#  shell or terminal, these commands are unreachable outside Admin Mode.
+#
+#  Validate before install with:  visudo -cf config/sudoers-thinclient
+# =============================================================================
+
+# Restart / stop / start the kiosk session (invoked by the admin GUI).
+thinclient ALL=(root) NOPASSWD: /opt/thinclient/bin/thinclient-adminctl start-session
+thinclient ALL=(root) NOPASSWD: /opt/thinclient/bin/thinclient-adminctl stop-session
+thinclient ALL=(root) NOPASSWD: /opt/thinclient/bin/thinclient-adminctl restart-session
+
+# Power actions from Admin Mode.
+thinclient ALL=(root) NOPASSWD: /usr/bin/systemctl reboot
+thinclient ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff
+
+# Package updates from Admin Mode.
+thinclient ALL=(root) NOPASSWD: /usr/bin/apt-get update
+thinclient ALL=(root) NOPASSWD: /usr/bin/apt-get -y upgrade
+
+# Network configuration from Admin Mode (NetworkManager CLI/TUI).
+thinclient ALL=(root) NOPASSWD: /usr/bin/nmcli *
+thinclient ALL=(root) NOPASSWD: /usr/bin/nmtui
+
+# Never require a tty for these (the GUI has no controlling terminal).
+Defaults:thinclient !requiretty
+Defaults:thinclient !authenticate

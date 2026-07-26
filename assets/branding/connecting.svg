@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ThinClient OS — "Connecting" splash source art.
+  Rendered to /opt/thinclient/assets/connecting.png at build time (ImageMagick
+  or rsvg-convert). If rendering tooling is unavailable, the X splash falls
+  back to a live yad progress window, so this asset is a nicety, not a hard
+  dependency. 1920x1080 canvas scales cleanly to common panel sizes.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">
+  <rect width="1920" height="1080" fill="#0b1220"/>
+  <g fill="none" stroke="#1b2740" stroke-width="2" opacity="0.5">
+    <circle cx="960" cy="470" r="120"/>
+    <circle cx="960" cy="470" r="170"/>
+    <circle cx="960" cy="470" r="220"/>
+  </g>
+  <!-- Simple monitor glyph -->
+  <g transform="translate(880,390)">
+    <rect x="0" y="0" width="160" height="104" rx="10" fill="#132038" stroke="#3b82f6" stroke-width="3"/>
+    <rect x="18" y="18" width="124" height="60" rx="4" fill="#0f1a2e"/>
+    <rect x="62" y="104" width="36" height="16" fill="#3b82f6"/>
+    <rect x="44" y="120" width="72" height="8" rx="4" fill="#3b82f6"/>
+  </g>
+  <text x="960" y="640" text-anchor="middle" font-family="DejaVu Sans, Sans-serif"
+        font-size="46" font-weight="bold" fill="#e6edf7">Connecting to Remote Workspace…</text>
+  <text x="960" y="700" text-anchor="middle" font-family="DejaVu Sans, Sans-serif"
+        font-size="22" fill="#7e8ba3">Please wait — establishing a secure session</text>
+</svg>
