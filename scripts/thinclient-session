@@ -124,10 +124,31 @@ while :; do
     while :; do sleep 3600; done
   fi
 
-  # Guard against a hot crash loop hammering the CPU: if RDP died almost
-  # instantly, back off a little more; otherwise honor the configured interval.
-  if (( duration < 3 )); then
-    log_warn "RDP exited almost immediately; backing off ${INTERVAL}s before retry."
+  # Track fast crashes. If FreeRDP keeps dying almost instantly, it is NOT a
+  # normal reconnect (server reboot etc.) — it's a real error. Surface it
+  # on screen so it can be photographed, instead of flashing forever.
+  if (( duration < 6 )); then
+    fast_fail=$(( ${fast_fail:-0} + 1 ))
+  else
+    fast_fail=0
+  fi
+  if (( fast_fail >= 3 )); then
+    log_error "FreeRDP is crashing on connect (${fast_fail}x); showing the error for diagnosis."
+    /opt/thinclient/bin/thinclient-splash stop 2>/dev/null || true
+    if command -v yad >/dev/null 2>&1; then
+      { echo "Esparks IT Solutions - RDP DIAGNOSTIC   (PHOTOGRAPH THIS SCREEN)";
+        echo "FreeRDP keeps crashing when connecting to $(conf_get SERVER_IP):$(conf_get PORT 3389)";
+        echo "exit code of last attempt: ${rc}";
+        echo "--------------------------------------------------------------";
+        echo "Command (password sent separately, not shown):";
+        echo "${RDP_BIN} ${TC_RDP_ARGS[*]}";
+        echo "--------------------------------------------------------------";
+        echo "Last lines of rdp.log:";
+        tail -n 45 "${TC_LOG_DIR}/rdp.log" 2>/dev/null;
+      } | yad --text-info --fullscreen --title="Esparks - RDP diagnostic" \
+              --fontname="Monospace 9" --wrap --button="Retry:0" 2>/dev/null || true
+    fi
+    fast_fail=0
   fi
   sleep "$INTERVAL"
 done

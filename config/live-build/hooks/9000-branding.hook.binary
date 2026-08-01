@@ -1,0 +1,43 @@
+#!/bin/sh
+# =============================================================================
+#  Esparks IT Solutions — boot-menu rebranding (runs in the live-build BINARY
+#  stage, where ./binary/ holds the assembled ISO tree before packing).
+#
+#  Replaces the default "Debian GNU/Linux" / "Live system" GRUB entries with
+#  the company name, and shortens the menu timeout so it auto-boots.
+# =============================================================================
+set -e
+echo "I: [branding] rebranding boot menu to Esparks IT Solutions"
+
+BRAND="Esparks IT Solutions"
+
+rebrand_file() {
+  f="$1"
+  [ -f "$f" ] || return 0
+  sed -i \
+    -e "s|Debian GNU/Linux[ ]*[0-9]*|${BRAND}|g" \
+    -e "s|Debian GNU/Linux|${BRAND}|g" \
+    -e "s|Debian Live|${BRAND}|g" \
+    -e "s|Live system (\(.*\))|${BRAND} (\1)|g" \
+    -e "s|Live system|${BRAND}|g" \
+    "$f"
+}
+
+# GRUB (BIOS grub-pc + UEFI grub-efi) menu configs.
+for f in binary/boot/grub/grub.cfg binary/boot/grub/loopback.cfg \
+         binary/boot/grub/*.cfg; do
+  rebrand_file "$f"
+done
+# Trim the timeout so it boots quickly (branding shows via Plymouth anyway).
+for f in binary/boot/grub/grub.cfg binary/boot/grub/*.cfg; do
+  [ -f "$f" ] || continue
+  sed -i -e 's/^set timeout=.*/set timeout=3/' \
+         -e 's/^timeout .*/timeout 30/' "$f" 2>/dev/null || true
+done
+
+# isolinux (only present if a BIOS syslinux bootloader was selected).
+for f in binary/isolinux/*.cfg; do
+  rebrand_file "$f"
+done
+
+echo "I: [branding] boot menu rebranded"

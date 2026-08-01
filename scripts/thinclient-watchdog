@@ -19,7 +19,8 @@ set -uo pipefail
 export TC_LOGFILE="watchdog"
 source "${TC_LIB_DIR:-/opt/thinclient/lib}"/thinclient-common.sh
 
-X_SERVICE="thinclient-x.service"
+# The graphical session is now managed by LightDM (display-manager).
+X_SERVICE="lightdm.service"
 
 interval="$(conf_get WATCHDOG_INTERVAL 5)"
 [[ "$interval" =~ ^[0-9]+$ ]] && (( interval >= 1 )) || interval=5
@@ -41,29 +42,38 @@ while :; do
   sleep "$interval"
 
   # Only supervise when the session service is actually enabled/active. During
-  # Admin Mode (which stops thinclient-x.service) we must stay hands-off.
+  # Admin Mode (which stops lightdm) we must stay hands-off.
   if ! service_active; then
     log_debug "Session service not active; watchdog idle."
     continue
   fi
 
-  now=$(date +%s)
-  hb=0
-  [[ -r "$TC_HEARTBEAT_FILE" ]] && hb="$(cat "$TC_HEARTBEAT_FILE" 2>/dev/null || echo 0)"
-  [[ "$hb" =~ ^[0-9]+$ ]] || hb=0
-  age=$(( now - hb ))
+  # Health is process-based: the session is fine as long as the connection
+  # window (or an active RDP session) is running. It is NOT based on a heartbeat,
+  # because the connection form blocks on user input (typing) and can't beat —
+  # a heartbeat check would falsely restart the session while the user types.
+  session_alive=0
+  if pgrep -f 'thinclient-connect' >/dev/null 2>&1 \
+     || pgrep -x xfreerdp3 >/dev/null 2>&1 || pgrep -x xfreerdp >/dev/null 2>&1; then
+    session_alive=1
+  fi
+  # Also require the X server itself to be up. Match BOTH 'Xorg' and '/usr/bin/X'
+  # (LightDM often launches the server as 'X') — a strict 'pgrep -x Xorg' would
+  # falsely report the session dead and restart LightDM in a loop.
+  x_alive=0
+  pgrep -f '[/ ]Xorg' >/dev/null 2>&1 && x_alive=1
+  pgrep -f '[/ ]X ' >/dev/null 2>&1 && x_alive=1
+  pgrep -x X >/dev/null 2>&1 && x_alive=1
 
-  launcher_alive=0
-  pgrep -f '/opt/thinclient/bin/thinclient-session' >/dev/null 2>&1 && launcher_alive=1
-
-  if (( age > stale_threshold )) || (( launcher_alive == 0 )); then
-    log_warn "Unhealthy session: heartbeat_age=${age}s (>${stale_threshold}s) launcher_alive=${launcher_alive} state=$(tc_get_state). Restarting ${X_SERVICE}."
-    # Reap any orphaned FreeRDP first so it cannot linger and grab the screen.
+  if (( session_alive == 0 )) || (( x_alive == 0 )); then
+    log_warn "Unhealthy session: session_alive=${session_alive} x_alive=${x_alive} state=$(tc_get_state). Restarting ${X_SERVICE}."
     pkill -TERM -f 'xfreerdp' 2>/dev/null || true
     systemctl restart "$X_SERVICE" 2>/dev/null || log_error "Failed to restart ${X_SERVICE}"
     log_info "Restart issued; holding ${restart_grace}s for recovery."
     sleep "$restart_grace"
   else
-    log_debug "Healthy: heartbeat_age=${age}s state=$(tc_get_state)"
+    # NOTE: do not reference undefined vars here — 'set -u' would crash the
+    # watchdog on every healthy tick (systemd would then restart it forever).
+    log_debug "Healthy: session_alive=1 x_alive=1 state=$(tc_get_state)"
   fi
 done

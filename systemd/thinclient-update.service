@@ -1,0 +1,24 @@
+# =============================================================================
+#  ThinClient OS — OTA update check (Esparks IT Solutions)
+#  Installed to: /etc/systemd/system/thinclient-update.service
+#  Triggered by thinclient-update.timer. No-op unless UPDATE_ENABLED=true.
+# =============================================================================
+[Unit]
+Description=Esparks ThinClient update check
+Documentation=file:/opt/thinclient/docs/UPDATES.md
+Wants=network-online.target
+After=network-online.target NetworkManager-wait-online.service lightdm.service
+
+[Service]
+Type=oneshot
+# --check only: detect a newer signed release and flag it "pending". It never
+# installs — the connect window prompts the user, who may defer a few times
+# before it is applied via thinclient-update-apply.service.
+ExecStart=/opt/thinclient/bin/thinclient-update --check
+# Be gentle: low priority, generous timeout for a slow download.
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=900
+# It swaps /opt, writes state, and drives systemctl — keep it least-privilege-ish.
+ProtectHome=yes
+ReadWritePaths=/opt /etc/thinclient /var/lib/thinclient /var/log/thinclient /run/thinclient

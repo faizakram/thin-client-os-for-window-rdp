@@ -59,5 +59,33 @@ else
   log_warn "Openbox not installed; running WM-less."
 fi
 
-# --- Hand off to the RDP reconnect loop (runs forever) -----------------------
-exec /opt/thinclient/bin/thinclient-session
+# --- Audio: bring up PipeWire (PulseAudio-compatible) so RDP sound + mic work -
+: "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"; export XDG_RUNTIME_DIR
+if command -v pipewire >/dev/null 2>&1; then
+  # Prefer the user's systemd units (respects socket activation); fall back to
+  # launching the daemons directly if there is no user systemd instance.
+  systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber.service 2>/dev/null \
+    || { pipewire >/dev/null 2>&1 & pipewire-pulse >/dev/null 2>&1 & wireplumber >/dev/null 2>&1 & }
+  log_info "Audio (PipeWire) started"
+fi
+
+# --- Display: force each panel's native mode + size the launcher for HiDPI ----
+# A wrong (low) KMS/EDID mode makes the whole session soft/blurry; forcing the
+# preferred (native) mode fixes that. Then scale the GTK launcher to the panel so
+# the login card is readable on 4K/1440p. (The RDP session's own scaling is
+# handled inside thinclient-connect via the on-screen "Display size" control.)
+if command -v xrandr >/dev/null 2>&1; then
+  # Every connected output -> its preferred/native mode (no-op if already native).
+  xrandr --query 2>/dev/null | awk '/ connected/{print $1}' | while read -r _out; do
+    xrandr --output "$_out" --auto 2>/dev/null || true
+  done
+  # Width of the widest active mode decides the launcher UI scale.
+  scr_w="$(xrandr --current 2>/dev/null | awk '/\*/ && $1 ~ /^[0-9]+x[0-9]+$/ {split($1,a,"x"); if (a[1]+0>m) m=a[1]+0} END{print m+0}')"
+  if   (( scr_w >= 3840 )); then export GDK_SCALE=2
+  elif (( scr_w >= 2560 )); then export GDK_DPI_SCALE=1.4
+  fi
+  log_info "Display: width=${scr_w:-?} GDK_SCALE=${GDK_SCALE:-1} GDK_DPI_SCALE=${GDK_DPI_SCALE:-1}"
+fi
+
+# --- Hand off to the RDP connection window (form -> connect -> repeat) --------
+exec /opt/thinclient/bin/thinclient-connect

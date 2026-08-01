@@ -17,11 +17,18 @@ screen_w = Window.GetWidth();
 screen_h = Window.GetHeight();
 
 // --- Title -------------------------------------------------------------------
-title.image  = Image.Text("Remote Workspace", 0.90, 0.93, 0.97, 1, "Sans Bold 30");
+title.image  = Image.Text("Esparks IT Solutions", 0.90, 0.93, 0.97, 1, "Sans Bold 32");
 title.sprite = Sprite(title.image);
 title.sprite.SetX(screen_w / 2 - title.image.GetWidth()  / 2);
-title.sprite.SetY(screen_h / 2 - title.image.GetHeight() / 2 - 30);
+title.sprite.SetY(screen_h / 2 - title.image.GetHeight() / 2 - 34);
 title.sprite.SetZ(10);
+
+// --- Subtitle (legal name) ---------------------------------------------------
+sub.image  = Image.Text("Private Limited", 0.60, 0.68, 0.80, 1, "Sans 15");
+sub.sprite = Sprite(sub.image);
+sub.sprite.SetX(screen_w / 2 - sub.image.GetWidth() / 2);
+sub.sprite.SetY(screen_h / 2 + 8);
+sub.sprite.SetZ(10);
 
 // --- Animated status line ("Starting" + growing ellipsis) --------------------
 status_tick = 0;
@@ -29,7 +36,7 @@ fun make_status(text) {
     img = Image.Text(text, 0.62, 0.70, 0.82, 1, "Sans 14");
     spr = Sprite(img);
     spr.SetX(screen_w / 2 - img.GetWidth() / 2);
-    spr.SetY(screen_h / 2 + 24);
+    spr.SetY(screen_h / 2 + 48);
     spr.SetZ(10);
     return spr;
 }

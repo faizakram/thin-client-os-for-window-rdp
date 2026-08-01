@@ -5,6 +5,8 @@ firmware-misc-nonfree
 firmware-iwlwifi
 firmware-realtek
 firmware-atheros
+# GPU firmware — fixes black screen / no display on AMD Radeon (amdgpu KMS).
+firmware-amd-graphics
 # CPU microcode is x86-only.
 #if ARCHITECTURES amd64 i386
 intel-microcode

@@ -77,7 +77,7 @@ fi
 
 # Use FreeRDP's authentication-only handshake (no window is opened).
 pw="$(conf_get PASSWORD)"
-auth_args=( "/v:${SERVER}:${PORT}" "/cert:ignore" "/auth-only" "+auth-pkg-list" "/timeout:8000" )
+auth_args=( "/v:${SERVER}:${PORT}" "/cert:ignore" "/auth-only" "/timeout:8000" )
 [[ -n "$USER_NAME" ]] && auth_args+=( "/u:${USER_NAME}" )
 [[ -n "$(conf_get DOMAIN)" ]] && auth_args+=( "/d:$(conf_get DOMAIN)" )
 case "$(conf_get SECURITY nla | tr '[:upper:]' '[:lower:]')" in

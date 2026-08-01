@@ -1,0 +1,6 @@
+# =============================================================================
+#  DEBUG ONLY — SSH server for live troubleshooting on real hardware.
+#  REMOVE this file (and the SSH-enable block in the setup hook) before
+#  producing a production image.
+# =============================================================================
+openssh-server

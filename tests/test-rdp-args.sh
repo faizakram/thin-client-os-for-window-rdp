@@ -47,7 +47,7 @@ assert_not_contains "$ARGS" "/printer"        "printer off (per config)"
 
 echo "== performance / security flags =="
 assert_contains "$ARGS" "/gfx:AVC444"         "GPU H.264 pipeline"
-assert_contains "$ARGS" "+bitmap-cache"       "bitmap cache"
+assert_contains "$ARGS" "/cache:bitmap:on,glyph:on"  "bitmap/glyph cache (FreeRDP-3 syntax)"
 assert_contains "$ARGS" "/network:lan"        "network profile mapped"
 assert_contains "$ARGS" "/sec:nla"            "NLA security"
 assert_contains "$ARGS" "/cert:tofu"          "trust-on-first-use cert policy"

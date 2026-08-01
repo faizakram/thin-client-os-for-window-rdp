@@ -93,23 +93,29 @@ tc_build_rdp_args() {
   tc_is_true "$(conf_get CLIPBOARD true)"  && TC_RDP_ARGS+=( "/clipboard" )
   tc_is_true "$(conf_get SPEAKERS true)"   && TC_RDP_ARGS+=( "/sound:sys:pulse" )
   tc_is_true "$(conf_get MICROPHONE true)" && TC_RDP_ARGS+=( "/microphone:sys:pulse" )
-  tc_is_true "$(conf_get CAMERA false)"    && TC_RDP_ARGS+=( "/video" "/camera" )
+  tc_is_true "$(conf_get CAMERA false)"    && TC_RDP_ARGS+=( "/video" )
   tc_is_true "$(conf_get USB false)"       && TC_RDP_ARGS+=( "/usb:auto" )
   tc_is_true "$(conf_get PRINTER false)"   && TC_RDP_ARGS+=( "/printer" )
   tc_is_true "$(conf_get SMARTCARD false)" && TC_RDP_ARGS+=( "/smartcard" )
 
   # ---- Performance / visuals ----------------------------------------------
   if tc_is_true "$(conf_get GPU true)"; then
-    TC_RDP_ARGS+=( "/gfx:AVC444" "+gfx-h264" )
-  else
-    TC_RDP_ARGS+=( "/gfx:rfx" )
+    # Hardware path: server-side H.264 GFX pipeline. /gfx:AVC444 already selects
+    # the H.264/AVC444 codec — the old "+gfx-h264" toggle was removed in FreeRDP 3.
+    TC_RDP_ARGS+=( "/gfx:AVC444" )
   fi
-  tc_is_true "$(conf_get BITMAP_CACHE true)"        && TC_RDP_ARGS+=( "+bitmap-cache" "+glyph-cache" "/cache:codec:persistent" )
-  tc_is_true "$(conf_get DESKTOP_COMPOSITION true)" && TC_RDP_ARGS+=( "+aero" )
+  # No-GPU path: pass NO /gfx flag at all. FreeRDP then uses legacy graphics
+  # (bitmap/RemoteFX negotiation) which render on any framebuffer, including a
+  # basic nomodeset/fbdev X server. (There is no "-gfx" toggle in FreeRDP; that
+  # is an invalid argument that makes xfreerdp exit before connecting.)
+  # FreeRDP 3 folded the bitmap/glyph caches into /cache: ; the FreeRDP-2
+  # "+bitmap-cache"/"+glyph-cache" names are rejected as "Unexpected keyword".
+  tc_is_true "$(conf_get BITMAP_CACHE true)"        && TC_RDP_ARGS+=( "/cache:bitmap:on,glyph:on" )
+  # DESKTOP_COMPOSITION (+aero) is heavy for a kiosk and off by default; omit it.
   tc_is_true "$(conf_get FONT_SMOOTHING true)"      && TC_RDP_ARGS+=( "+fonts" )
   TC_RDP_ARGS+=( "/network:$(__tc_network_flag "$(conf_get NETWORK_PROFILE auto)")" )
-  # Enable the wider experience feature set (themes, window drag, menu anim).
-  TC_RDP_ARGS+=( "+window-drag" "+menu-anims" "+themes" "+wallpaper" )
+  # Verbose FreeRDP logging so any connection failure reason lands in rdp.log.
+  TC_RDP_ARGS+=( "/log-level:INFO" )
 
   # ---- Security ------------------------------------------------------------
   case "$(printf '%s' "$(conf_get SECURITY nla)" | tr '[:upper:]' '[:lower:]')" in
@@ -132,8 +138,6 @@ tc_build_rdp_args() {
   # No local window decorations / menu; keep title minimal; disable the
   # FreeRDP-side keyboard grab escape so users cannot break out.
   TC_RDP_ARGS+=( "-grab-keyboard" "/floatbar:sticky:off,default:hidden" "/t:Remote Workspace" )
-  # Send Ctrl+Alt+Del etc. straight to the remote host.
-  TC_RDP_ARGS+=( "/kbd:unicode" )
 
   # ---- Extra raw args ------------------------------------------------------
   local extra

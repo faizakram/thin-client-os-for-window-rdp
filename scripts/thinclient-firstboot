@@ -21,7 +21,9 @@ chmod 0755 "$TC_LOG_DIR"
 # --- Seed log files -----------------------------------------------------------
 for f in boot rdp watchdog network install thinclient; do
   touch "${TC_LOG_DIR}/${f}.log"
-  chmod 0640 "${TC_LOG_DIR}/${f}.log"
+  # Group-writable: the kiosk user (group thinclient) must be able to append
+  # its own logs. 0640 would be read-only for the group and silently drop logs.
+  chmod 0660 "${TC_LOG_DIR}/${f}.log"
 done
 # thinclient user must be able to append to the logs it owns.
 chown -R root:thinclient "$TC_LOG_DIR" 2>/dev/null || true

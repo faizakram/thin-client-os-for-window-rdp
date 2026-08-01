@@ -1,0 +1,25 @@
+# =============================================================================
+#  ThinClient OS — management agent (Esparks IT Solutions)
+#  Installed to: /etc/systemd/system/thinclient-agent.service
+#
+#  Long-running daemon: rotates + enforces the device licence, polls the control
+#  plane for remote commands (shutdown / terminate / lock / stream), and pushes
+#  screen frames on request. Idles quietly until the device is enrolled in
+#  /etc/thinclient/license.conf. Enforcement is off unless LICENSE_ENFORCE=true.
+# =============================================================================
+[Unit]
+Description=Esparks ThinClient management agent (licence + fleet ops)
+After=network-online.target NetworkManager-wait-online.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/thinclient/bin/thinclient-agent daemon
+Restart=always
+RestartSec=10
+Nice=10
+# It reads license.conf, writes /var/lib/thinclient/license, and (for remote
+# commands) runs systemctl poweroff / pkill and captures the screen.
+
+[Install]
+WantedBy=multi-user.target

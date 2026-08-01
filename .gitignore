@@ -12,3 +12,8 @@ iso/*.iso.sha256
 .DS_Store
 *.swp
 config/server.conf
+update-signing-key.pem
+*.tar.gz
+
+# OTA release bundles produced by make-update-bundle.sh
+dist/

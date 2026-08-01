@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+# =============================================================================
+#  ThinClient Manager — device agent (runs on each ThinClient appliance)
+#  Installed to: /opt/thinclient/bin/thinclient-agent
+#
+#  Responsibilities (Phase 1 — licensing):
+#    * Fetch a fresh signed licence token from the control plane (monthly
+#      rotation), best-effort — a network outage must NOT lock a paid device.
+#    * VERIFY the cached token offline against the baked-in public key
+#      (/etc/thinclient/license-pubkey.pem) using openssl (same tool as OTA).
+#    * Decide active | grace | locked from the token's own `exp` + a grace
+#      window, and write /var/lib/thinclient/license/state. The connect window
+#      reads that file and refuses to launch RDP when "locked".
+#
+#  Because expiry lives inside the SIGNED token, a device enforces its own
+#  licence with no network — pulling the cable cannot keep an expired box alive.
+#
+#  CLI:
+#    thinclient-agent enforce                         # full cycle (timer/boot)
+#    thinclient-agent state                           # print current state
+#    thinclient-agent verify <token_file> <pubkey> [device_id] [now] [grace]
+#                                                     # verify+classify (testing)
+# =============================================================================
+import base64, json, os, subprocess, sys, tempfile, time
+
+GRACE_DEFAULT = 3 * 86400            # 3 days after exp before hard-lock
+STATE_DIR = os.environ.get("TC_LICENSE_DIR", "/var/lib/thinclient/license")
+PUBKEY = os.environ.get("TC_LICENSE_PUBKEY", "/etc/thinclient/license-pubkey.pem")
+TOKEN_CACHE = os.path.join(STATE_DIR, "token")
+STATE_FILE = os.path.join(STATE_DIR, "state")
+CONF = os.environ.get("TC_LICENSE_CONF", "/etc/thinclient/license.conf")
+
+
+def _b64u_decode(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def verify_token(token: str, pubkey_path: str) -> dict:
+    """Return the claims dict if the RS256 signature is valid; else raise."""
+    parts = token.strip().split(".")
+    if len(parts) != 3:
+        raise ValueError("malformed token")
+    h, p, sig = parts
+    signing_input = ("%s.%s" % (h, p)).encode()
+    raw_sig = _b64u_decode(sig)
+    with tempfile.TemporaryDirectory() as d:
+        msg, sg = os.path.join(d, "msg"), os.path.join(d, "sig")
+        with open(msg, "wb") as f:
+            f.write(signing_input)
+        with open(sg, "wb") as f:
+            f.write(raw_sig)
+        rc = subprocess.run(
+            ["openssl", "dgst", "-sha256", "-verify", pubkey_path, "-signature", sg, msg],
+            capture_output=True,
+        ).returncode
+    if rc != 0:
+        raise ValueError("bad signature")
+    try:
+        header = json.loads(_b64u_decode(h))
+        claims = json.loads(_b64u_decode(p))
+    except Exception:
+        raise ValueError("bad token payload")
+    if header.get("alg") != "RS256":
+        raise ValueError("unexpected alg")
+    for k in ("device_id", "tenant_id", "exp", "iat"):
+        if k not in claims:
+            raise ValueError("missing claim: %s" % k)
+    return claims
+
+
+def license_state(claims: dict, device_id: str, grace: int, now: float) -> str:
+    if device_id and claims.get("device_id") != device_id:
+        return "locked"
+    exp = float(claims["exp"])
+    if now <= exp:
+        return "active"
+    if now <= exp + grace:
+        return "grace"
+    return "locked"
+
+
+# --------------------------- config + device identity ------------------------
+def conf_get(key: str, default: str = "") -> str:
+    try:
+        with open(CONF) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, _, v = line.partition("=")
+                    if k.strip() == key:
+                        return v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return default
+
+
+def device_id() -> str:
+    mid = ""
+    try:
+        mid = open("/etc/machine-id").read().strip()
+    except OSError:
+        mid = os.uname().nodename
+    import hashlib
+    return hashlib.sha256(mid.encode()).hexdigest()[:32]
+
+
+def write_state(state: str, claims: dict | None):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(STATE_FILE, "w") as f:
+            f.write("state=%s\n" % state)
+            if claims:
+                f.write("exp=%d\ntenant_id=%s\nplan=%s\n"
+                        % (int(claims.get("exp", 0)), claims.get("tenant_id", ""),
+                           claims.get("plan", "")))
+        os.chmod(STATE_FILE, 0o644)
+    except OSError:
+        pass
+
+
+# ------------------------------- commands ------------------------------------
+def cmd_enforce() -> int:
+    grace = int(conf_get("LICENSE_GRACE_SECONDS", str(GRACE_DEFAULT)) or GRACE_DEFAULT)
+    did = device_id()
+    url = conf_get("CONTROL_URL")
+    secret = conf_get("DEVICE_SECRET")
+
+    # 1) Best-effort: rotate the token from the control plane.
+    if url and secret:
+        try:
+            body = json.dumps({"device_id": did, "secret": secret}).encode()
+            os.makedirs(STATE_DIR, exist_ok=True)
+            fresh = subprocess.run(
+                ["curl", "-fsSL", "--connect-timeout", "15", "--max-time", "60",
+                 "-H", "Content-Type: application/json", "-d", body.decode(),
+                 "%s/api/licenses/token" % url.rstrip("/")],
+                capture_output=True, text=True, timeout=90,
+            )
+            if fresh.returncode == 0 and fresh.stdout.strip():
+                tok = json.loads(fresh.stdout).get("token", "")
+                if tok:
+                    verify_token(tok, PUBKEY)          # only cache if it verifies
+                    with open(TOKEN_CACHE, "w") as f:
+                        f.write(tok)
+        except Exception:
+            pass  # offline / server down -> fall back to the cached token
+
+    # 2) Enforce using whatever token we have (fresh or previously cached).
+    try:
+        token = open(TOKEN_CACHE).read().strip()
+        claims = verify_token(token, PUBKEY)
+        state = license_state(claims, did, grace, time.time())
+        write_state(state, claims)
+    except Exception as e:
+        # No valid token at all -> locked (fail closed). A never-licensed device
+        # cannot run; a previously-licensed one keeps its last cached state file.
+        if not os.path.exists(STATE_FILE):
+            write_state("locked", None)
+        print("agent: %s" % e, file=sys.stderr)
+        return 1
+    print(state)
+    return 0
+
+
+def cmd_state() -> int:
+    try:
+        sys.stdout.write(open(STATE_FILE).read())
+    except OSError:
+        print("state=unknown")
+    return 0
+
+
+def cmd_verify(argv) -> int:
+    # verify <token_file> <pubkey> [device_id] [now] [grace]
+    token = open(argv[0]).read()
+    pubkey = argv[1]
+    did = argv[2] if len(argv) > 2 else ""
+    now = float(argv[3]) if len(argv) > 3 else time.time()
+    grace = int(argv[4]) if len(argv) > 4 else GRACE_DEFAULT
+    try:
+        claims = verify_token(token, pubkey)
+    except ValueError as e:
+        print("invalid %s" % e)
+        return 2
+    print(license_state(claims, did, grace, now))
+    return 0
+
+
+# ------------------------- fleet ops: commands + stream ----------------------
+ADMIN_LOCK = os.path.join(STATE_DIR, "admin-lock")   # connect window refuses RDP
+
+
+def set_admin_lock(locked: bool):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        if locked:
+            with open(ADMIN_LOCK, "w") as f:
+                f.write("locked\n")
+        elif os.path.exists(ADMIN_LOCK):
+            os.remove(ADMIN_LOCK)
+    except OSError:
+        pass
+
+
+def _curl_json(url: str, payload: dict) -> dict | None:
+    try:
+        r = subprocess.run(
+            ["curl", "-fsS", "--max-time", "30", "-X", "POST",
+             "-H", "content-type: application/json", "-d", json.dumps(payload), url],
+            capture_output=True, text=True, timeout=40,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return json.loads(r.stdout)
+    except Exception:
+        pass
+    return None
+
+
+def execute(ctype: str) -> str:
+    try:
+        if ctype == "SHUTDOWN":
+            subprocess.Popen(["systemctl", "poweroff"])
+            return "ok"
+        if ctype == "TERMINATE_SESSION":
+            subprocess.run(["pkill", "-x", "xfreerdp3"], capture_output=True)
+            subprocess.run(["pkill", "-x", "xfreerdp"], capture_output=True)
+            return "ok"
+        if ctype == "LOCK":
+            set_admin_lock(True); return "ok"
+        if ctype == "UNLOCK":
+            set_admin_lock(False); return "ok"
+        if ctype in ("STREAM_START", "STREAM_STOP"):
+            return "ok"  # actual streaming is driven by the poll `stream` flag
+        return "failed"
+    except Exception as e:
+        print("agent exec %s: %s" % (ctype, e), file=sys.stderr)
+        return "failed"
+
+
+def capture_jpeg(out_path: str) -> bool:
+    """Grab the live X screen to a downscaled JPEG. Device-only (needs a display)."""
+    disp = conf_get("CAPTURE_DISPLAY", os.environ.get("DISPLAY", ":0"))
+    xauth = conf_get("CAPTURE_XAUTHORITY", "/home/thinclient/.Xauthority")
+    env = dict(os.environ, DISPLAY=disp, XAUTHORITY=xauth)
+    tmp_png = "/tmp/.tc-frame.png"
+    attempts = [
+        ["bash", "-c", "ffmpeg -y -loglevel error -f x11grab -i %s -frames:v 1 "
+         "-vf scale=1280:-2 -q:v 6 %s" % (disp, out_path)],
+        ["bash", "-c", "scrot -o %s && convert %s -resize 1280x -quality 60 %s"
+         % (tmp_png, tmp_png, out_path)],
+        ["bash", "-c", "import -window root %s && convert %s -resize 1280x -quality 60 %s"
+         % (tmp_png, tmp_png, out_path)],
+    ]
+    for a in attempts:
+        try:
+            rc = subprocess.run(a, env=env, capture_output=True, timeout=15).returncode
+            if rc == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def push_frame(base: str, creds: dict, jpeg_path: str):
+    subprocess.run(
+        ["curl", "-fsS", "--max-time", "30", "-X", "POST",
+         "-H", "content-type: image/jpeg",
+         "-H", "x-enroll-code: %s" % creds["enroll_code"],
+         "-H", "x-secret: %s" % creds["secret"],
+         "-H", "x-hwid: %s" % creds["hwid"],
+         "--data-binary", "@%s" % jpeg_path, "%s/api/agent/frame" % base],
+        capture_output=True, timeout=40,
+    )
+
+
+def cmd_poll() -> int:
+    url = conf_get("CONTROL_URL")
+    code = conf_get("ENROLL_CODE")
+    secret = conf_get("DEVICE_SECRET")
+    if not (url and code and secret):
+        return 0   # not enrolled yet — idle quietly
+    base = url.rstrip("/")
+    creds = {"enroll_code": code, "secret": secret, "hwid": device_id()}
+
+    resp = _curl_json("%s/api/agent/poll" % base, creds)
+    if resp is None:
+        return 0  # offline — try again next tick
+    set_admin_lock(bool(resp.get("locked")))
+    for c in resp.get("commands", []):
+        result = execute(c.get("type", ""))
+        ack = dict(creds, command_id=c.get("id"), result=result)
+        _curl_json("%s/api/agent/ack" % base, ack)
+    if resp.get("stream"):
+        with tempfile.TemporaryDirectory() as d:
+            fp = os.path.join(d, "frame.jpg")
+            if capture_jpeg(fp):
+                push_frame(base, creds, fp)
+    return 0
+
+
+def cmd_daemon() -> int:
+    """Long-running loop (systemd service). Polls for commands + pushes frames
+    every few seconds; rotates + enforces the licence every few hours. Idles
+    quietly when the control plane isn't configured yet."""
+    interval = int(conf_get("AGENT_POLL_SECONDS", "5") or 5)
+    enforce_every = int(conf_get("AGENT_ENFORCE_SECONDS", "21600") or 21600)  # 6h
+    last_enforce = 0.0
+    while True:
+        now = time.time()
+        if now - last_enforce >= enforce_every:
+            try:
+                cmd_enforce()
+            except Exception as e:
+                print("agent enforce: %s" % e, file=sys.stderr)
+            last_enforce = now
+        try:
+            cmd_poll()
+        except Exception as e:
+            print("agent poll: %s" % e, file=sys.stderr)
+        time.sleep(max(2, interval))
+
+
+def main() -> int:
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "enforce"
+    if cmd == "enforce":
+        return cmd_enforce()
+    if cmd == "poll":
+        return cmd_poll()
+    if cmd == "daemon":
+        return cmd_daemon()
+    if cmd == "state":
+        return cmd_state()
+    if cmd == "verify":
+        return cmd_verify(sys.argv[2:])
+    print("usage: thinclient-agent [enforce|poll|daemon|state|verify ...]", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -30,9 +30,14 @@ OUTPUT_ISO="${PROJECT_ROOT}/iso/thinclient.iso"
 VERSION="${TC_VERSION:-1.0.0}"
 
 BOOTAPPEND="boot=live components \
-live-config.username=thinclient live-config.hostname=thinclient live-config.noautologin \
+live-config.username=thinclient live-config.hostname=esparksit live-config.noautologin \
 quiet splash loglevel=0 vt.global_cursor_default=0 \
 rd.systemd.show_status=false systemd.show_status=false udev.log_level=0"
+# NOTE: hardware KMS (native graphics) is the default so the display runs at the
+# panel's true resolution. The AMD box that black-screened before now has its
+# GPU firmware (firmware-amd-graphics) in the image, so amdgpu KMS initialises
+# correctly. live-build's built-in "fail-safe" GRUB entry remains as a fallback,
+# and iso/thinclient-safe-nomodeset.iso is kept as a safe-graphics backup.
 
 # Arch-specific bootloader + image type. amd64 gets a BIOS+UEFI hybrid ISO;
 # arm64 (UEFI-only platform) gets a plain UEFI ISO with grub-efi.
@@ -83,8 +88,19 @@ stage() {
 # Clean.
 # --------------------------------------------------------------------------- #
 do_clean() {
-  say "Cleaning previous build artifacts"
-  if [[ -d "$BUILD_DIR" ]]; then
+  [[ -d "$BUILD_DIR" ]] || { ok "Nothing to clean"; return 0; }
+  local keep; keep="$(dirname "$BUILD_DIR")/.tc-cache-keep"
+  if [[ "${TC_KEEP_CACHE:-1}" == "1" && -d "$BUILD_DIR/cache" ]]; then
+    # Preserve live-build's download cache (bootstrap base + .debs) across
+    # rebuilds so we don't re-download the whole base system every time.
+    say "Cleaning build (keeping download cache for fast rebuilds)"
+    rm -rf "$keep"
+    mv "$BUILD_DIR/cache" "$keep"
+    rm -rf "$BUILD_DIR"
+    mkdir -p "$BUILD_DIR"
+    mv "$keep" "$BUILD_DIR/cache"
+  else
+    say "Cleaning previous build artifacts (full purge)"
     ( cd "$BUILD_DIR" && lb clean --purge >/dev/null 2>&1 || true )
     rm -rf "$BUILD_DIR"
   fi
@@ -118,10 +134,10 @@ configure() {
     --backports false \
     --mirror-bootstrap "$MIRROR" \
     --mirror-binary "$MIRROR" \
-    --iso-application "ThinClient OS" \
-    --iso-publisher "ThinClient Project" \
+    --iso-application "Esparks IT Solutions Thin Client" \
+    --iso-publisher "Esparks IT Solutions Private Limited" \
     --iso-preparer "build.sh (live-build)" \
-    --iso-volume "THINCLIENT ${VERSION}"
+    --iso-volume "ESPARKSIT ${VERSION}"
 
   ok "live-build configured"
 }
@@ -153,8 +169,12 @@ populate() {
 
   install -d "${BUILD_DIR}/config/hooks/live"
   cp "${PROJECT_ROOT}"/config/live-build/hooks/*.hook.chroot \
-     "${BUILD_DIR}/config/hooks/live/"
-  chmod +x "${BUILD_DIR}/config/hooks/live/"*.hook.chroot
+     "${BUILD_DIR}/config/hooks/live/" 2>/dev/null || true
+  # Binary-stage hooks (e.g. boot-menu rebranding) run when the ISO tree is
+  # assembled; copy them too if present.
+  cp "${PROJECT_ROOT}"/config/live-build/hooks/*.hook.binary \
+     "${BUILD_DIR}/config/hooks/live/" 2>/dev/null || true
+  chmod +x "${BUILD_DIR}/config/hooks/live/"*.hook.* 2>/dev/null || true
 
   say "Staging appliance files into the root filesystem"
 
@@ -163,7 +183,8 @@ populate() {
               thinclient-xsession thinclient-config thinclient-adminctl \
               thinclient-test-connection thinclient-admin thinclient-adminmode \
               thinclient-netctl thinclient-diagnostics thinclient-firstboot \
-              thinclient-wifi thinclient-netwait"
+              thinclient-wifi thinclient-netwait thinclient-connect \
+              thinclient-update thinclient-agent"
   local b
   for b in $bins; do
     stage "scripts/${b}" "/opt/thinclient/bin/${b}" 0755
@@ -185,9 +206,20 @@ populate() {
   stage "config/sudoers-thinclient"   "/etc/sudoers.d/thinclient"                      0440
   stage "config/logrotate-thinclient" "/etc/logrotate.d/thinclient"                    0644
 
-  # --- systemd units -----------------------------------------------------
+  # --- OTA update public key (verifies signed manifests) -----------------
+  # Private half (update-signing-key.pem) NEVER ships — it stays on the build host.
+  stage "config/update-pubkey.pem"    "/etc/thinclient/update-pubkey.pem"              0644
+
+  # --- Device licensing / management agent config + trust anchor -------------
+  stage "config/license.conf"         "/etc/thinclient/license.conf"                   0644
+  if [[ -f "${PROJECT_ROOT}/config/license-pubkey.pem" ]]; then
+    stage "config/license-pubkey.pem" "/etc/thinclient/license-pubkey.pem"             0644
+  fi
+
+  # --- systemd units (.service + .timer) ---------------------------------
   local u
-  for u in "${PROJECT_ROOT}"/systemd/*.service; do
+  for u in "${PROJECT_ROOT}"/systemd/*.service "${PROJECT_ROOT}"/systemd/*.timer; do
+    [[ -e "$u" ]] || continue
     stage "systemd/$(basename "$u")" "/etc/systemd/system/$(basename "$u")" 0644
   done
 
@@ -211,6 +243,19 @@ populate() {
     echo "build_date=$(date --iso-8601=seconds)"
     echo "base=Debian ${DIST}"
   } >"${BUILD_DIR}/config/includes.chroot/etc/thinclient/build-info"
+
+  # VERSION stamp the OTA updater compares against. The chroot hook converts
+  # /opt/thinclient into the /opt/thinclient-releases/<version> symlink layout
+  # so future updates swap atomically.
+  install -d "${BUILD_DIR}/config/includes.chroot/opt/thinclient"
+  printf '%s\n' "${VERSION}" >"${BUILD_DIR}/config/includes.chroot/opt/thinclient/VERSION"
+
+  # Build flags the chroot hook reads. DEBUG_SSH defaults OFF (production): no
+  # openssh debug user / root password. Rebuild with TC_DEBUG_SSH=1 for a
+  # debug image.
+  {
+    echo "DEBUG_SSH=${TC_DEBUG_SSH:-0}"
+  } >"${BUILD_DIR}/config/includes.chroot/etc/thinclient/.build-flags"
 
   ok "Root filesystem staged"
 }

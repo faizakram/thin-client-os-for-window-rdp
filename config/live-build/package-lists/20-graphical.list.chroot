@@ -8,6 +8,13 @@ xinit
 x11-xserver-utils
 x11-utils
 openbox
+# LightDM: robust, seat-managed X startup + autologin (replaces the hand-rolled
+# xinit-on-VT service that failed to bring up Xorg on some AMD hardware).
+lightdm
+# GTK runtime for the connection window (thinclient-connect, python3 + GTK3).
+python3
+python3-gi
+gir1.2-gtk-3.0
 unclutter
 feh
 xterm
@@ -24,3 +31,7 @@ va-driver-all
 libva2
 libva-drm2
 libva-x11-2
+
+# Screen capture for the management agent's live-view streaming
+scrot
+imagemagick

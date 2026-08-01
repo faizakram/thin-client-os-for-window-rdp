@@ -15,6 +15,11 @@ htop
 #if ARCHITECTURES amd64 i386
 grub-efi-amd64-bin
 grub-pc-bin
+# Secure Boot: signed shim + signed GRUB so the USB boots on PCs that have
+# Secure Boot ENABLED (no BIOS changes needed). live-build wires the signed
+# shim into the ESP automatically when these are present.
+shim-signed
+grub-efi-amd64-signed
 #endif
 #if ARCHITECTURES arm64
 grub-efi-arm64-bin

@@ -9,8 +9,8 @@
 [Unit]
 Description=ThinClient session watchdog
 Documentation=file:/opt/thinclient/docs/RECOVERY.md
-After=thinclient-x.service
-Wants=thinclient-x.service
+After=lightdm.service
+Wants=lightdm.service
 
 [Service]
 Type=simple

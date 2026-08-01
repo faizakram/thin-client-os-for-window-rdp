@@ -1,0 +1,18 @@
+# =============================================================================
+#  ThinClient OS — OTA update schedule
+#  Installed to: /etc/systemd/system/thinclient-update.timer
+#
+#  Checks shortly after boot, then every 6 hours. RandomizedDelaySec staggers
+#  the fleet so a release wave doesn't hit GitHub (or your session) all at once.
+# =============================================================================
+[Unit]
+Description=Esparks ThinClient update schedule
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=6h
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

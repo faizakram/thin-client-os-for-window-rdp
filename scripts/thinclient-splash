@@ -51,9 +51,9 @@ _splash_start() {
     yad --class=ThinClientSplash --fullscreen --undecorated --skip-taskbar \
         --on-top --sticky --no-buttons --center \
         --window-icon="network-workgroup" \
-        --title="Remote Workspace" \
+        --title="Esparks IT Solutions" \
         --image="network-workgroup" --image-on-top \
-        --text="<span font='22' foreground='#e6edf7'>${msg}</span>" \
+        --text="<span font='26' weight='bold' foreground='#e6edf7'>Esparks IT Solutions</span>\n<span font='15' foreground='#9fb2d8'>${msg}</span>" \
         --progress --pulsate --auto-close --no-escape \
         --css='window { background-color: #0b1220; }' \
         < <(while :; do echo "#${msg}"; sleep 1; done) &

@@ -1,0 +1,552 @@
+#!/usr/bin/env python3
+# =============================================================================
+#  ThinClient OS — Remote Desktop connection window (Esparks IT Solutions)
+#  Installed to: /opt/thinclient/bin/thinclient-connect
+#
+#  The kiosk's front door. A clean, standard-looking GTK window:
+#    * Server / IP, Username, Password, Security -> [Connect] -> Windows RDP
+#    * A LIVE network indicator: LAN dot green when wired is up, red when not
+#    * A Wi-Fi button that scans/lists networks and connects (via thinclient-wifi)
+#  On disconnect/failure it returns to the form (showing the real FreeRDP error).
+#  No Linux desktop is ever exposed.
+#
+#  The FreeRDP argv here is the exact, verified-working command:
+#    xfreerdp3 /v:H:P /u:U [/d:D] /from-stdin:force /f /cert:ignore /sec:S
+#              /clipboard /dynamic-resolution [/scale-desktop:N /scale-device:M]
+#              /sound:sys:pulse /microphone:sys:pulse /log-level:INFO
+#
+#  Display sizing: a hi-res panel (e.g. 4K) delivered at the server's 100% DPI
+#  makes the Windows UI microscopic. The "Display size" control scales it:
+#    Auto / 100..200%  -> /scale-desktop (server-side DPI, stays crisp)
+#    Zoom to fit       -> /smart-sizing + /size (always enlarges, even if the
+#                         server ignores DPI; note: mutually exclusive with
+#                         /dynamic-resolution, so that flag is dropped in fit mode)
+#
+#  Video: without an H.264 GFX codec, full-motion video (YouTube etc.) renders
+#  through legacy bitmap codecs and looks blurry/smeared on motion. The "Video"
+#  control enables the H.264 GFX pipeline (what Windows mstsc uses):
+#    Auto / High -> /gfx:AVC444 (H.264 4:4:4 — sharp text AND video)
+#    Balanced    -> /gfx:AVC420 (H.264 4:2:0 — lighter on bandwidth)
+#    Compat      -> no /gfx (legacy bitmap path, maximum compatibility)
+#  With H.264 on we add /network:auto so the server adapts bitrate over WAN.
+#  H.264 decode ships in the image (libavcodec); all flags verified against
+#  Debian's FreeRDP 3.15 and against the live server's GFX capabilities.
+# =============================================================================
+import gi, os, re, subprocess, tempfile
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, GLib, Gdk
+
+CONF = os.environ.get("TC_CONF", "/etc/thinclient/server.conf")
+LOGDIR = os.environ.get("TC_LOG_DIR", "/var/log/thinclient")
+
+# OTA update prompt state. `thinclient-update --check` (root, on a timer) writes
+# PENDING_FILE when a newer signed release is available; this window prompts the
+# user and tracks how many times they deferred in SKIP_CACHE (user-owned).
+PENDING_FILE = os.environ.get("TC_UPDATE_PENDING", "/var/lib/thinclient/updates/pending")
+SKIP_CACHE = os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+    "thinclient", "update-skips")
+
+def _read_kv(path):
+    d = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, _, v = line.partition("=")
+                    d[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return d
+
+def pending_update_version():
+    """Version string of a staged update, or '' if none is pending."""
+    return _read_kv(PENDING_FILE).get("version", "")
+
+# Device licensing / admin lock. The agent (thinclient-agent) writes the state;
+# this window refuses RDP when locked — but ONLY if enforcement is switched on,
+# so an unconfigured/unlicensed appliance behaves exactly as before (fail-safe).
+LICENSE_CONF = os.environ.get("TC_LICENSE_CONF", "/etc/thinclient/license.conf")
+LICENSE_STATE = os.environ.get("TC_LICENSE_STATE", "/var/lib/thinclient/license/state")
+LICENSE_ADMIN_LOCK = os.environ.get("TC_LICENSE_ADMIN_LOCK", "/var/lib/thinclient/license/admin-lock")
+
+def license_block_reason():
+    """Return a user-facing message if the device is locked and enforcement is
+    ON; otherwise None (disabled/unconfigured never blocks)."""
+    enforce = (_read_kv(LICENSE_CONF).get("LICENSE_ENFORCE", "false") or "false").lower()
+    if enforce not in ("true", "1", "yes", "on"):
+        return None
+    if os.path.exists(LICENSE_ADMIN_LOCK):
+        return "This device has been locked by your administrator."
+    if _read_kv(LICENSE_STATE).get("state", "") == "locked":
+        return "This device's licence has expired. Please contact your administrator."
+    return None
+
+def rdp_bin():
+    for b in ("xfreerdp3", "xfreerdp"):
+        p = subprocess.run(["which", b], capture_output=True, text=True)
+        if p.returncode == 0:
+            return p.stdout.strip()
+    return ""
+
+def conf_get(key, default=""):
+    try:
+        with open(CONF) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                if k.strip() == key:
+                    return v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return default
+
+def net_status():
+    """Return 'lan' if wired is connected, 'wifi' if Wi-Fi is connected, else ''."""
+    try:
+        p = subprocess.run(["nmcli", "-t", "-f", "TYPE,STATE", "device", "status"],
+                           capture_output=True, text=True, timeout=4)
+        if p.returncode == 0:
+            lines = p.stdout.splitlines()
+            if any(l.startswith("ethernet:connected") for l in lines):
+                return "lan"
+            if any(l.startswith("wifi:connected") for l in lines):
+                return "wifi"
+            return ""
+    except Exception:
+        pass
+    # Fallback: any wired interface with carrier == 1
+    try:
+        base = "/sys/class/net"
+        for ifc in os.listdir(base):
+            if ifc[:1] == "e":  # en*, eth*
+                cp = os.path.join(base, ifc, "carrier")
+                if os.path.exists(cp) and open(cp).read().strip() == "1":
+                    return "lan"
+    except OSError:
+        pass
+    return ""
+
+def screen_size():
+    """Physical screen resolution (w, h) via xrandr; Gdk fallback; default 1080p.
+    Used to auto-pick a DPI scale and to show the real resolution on screen."""
+    try:
+        p = subprocess.run(["xrandr", "--current"], capture_output=True, text=True, timeout=4)
+        if p.returncode == 0:
+            best = (0, 0)
+            for line in p.stdout.splitlines():
+                if "*" not in line:            # only the active mode line is starred
+                    continue
+                m = re.match(r"\s*(\d+)x(\d+)\b", line)
+                if m:
+                    w, h = int(m.group(1)), int(m.group(2))
+                    if w * h > best[0] * best[1]:
+                        best = (w, h)
+            if best[0]:
+                return best
+    except Exception:
+        pass
+    try:
+        disp = Gdk.Display.get_default()
+        mon = disp.get_primary_monitor() or disp.get_monitor(0)
+        g = mon.get_geometry(); sf = mon.get_scale_factor()
+        if g.width:
+            return (g.width * sf, g.height * sf)
+    except Exception:
+        pass
+    return (1920, 1080)
+
+def auto_scale_pct(width):
+    """Sensible desktop DPI scale so a hi-res panel isn't microscopic at 100%."""
+    if width >= 3840: return 200
+    if width >= 3000: return 175
+    if width >= 2560: return 150
+    return 100
+
+CSS = b"""
+window { background-color: #0b1220; }
+.card { background-color: #0e1728; border: 1px solid #1b2740;
+        border-radius: 12px; padding: 24px 26px; }
+.title { color: #e6edf7; font-size: 20px; font-weight: bold; }
+.subtitle { color: #7e8ba3; font-size: 12px; }
+label { color: #c3cee3; }
+entry { background: #101a2e; color: #e6edf7; border: 1px solid #28395c;
+        border-radius: 6px; padding: 8px; }
+.connect { background: #2f6fed; color: #ffffff; font-weight: bold;
+           padding: 10px 18px; border-radius: 8px; }
+.wifi { background: #16223c; color: #cfe0ff; border-radius: 8px; padding: 6px 12px; }
+.statusbar { background: #0e1728; border-radius: 8px; padding: 8px 12px; }
+.dot-green { color: #34d399; font-size: 16px; }
+.dot-red   { color: #fb7185; font-size: 16px; }
+"""
+
+class Connect(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Esparks IT Solutions — Remote Desktop")
+        self.rdp = rdp_bin()
+        self.scr_w, self.scr_h = screen_size()
+        self.fullscreen()
+        self.set_default_size(560, 460)
+
+        prov = Gtk.CssProvider(); prov.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.add(outer)
+        # Center a fixed-width card.
+        center = Gtk.Alignment(xalign=0.5, yalign=0.5, xscale=0, yscale=0)
+        outer.pack_start(center, True, True, 0)
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        card.set_size_request(360, -1)   # standard login-card width
+        card.get_style_context().add_class("card")
+        center.add(card)
+
+        title = Gtk.Label(label="Esparks IT Solutions"); title.get_style_context().add_class("title")
+        title.set_xalign(0)
+        sub = Gtk.Label(label="Connect to Remote Desktop  ·  Display %d×%d" % (self.scr_w, self.scr_h))
+        sub.get_style_context().add_class("subtitle")
+        sub.set_xalign(0)
+        card.pack_start(title, False, False, 0)
+        card.pack_start(sub, False, False, 0)
+
+        # --- Network status bar (LAN dot + Wi-Fi button) ---
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        bar.get_style_context().add_class("statusbar")
+        self.dot = Gtk.Label(label="●")
+        self.lan_lbl = Gtk.Label(label="Checking network…"); self.lan_lbl.set_xalign(0)
+        wifi_btn = Gtk.Button(label="Wi-Fi…"); wifi_btn.get_style_context().add_class("wifi")
+        wifi_btn.connect("clicked", self.on_wifi)
+        bar.pack_start(self.dot, False, False, 0)
+        bar.pack_start(self.lan_lbl, True, True, 0)
+        bar.pack_end(wifi_btn, False, False, 0)
+        card.pack_start(bar, False, False, 0)
+
+        # --- Form fields ---
+        grid = Gtk.Grid(row_spacing=8, column_spacing=10)
+        def row(r, text, widget):
+            lbl = Gtk.Label(label=text); lbl.set_xalign(0)
+            grid.attach(lbl, 0, r, 1, 1); grid.attach(widget, 1, r, 1, 1)
+            widget.set_hexpand(True)
+        self.e_server = Gtk.Entry(text=conf_get("SERVER_IP"))
+        self.e_port   = Gtk.Entry(text=conf_get("PORT", "3389")); self.e_port.set_width_chars(6)
+        self.e_user   = Gtk.Entry(text=conf_get("USERNAME"))
+        self.e_pass   = Gtk.Entry(text=conf_get("PASSWORD")); self.e_pass.set_visibility(False)
+        # Standard show/hide-password "eye" toggle on the password field.
+        self.e_pass.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, "view-reveal-symbolic")
+        self.e_pass.set_icon_tooltip_text(Gtk.EntryIconPosition.SECONDARY, "Show / hide password")
+        self.e_pass.set_icon_activatable(Gtk.EntryIconPosition.SECONDARY, True)
+        self.e_pass.connect("icon-press", self._toggle_pw)
+        self.e_dom    = Gtk.Entry(text=conf_get("DOMAIN"))
+        self.c_sec    = Gtk.ComboBoxText()
+        for s in ("nla", "tls", "rdp"):
+            self.c_sec.append_text(s)
+        cur = (conf_get("SECURITY", "nla") or "nla").lower()
+        self.c_sec.set_active({"nla": 0, "tls": 1, "rdp": 2}.get(cur, 0))
+        # Display size: fixes "everything is tiny" on a hi-res panel. Live-adjustable
+        # so no rebuild is ever needed to get a comfortable size.
+        self.c_scale = Gtk.ComboBoxText()
+        self.scale_opts = [("Auto (recommended)", "auto"), ("100% — native", "100"),
+                           ("125%", "125"), ("150%", "150"), ("175%", "175"),
+                           ("200%", "200"), ("Zoom to fit", "fit")]
+        for _lbl, _v in self.scale_opts:
+            self.c_scale.append_text(_lbl)
+        _ds = (conf_get("DISPLAY_SCALE", "auto") or "auto").lower()
+        self.c_scale.set_active(next((i for i, (_l, v) in enumerate(self.scale_opts) if v == _ds), 0))
+        # Video codec: H.264 GFX fixes blurry full-motion video. Live-adjustable.
+        self.c_video = Gtk.ComboBoxText()
+        self.video_opts = [("Auto (H.264)", "auto"), ("High — sharpest (4:4:4)", "avc444"),
+                           ("Balanced (4:2:0)", "avc420"), ("Compatibility (no H.264)", "off")]
+        for _lbl, _v in self.video_opts:
+            self.c_video.append_text(_lbl)
+        _vg = (conf_get("GFX_CODEC", "auto") or "auto").lower()
+        self.c_video.set_active(next((i for i, (_l, v) in enumerate(self.video_opts) if v == _vg), 0))
+        row(0, "Server / IP", self.e_server)
+        row(1, "Port", self.e_port)
+        row(2, "Username", self.e_user)
+        row(3, "Password", self.e_pass)
+        row(4, "Domain (optional)", self.e_dom)
+        row(5, "Security", self.c_sec)
+        row(6, "Display size", self.c_scale)
+        row(7, "Video", self.c_video)
+        card.pack_start(grid, False, False, 0)
+
+        # --- Buttons ---
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        connect = Gtk.Button(label="Connect"); connect.get_style_context().add_class("connect")
+        connect.connect("clicked", self.on_connect)
+        shutdown = Gtk.Button(label="Shut down")
+        shutdown.connect("clicked", lambda *_: subprocess.call(["sudo", "-n", "systemctl", "poweroff"]))
+        btns.pack_end(connect, False, False, 0)
+        btns.pack_start(shutdown, False, False, 0)
+        card.pack_start(btns, False, False, 0)
+
+        self.e_pass.connect("activate", self.on_connect)  # Enter in password = connect
+        self.refresh_lan()
+        GLib.timeout_add_seconds(2, self.refresh_lan)      # live LAN dot
+        # --- Deferrable software-update prompt ---
+        self._upd_dialog = None
+        try:
+            self._max_skips = max(0, int(conf_get("UPDATE_MAX_SKIPS", "3") or 3))
+        except ValueError:
+            self._max_skips = 3
+        try:
+            self._prompt_interval = max(0.0, float(conf_get("UPDATE_PROMPT_HOURS", "4") or 4)) * 3600
+        except ValueError:
+            self._prompt_interval = 4 * 3600
+        GLib.timeout_add_seconds(3, self._initial_update_check)   # shortly after boot
+        GLib.timeout_add_seconds(300, self._check_update)         # re-offer while idle
+        self.connect("destroy", Gtk.main_quit)
+
+    def refresh_lan(self):
+        st = net_status()
+        ctx = self.dot.get_style_context()
+        ctx.remove_class("dot-green"); ctx.remove_class("dot-red")
+        if st:
+            ctx.add_class("dot-green")
+            self.lan_lbl.set_text("Network connected (%s)" % ("LAN" if st == "lan" else "Wi-Fi"))
+        else:
+            ctx.add_class("dot-red")
+            self.lan_lbl.set_text("No network — click Wi-Fi to connect")
+        return True  # keep the timer running
+
+    def _toggle_pw(self, entry, pos, event=None):
+        vis = not entry.get_visibility()
+        entry.set_visibility(vis)
+        entry.set_icon_from_icon_name(
+            Gtk.EntryIconPosition.SECONDARY,
+            "view-conceal-symbolic" if vis else "view-reveal-symbolic")
+
+    def on_wifi(self, *_):
+        # Delegate to the tested Wi-Fi scan/connect backend (separate window).
+        try:
+            subprocess.Popen(["/opt/thinclient/bin/thinclient-wifi", "menu"])
+        except Exception as e:
+            self.msg(Gtk.MessageType.ERROR, "Wi-Fi", str(e))
+
+    # ---------------------- Deferrable software updates ----------------------
+    def _initial_update_check(self):
+        self._check_update(natural=True)
+        return False   # one-shot
+
+    def _write_skip_cache(self, ver, skips, last):
+        try:
+            os.makedirs(os.path.dirname(SKIP_CACHE), exist_ok=True)
+            with open(SKIP_CACHE, "w") as f:
+                f.write("version=%s\nskips=%d\nlast_offer=%f\n" % (ver, skips, last))
+        except OSError:
+            pass
+
+    def _update_action(self, ver, natural):
+        """Pure decision (no UI): return ('forced'|'offer'|'wait', skips) for the
+        pending version. A new version resets the skip counter. `natural`=True
+        (boot / return-from-session) always offers; otherwise offer only once
+        every UPDATE_PROMPT_HOURS. After UPDATE_MAX_SKIPS deferrals it is forced."""
+        import time
+        cache = _read_kv(SKIP_CACHE)
+        if cache.get("version") == ver:
+            try: skips = int(cache.get("skips", "0"))
+            except ValueError: skips = 0
+            try: last = float(cache.get("last_offer", "0"))
+            except ValueError: last = 0.0
+        else:
+            skips, last = 0, 0.0                  # a new version resets the counter
+            self._write_skip_cache(ver, 0, 0.0)
+        if skips >= self._max_skips:
+            return "forced", skips
+        if natural or (time.time() - last) >= self._prompt_interval:
+            return "offer", skips
+        return "wait", skips
+
+    def _check_update(self, natural=False):
+        """Offer a staged update; after UPDATE_MAX_SKIPS deferrals, force it."""
+        if self._upd_dialog is not None:
+            return True                          # a dialog is already up
+        ver = pending_update_version()
+        if not ver:
+            return True                          # nothing pending
+        action, skips = self._update_action(ver, natural)
+        if action == "forced":
+            self._show_update_forced(ver)
+        elif action == "offer":
+            self._show_update_offer(ver, skips)
+        return True
+
+    def _show_update_offer(self, ver, skips):
+        import time
+        left = self._max_skips - skips
+        d = Gtk.MessageDialog(transient_for=self, modal=True,
+                              message_type=Gtk.MessageType.INFO,
+                              buttons=Gtk.ButtonsType.NONE, text="Software update available")
+        d.format_secondary_text(
+            "Version %s is ready to install.\n\n"
+            "You can postpone %d more time%s; after that it installs "
+            "automatically. It takes about a minute and the screen refreshes once."
+            % (ver, left, "" if left == 1 else "s"))
+        d.add_button("Remind me later", Gtk.ResponseType.CANCEL)
+        d.add_button("Update now", Gtk.ResponseType.OK).get_style_context().add_class("connect")
+        self._upd_dialog = d
+        resp = d.run()
+        d.destroy()
+        self._upd_dialog = None
+        if resp == Gtk.ResponseType.OK:
+            self._trigger_apply(ver)
+        else:
+            self._write_skip_cache(ver, skips + 1, time.time())
+
+    def _show_update_forced(self, ver):
+        d = Gtk.MessageDialog(transient_for=self, modal=True,
+                              message_type=Gtk.MessageType.WARNING,
+                              buttons=Gtk.ButtonsType.NONE, text="Installing required update")
+        d.add_button("Update now", Gtk.ResponseType.OK).get_style_context().add_class("connect")
+        state = {"left": 30, "tid": 0}
+        def body(n):
+            return ("Version %s will now be installed (you have postponed the "
+                    "maximum number of times).\n\nInstalling in %d seconds…" % (ver, n))
+        def tick():
+            state["left"] -= 1
+            d.format_secondary_text(body(state["left"]))
+            if state["left"] <= 0:
+                state["tid"] = 0
+                d.response(Gtk.ResponseType.OK)
+                return False
+            return True
+        d.format_secondary_text(body(30))
+        state["tid"] = GLib.timeout_add_seconds(1, tick)
+        self._upd_dialog = d
+        d.run()
+        if state["tid"]:
+            GLib.source_remove(state["tid"])
+        d.destroy()
+        self._upd_dialog = None
+        self._trigger_apply(ver)
+
+    def _trigger_apply(self, ver):
+        try:
+            subprocess.Popen(["sudo", "-n", "systemctl", "--no-block", "start",
+                              "thinclient-update-apply.service"])
+        except Exception as e:
+            self.msg(Gtk.MessageType.ERROR, "Update failed to start", str(e))
+            return
+        # The apply service downloads, swaps, and restarts the session (which
+        # replaces this window). Show a please-wait notice until then.
+        d = Gtk.MessageDialog(transient_for=self, modal=True,
+                              message_type=Gtk.MessageType.INFO,
+                              buttons=Gtk.ButtonsType.NONE, text="Installing update %s…" % ver)
+        d.format_secondary_text("Please wait — the screen will refresh automatically "
+                                "when the update is complete. Do not power off.")
+        self._upd_dialog = d
+        d.show_all()   # non-blocking; the session restart tears it down
+
+    def scale_choice(self):
+        i = self.c_scale.get_active()
+        return self.scale_opts[i][1] if 0 <= i < len(self.scale_opts) else "auto"
+
+    def video_choice(self):
+        i = self.c_video.get_active()
+        return self.video_opts[i][1] if 0 <= i < len(self.video_opts) else "auto"
+
+    def rdp_argv(self, host, port, user, dom, sec):
+        argv = [self.rdp, "/v:%s:%s" % (host, port), "/u:%s" % user]
+        if dom:
+            argv.append("/d:%s" % dom)
+        argv += ["/from-stdin:force", "/f", "/cert:ignore", "/sec:%s" % sec,
+                 "/clipboard",
+                 # Audio out (speakers) + audio in (microphone) via the local
+                 # PulseAudio-compatible server (PipeWire), started by the session.
+                 "/sound:sys:pulse", "/microphone:sys:pulse",
+                 "/log-level:INFO"]
+        # --- Video / GFX codec: H.264 pipeline for smooth, sharp motion video ---
+        vid = self.video_choice()
+        if vid in ("auto", "avc444"):
+            argv += ["/gfx:AVC444", "/network:auto"]   # H.264 4:4:4 (mstsc default)
+        elif vid == "avc420":
+            argv += ["/gfx:AVC420", "/network:auto"]   # H.264 4:2:0 (lighter)
+        # vid == "off": legacy bitmap path, no /gfx (maximum compatibility)
+        # --- Display sizing (all flags verified against Debian FreeRDP 3.15) ---
+        choice = self.scale_choice()
+        if choice == "fit":
+            # Guaranteed-bigger fallback: render a comfortable logical desktop and
+            # let FreeRDP scale it to fill the panel. Works even if the server
+            # ignores DPI. /smart-sizing is mutually exclusive with
+            # /dynamic-resolution, so we deliberately omit the latter here.
+            lw, lh = (1920, 1080) if self.scr_w >= 1920 else (self.scr_w, self.scr_h)
+            argv += ["/smart-sizing", "/size:%dx%d" % (lw, lh)]
+        else:
+            pct = auto_scale_pct(self.scr_w) if choice == "auto" else int(choice)
+            argv.append("/dynamic-resolution")   # desktop matches the panel size
+            if pct != 100:
+                # DesktopScaleFactor (100-500) drives the server-side DPI; pair it
+                # with a spec-valid DeviceScaleFactor (100/140/180) so Windows
+                # actually applies the enlargement.
+                dev = 100 if pct < 130 else (140 if pct < 175 else 180)
+                argv += ["/scale-desktop:%d" % pct, "/scale-device:%d" % dev]
+        return argv
+
+    def on_connect(self, *_):
+        blocked = license_block_reason()
+        if blocked:
+            self.msg(Gtk.MessageType.WARNING, "Device locked", blocked)
+            return
+        host = self.e_server.get_text().strip()
+        port = self.e_port.get_text().strip() or "3389"
+        user = self.e_user.get_text().strip()
+        pw   = self.e_pass.get_text()
+        dom  = self.e_dom.get_text().strip()
+        sec  = self.c_sec.get_active_text() or "nla"
+        if not host:
+            self.msg(Gtk.MessageType.WARNING, "Missing server", "Enter the Server / IP.")
+            return
+        if not self.rdp:
+            self.msg(Gtk.MessageType.ERROR, "FreeRDP missing", "No RDP client is installed.")
+            return
+
+        argv = self.rdp_argv(host, port, user, dom, sec)
+        out = tempfile.NamedTemporaryFile(prefix="rdp-", suffix=".log", delete=False,
+                                          dir=os.environ.get("TC_RUN_DIR", "/tmp"))
+        self.hide()
+        while Gtk.events_pending():
+            Gtk.main_iteration()
+        import time
+        t0 = time.time()
+        try:
+            proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=out, stderr=out)
+            proc.communicate(input=(pw + "\n").encode(), timeout=None)
+            rc = proc.returncode
+        except Exception as e:
+            rc = -1
+            out.write(("launch error: %s\n" % e).encode())
+        out.flush(); out.close()
+        dur = time.time() - t0
+        self.show_all()
+        self.refresh_lan()
+        # Fast exit = failed; show FreeRDP's real output.
+        if dur < 8:
+            try:
+                detail = open(out.name).read()[-4000:]
+            except OSError:
+                detail = "(no output captured)"
+            self.msg(Gtk.MessageType.ERROR, "Connection failed",
+                     "Could not connect to %s:%s as %s (exit %s).\n\n%s"
+                     % (host, port, user, rc, detail))
+        try:
+            os.unlink(out.name)
+        except OSError:
+            pass
+        # Back at the connect screen (safe, no RDP running) — a good moment to
+        # offer any pending update.
+        self._check_update(natural=True)
+
+    def msg(self, kind, title, text):
+        d = Gtk.MessageDialog(transient_for=self, modal=True,
+                              message_type=kind, buttons=Gtk.ButtonsType.OK, text=title)
+        d.format_secondary_text(text)
+        d.run(); d.destroy()
+
+if __name__ == "__main__":
+    win = Connect()
+    win.show_all()
+    Gtk.main()

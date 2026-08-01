@@ -18,8 +18,12 @@ if ! getent group thinclient >/dev/null; then
   groupadd -g 1000 thinclient
 fi
 if ! id thinclient >/dev/null 2>&1; then
-  useradd -m -u 1000 -g 1000 -s /usr/sbin/nologin -c "Thin Client" thinclient
+  useradd -m -u 1000 -g 1000 -s /bin/bash -c "Thin Client" thinclient
 fi
+# LightDM execs the session through the user's shell, so it must be real (bash),
+# not nologin. The account stays safe: password is locked, no console getty, and
+# the kiosk session exposes no terminal.
+usermod -s /bin/bash thinclient || true
 # Hardware access for audio/video/input/USB/network — but NOT sudo/adm.
 for g in audio video render input plugdev netdev; do
   getent group "$g" >/dev/null 2>&1 && usermod -aG "$g" thinclient || true
@@ -38,9 +42,64 @@ usermod -s /usr/sbin/nologin root || true
 # ---------------------------------------------------------------------------
 systemctl set-default graphical.target
 systemctl enable thinclient-firstboot.service
-systemctl enable thinclient-x.service
 systemctl enable thinclient-watchdog.service
 systemctl enable NetworkManager.service || true
+# OTA auto-update: the timer wakes 2min after boot then every 6h. It is a no-op
+# unless UPDATE_ENABLED=true in server.conf, so shipping it enabled is safe.
+# NetworkManager-wait-online makes network-online.target meaningful so the
+# updater only fires once the box is actually online.
+systemctl enable thinclient-update.timer 2>/dev/null || true
+systemctl enable NetworkManager-wait-online.service 2>/dev/null || true
+# Management agent (licence enforcement + remote commands + screen stream). Idles
+# quietly until the device is enrolled in /etc/thinclient/license.conf.
+systemctl enable thinclient-agent.service 2>/dev/null || true
+
+# Convert /opt/thinclient (a real dir) into /opt/thinclient-releases/<ver> plus a
+# symlink, so the updater can swap releases with an atomic `mv -T`. Every path
+# that points at /opt/thinclient/... keeps working transparently through the link.
+if [ -d /opt/thinclient ] && [ ! -L /opt/thinclient ]; then
+  _tcver="$(cat /opt/thinclient/VERSION 2>/dev/null || echo 1.0.0)"
+  mkdir -p /opt/thinclient-releases
+  rm -rf "/opt/thinclient-releases/${_tcver}"
+  mv /opt/thinclient "/opt/thinclient-releases/${_tcver}"
+  ln -sfn "/opt/thinclient-releases/${_tcver}" /opt/thinclient
+fi
+# Enable the PipeWire audio stack for every user session so RDP sound + mic
+# redirection has a running PulseAudio-compatible server.
+systemctl --global enable pipewire.socket pipewire-pulse.socket wireplumber.service 2>/dev/null || true
+# The hand-rolled xinit service is replaced by LightDM (configured below).
+systemctl disable thinclient-x.service 2>/dev/null || true
+
+# --- LightDM autologin -> the kiosk RDP session ------------------------------
+mkdir -p /etc/lightdm/lightdm.conf.d
+cat >/etc/lightdm/lightdm.conf.d/50-thinclient.conf <<'EOF'
+[Seat:*]
+autologin-user=thinclient
+autologin-user-timeout=0
+autologin-session=thinclient
+user-session=thinclient
+# Skip any greeter; go straight to the session.
+greeter-hide-users=true
+allow-guest=false
+EOF
+# The session LightDM launches for the kiosk user.
+mkdir -p /usr/share/xsessions
+cat >/usr/share/xsessions/thinclient.desktop <<'EOF'
+[Desktop Entry]
+Name=Esparks Thin Client
+Comment=Esparks IT Solutions RDP appliance
+Exec=/opt/thinclient/bin/thinclient-xsession
+Type=Application
+DesktopNames=ThinClient
+EOF
+# Passwordless autologin groups (Debian LightDM checks these).
+groupadd -f autologin || true
+groupadd -f nopasswdlogin || true
+usermod -aG autologin,nopasswdlogin thinclient || true
+# Make LightDM the boot display manager.
+echo "/usr/sbin/lightdm" >/etc/X11/default-display-manager 2>/dev/null || true
+systemctl enable lightdm.service 2>/dev/null || true
+systemctl set-default graphical.target
 
 # ---------------------------------------------------------------------------
 # 4. No console login prompts anywhere (mask every getty).
@@ -91,17 +150,35 @@ chmod 0775 /var/log/thinclient
 # ---------------------------------------------------------------------------
 # 7. Security hardening — remove attack surface / avoid pulling a desktop.
 # ---------------------------------------------------------------------------
-# Never run an SSH server; remove if the base pulled one in.
-systemctl disable ssh.service 2>/dev/null || true
-apt-get -y purge openssh-server 2>/dev/null || true
+# === Debug SSH — ONLY when built with TC_DEBUG_SSH=1. OFF for production. =====
+# Debug creds (esparks/esparks, root/esparks-debug) exist only in debug images.
+if [ "$(sed -n 's/^DEBUG_SSH=//p' /etc/thinclient/.build-flags 2>/dev/null)" = "1" ]; then
+  echo "[hook] DEBUG_SSH=1 — enabling debug SSH access"
+  systemctl enable ssh.service 2>/dev/null || true
+  mkdir -p /etc/ssh/sshd_config.d
+  cat >/etc/ssh/sshd_config.d/99-esparks-debug.conf <<'EOF'
+PasswordAuthentication yes
+PermitRootLogin yes
+EOF
+  echo 'root:esparks-debug' | chpasswd 2>/dev/null || true
+  usermod -s /bin/bash root 2>/dev/null || true   # DEBUG: allow root shell/SSH
+else
+  # production: no remote login, root stays nologin (set above)
+  systemctl disable ssh.service 2>/dev/null || true
+  rm -f /etc/ssh/sshd_config.d/99-esparks-debug.conf 2>/dev/null || true
+fi
 # Kill magic SysRq (prevents console kill combos on an exposed keyboard).
 mkdir -p /etc/sysctl.d
 cat >/etc/sysctl.d/99-thinclient.conf <<'EOF'
 kernel.sysrq = 0
 kernel.dmesg_restrict = 1
 EOF
-# Blank the message-of-the-day / issue (no info leak on the never-seen console).
-: >/etc/issue || true
+# Brand the console banner (Esparks IT Solutions) instead of the Debian default.
+cat >/etc/issue <<'EOF'
+Esparks IT Solutions Private Limited  \n \l
+
+EOF
+cp -f /etc/issue /etc/issue.net 2>/dev/null || true
 : >/etc/motd || true
 
 # ---------------------------------------------------------------------------
@@ -133,9 +210,17 @@ fi
 update-initramfs -u || true
 
 # ---------------------------------------------------------------------------
-# 11. Hostname + locale + timezone defaults.
+# 11. Branding (Esparks IT Solutions) + hostname + locale + timezone.
 # ---------------------------------------------------------------------------
-echo "thinclient" >/etc/hostname
+echo "esparksit" >/etc/hostname
+cat >/etc/hosts <<'EOF'
+127.0.0.1   localhost esparksit
+::1         localhost ip6-localhost ip6-loopback
+EOF
+# Replace the Debian display name on any surface that shows it (keep ID=debian
+# so apt and tooling keep working).
+sed -i 's/^PRETTY_NAME=.*/PRETTY_NAME="Esparks IT Solutions"/' /etc/os-release 2>/dev/null || true
+sed -i 's/^NAME=.*/NAME="Esparks IT Solutions"/' /etc/os-release 2>/dev/null || true
 sed -i 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen 2>/dev/null || true
 locale-gen 2>/dev/null || true
 ln -sf /usr/share/zoneinfo/UTC /etc/localtime || true
@@ -154,11 +239,105 @@ if [ -f /opt/thinclient/assets/connecting.svg ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 12b. Rescue diagnostic — if the graphical session fails to start, show the
+#      reason on tty1 so it can be photographed. No login required.
+# ---------------------------------------------------------------------------
+# NOTE: the rescue diagnostic lives OUTSIDE /opt/thinclient on purpose. That dir
+# is atomically swapped by OTA updates; the recovery path must survive a bad
+# update (and never be dropped by a bundle that doesn't ship it), so it goes to
+# /usr/local/sbin, which the updater never touches.
+cat >/usr/local/sbin/thinclient-rescue <<'RESC'
+#!/bin/sh
+# Wait for the kiosk to ACTUALLY come up (FreeRDP running or fresh heartbeat).
+# Checking FreeRDP (not just Xorg) means we also catch an X crash-loop/flicker,
+# where Xorg is present intermittently but the session never stabilises.
+i=0
+while [ "$i" -lt 115 ]; do
+  # Healthy = X server up (match 'Xorg' OR '/usr/bin/X') AND the connection
+  # window (or an RDP session) running. Widened window so a slow GPU init on a
+  # cold boot does not trip the diagnostic before the session settles.
+  x_up=0
+  pgrep -f '[/ ]Xorg' >/dev/null 2>&1 && x_up=1
+  pgrep -x X >/dev/null 2>&1 && x_up=1
+  if [ "$x_up" = 1 ] && \
+     { pgrep -f 'thinclient-connect' >/dev/null 2>&1 || \
+       pgrep -x xfreerdp3 >/dev/null 2>&1 || pgrep -x xfreerdp >/dev/null 2>&1; }; then
+    exit 0
+  fi
+  sleep 3; i=$((i + 3))
+done
+# Kiosk never came up. Stop the display manager so the screen stops flickering,
+# then show the real reason on tty1.
+systemctl stop lightdm 2>/dev/null || true
+sleep 2
+chvt 1 2>/dev/null || true
+{
+  echo "==================================================================="
+  echo " Esparks IT Solutions - DIAGNOSTIC: the display session failed to start"
+  echo " >>> PHOTOGRAPH THIS SCREEN and send it to support. <<<"
+  echo " Host: $(hostname)   $(date)"
+  echo "==================================================================="
+  echo "----- GPU -----"
+  lspci 2>/dev/null | grep -iE 'vga|display|3d'
+  echo "----- kernel amdgpu / drm / firmware messages -----"
+  dmesg 2>/dev/null | grep -iE 'amdgpu|drm|firmware' | tail -15
+  echo "----- Xorg errors -----"
+  grep -E '\(EE\)|no screens|Fatal|Cannot|failed|ABI|module' \
+       /var/log/lightdm/x-0.log /var/log/Xorg.0.log 2>/dev/null | tail -25
+  echo "----- session errors (.xsession-errors) -----"
+  tail -20 /home/thinclient/.xsession-errors 2>/dev/null
+  echo "----- lightdm journal -----"
+  journalctl -b -u lightdm --no-pager 2>/dev/null | tail -20
+  echo "----- Xorg log tail -----"
+  tail -20 /var/log/lightdm/x-0.log /var/log/Xorg.0.log 2>/dev/null
+  echo "==================================================================="
+  echo " Backup: press Ctrl+Alt+F2, login  esparks / esparks , then run: getlogs"
+  echo "==================================================================="
+} >/dev/tty1 2>&1
+sleep 100000   # hold the diagnostic on screen
+RESC
+chmod 0755 /usr/local/sbin/thinclient-rescue
+cat >/etc/systemd/system/thinclient-rescue.service <<'EOF'
+[Unit]
+Description=Esparks thin-client rescue diagnostic
+After=lightdm.service
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/thinclient-rescue
+[Install]
+WantedBy=graphical.target
+EOF
+systemctl enable thinclient-rescue.service 2>/dev/null || true
+
+# --- Debug console on tty2 — ONLY when built with TC_DEBUG_SSH=1 -------------
+if [ "$(sed -n 's/^DEBUG_SSH=//p' /etc/thinclient/.build-flags 2>/dev/null)" = "1" ]; then
+  if ! id esparks >/dev/null 2>&1; then
+    useradd -m -u 1002 -s /bin/bash -c "Esparks Debug" esparks
+  fi
+  echo 'esparks:esparks' | chpasswd
+  usermod -aG sudo esparks || true
+  cat >/usr/local/bin/getlogs <<'GL'
+#!/bin/sh
+sudo sh -c '
+  echo "===== GPU =====";            lspci | grep -iE "vga|display|3d"
+  echo "===== amdgpu/drm dmesg ====="; dmesg | grep -iE "amdgpu|drm|firmware" | tail -20
+  echo "===== Xorg errors =====";     grep -E "\(EE\)|no screens|Fatal|Cannot|failed" /var/log/lightdm/x-0.log /var/log/Xorg.0.log 2>/dev/null | tail -30
+  echo "===== .xsession-errors ====="; tail -25 /home/thinclient/.xsession-errors 2>/dev/null
+  echo "===== lightdm journal =====";  journalctl -b -u lightdm --no-pager | tail -25
+'
+GL
+  chmod 0755 /usr/local/bin/getlogs
+  systemctl unmask getty@tty2.service 2>/dev/null || true
+  systemctl enable getty@tty2.service 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
 # 13. Build marker for diagnostics.
 # ---------------------------------------------------------------------------
 mkdir -p /etc/thinclient
 {
-  echo "product=ThinClient OS"
+  echo "product=Esparks IT Solutions — Thin Client"
+  echo "vendor=Esparks IT Solutions Private Limited"
   echo "base=Debian $(cat /etc/debian_version 2>/dev/null || echo 13)"
   echo "built_by=live-build"
 } >/etc/thinclient/build-info

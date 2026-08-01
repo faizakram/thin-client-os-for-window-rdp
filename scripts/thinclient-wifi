@@ -24,18 +24,21 @@ sudo_nmcli() { sudo -n nmcli "$@"; }
 
 _scan_rows() {
   sudo_nmcli device wifi rescan >/dev/null 2>&1 || true
-  # SSID:SIGNAL:SECURITY  ->  dedupe by SSID keeping the strongest signal,
-  # drop hidden/empty SSIDs, emit yad rows (3 fields per network).
-  nmcli -t -f SSID,SIGNAL,SECURITY device wifi list 2>/dev/null \
-    | awk -F: 'NF>=1 && $1!="" {print}' \
-    | sort -t: -k2 -nr \
-    | awk -F: '!seen[$1]++ { sec=$3; if (sec=="") sec="open"; print $1; print $2"%"; print sec }'
+  # Put the free-text SSID LAST so a colon inside an SSID can't shift the other
+  # fields. Dedupe by SSID keeping the strongest signal; drop hidden SSIDs.
+  # Emits yad rows: SSID, SIGNAL%, SECURITY (3 lines per network).
+  nmcli -t -f IN-USE,SIGNAL,SECURITY,SSID device wifi list 2>/dev/null \
+    | awk -F: '{ sig=$2+0; sec=$3; ssid=$4; for(i=5;i<=NF;i++) ssid=ssid":"$i;
+                 if(ssid!="") printf "%d\t%s\t%s\n", sig, ssid, (sec==""?"open":sec) }' \
+    | sort -k1,1 -nr \
+    | awk -F'\t' '!seen[$2]++ { print $2; print $1"%"; print $3 }'
 }
 
 _is_secured() {
   local ssid="$1"
-  nmcli -t -f SSID,SECURITY device wifi list 2>/dev/null \
-    | awk -F: -v s="$ssid" '$1==s && $2!="" { print "yes"; exit }'
+  nmcli -t -f SECURITY,SSID device wifi list 2>/dev/null \
+    | awk -F: -v s="$ssid" '{ sec=$1; name=$2; for(i=3;i<=NF;i++) name=name":"$i;
+                              if(name==s){ if(sec!="") print "yes"; exit } }'
 }
 
 picker() {
@@ -49,8 +52,12 @@ picker() {
   log_info "WiFi picker opened (offline)"
 
   while :; do
-    # If a route appeared while we were looping (e.g. Ethernet plugged in), stop.
-    tc_have_network && { log_info "Network detected; closing picker"; return 0; }
+    # In the boot GATE (picker) mode we close as soon as a network appears
+    # (e.g. Ethernet plugged in). In MENU mode (opened from the connect window)
+    # we stay open even when online, so the user can switch/add Wi-Fi anytime.
+    if [[ "${TC_WIFI_MODE:-}" != "menu" ]]; then
+      tc_have_network && { log_info "Network detected; closing picker"; return 0; }
+    fi
 
     local rows; rows="$(_scan_rows)"
     if [[ -z "$rows" ]]; then
@@ -111,7 +118,8 @@ picker() {
 }
 
 case "${1:-picker}" in
-  picker) picker ;;
+  picker) picker ;;                              # boot gate: closes when online
+  menu)   TC_WIFI_MODE=menu picker ;;            # on-demand: stays open when online
   status) tc_have_network && { echo "online"; exit 0; } || { echo "offline"; exit 1; } ;;
-  *) echo "Usage: $0 {picker|status}" >&2; exit 2 ;;
+  *) echo "Usage: $0 {picker|menu|status}" >&2; exit 2 ;;
 esac

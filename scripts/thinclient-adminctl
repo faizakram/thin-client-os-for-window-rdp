@@ -20,7 +20,7 @@ set -uo pipefail
 source "${TC_LIB_DIR:-/opt/thinclient/lib}"/thinclient-common.sh
 export TC_LOGFILE="thinclient"
 
-X_SERVICE="thinclient-x.service"
+X_SERVICE="lightdm.service"
 WD_SERVICE="thinclient-watchdog.service"
 LOCK_STATE="${TC_RUN_DIR}/admin.lock"
 

@@ -21,6 +21,12 @@ mapfile -t files < <(
 rc=0
 for f in "${files[@]}"; do
   [[ -f "$f" ]] || continue
+  # Only shellcheck actual shell scripts — skip others (e.g. the Python GTK
+  # connect app thinclient-connect) by inspecting the shebang.
+  if ! head -1 "$f" | grep -qE '^#!.*(bin/sh|bash|dash|ksh|busybox)'; then
+    printf '  skip %s (not a shell script)\n' "${f#"$ROOT"/}"
+    continue
+  fi
   # SC1091: don't follow sourced files (paths resolve only at runtime).
   # SC2155: allow `local x=$(...)` in these operational scripts.
   if shellcheck -x -e SC1091,SC2155 -S warning "$f"; then

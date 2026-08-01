@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  ThinClient OS — pull-based OTA updater (Esparks IT Solutions)
+#  Installed to: /opt/thinclient/bin/thinclient-update
+#
+#  Two modes:
+#    --check   (default; run by thinclient-update.timer every few hours)
+#              Fetch + VERIFY the signed manifest, decide if a newer release is
+#              available for THIS device, and if so write a "pending" flag.
+#              It does NOT install anything. The connect window reads the flag
+#              and prompts the user (defer up to N times, then it is forced).
+#    --apply   (run by thinclient-update-apply.service, triggered from the
+#              connect window when the user accepts or after the skip limit)
+#              Re-verify, download, stage, ATOMIC swap, restart, health-check,
+#              then commit (prune) or ROLL BACK + blocklist the bad version.
+#
+#  Never touches /etc/thinclient/server.conf or admin.conf. Releases live under
+#  /opt/thinclient-releases/<version>; /opt/thinclient is a symlink to the live
+#  one, so a swap is atomic and rollback is instant.
+# =============================================================================
+set -uo pipefail
+
+source "${TC_LIB_DIR:-/opt/thinclient/lib}"/thinclient-common.sh
+export TC_LOGFILE="install"
+
+MODE="check"
+case "${1:-}" in
+  --check|"") MODE="check" ;;
+  --apply)    MODE="apply" ;;
+  *) echo "usage: $(basename "$0") [--check|--apply]" >&2; exit 2 ;;
+esac
+
+RELEASES_DIR="/opt/thinclient-releases"
+STATE_DIR="/var/lib/thinclient/updates"
+PUBKEY="/etc/thinclient/update-pubkey.pem"
+BLOCKED="${STATE_DIR}/blocked"
+PENDING="${STATE_DIR}/pending"     # world-readable flag the connect window polls
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+
+# --- Single instance ---------------------------------------------------------
+exec 8>"${STATE_DIR}/.lock" 2>/dev/null || true
+flock -n 8 || { log_info "update: another run in progress"; exit 0; }
+
+die()  { log_error "update: $*"; exit 1; }
+skip() { log_info "update: $*"; exit 0; }
+clear_pending() { rm -f "$PENDING" 2>/dev/null || true; }
+stage_pending() { # $1 = version
+  printf 'version=%s\n' "$1" > "$PENDING" 2>/dev/null || true
+  chmod 0644 "$PENDING" 2>/dev/null || true
+}
+
+# --- Guards ------------------------------------------------------------------
+[[ "$(tc_bool "$(conf_get UPDATE_ENABLED false)")" == "true" ]] || { clear_pending; skip "disabled (UPDATE_ENABLED=false)"; }
+URL="$(conf_get UPDATE_URL)"
+[[ -n "$URL" ]] || { clear_pending; skip "no UPDATE_URL configured"; }
+URL="${URL%/}"
+command -v curl >/dev/null 2>&1 || die "curl missing"
+
+# Don't self-update a live-USB (changes vanish at reboot); only installed disks.
+if findmnt -rn /run/live/medium >/dev/null 2>&1 || grep -q 'boot=live' /proc/cmdline 2>/dev/null; then
+  skip "running from live medium; updates apply to installed systems only"
+fi
+
+cur_ver="$(cat /opt/thinclient/VERSION 2>/dev/null || echo 0.0.0)"
+tmp="$(mktemp -d "${STATE_DIR}/chk.XXXXXX")"
+trap 'rm -rf "$tmp"' EXIT
+
+# --- Fetch + verify the manifest ---------------------------------------------
+fetch() { curl -fsSL --connect-timeout 15 --max-time 300 -o "$2" "$1"; }
+fetch "${URL}/manifest"     "${tmp}/manifest"     || skip "no manifest at ${URL} (or offline)"
+fetch "${URL}/manifest.sig" "${tmp}/manifest.sig" || true
+
+if [[ -s "$PUBKEY" ]]; then
+  [[ -s "${tmp}/manifest.sig" ]] || die "manifest.sig missing but a signing key is present — refusing"
+  openssl dgst -sha256 -verify "$PUBKEY" -signature "${tmp}/manifest.sig" "${tmp}/manifest" >/dev/null 2>&1 \
+    || die "manifest signature INVALID — refusing (possible tampering)"
+  log_info "update: manifest signature verified"
+elif [[ "$(tc_bool "$(conf_get UPDATE_ALLOW_UNSIGNED false)")" != "true" ]]; then
+  die "no public key at ${PUBKEY} and UPDATE_ALLOW_UNSIGNED!=true — refusing unsigned update"
+fi
+
+mget() { tc_conf_get "${tmp}/manifest" "$1" "${2:-}"; }
+new_ver="$(mget version)"
+bundle="$(mget bundle)"
+want_sha="$(mget sha256)"
+rollout="$(mget rollout 100)"
+[[ -n "$new_ver" && -n "$bundle" && -n "$want_sha" ]] || die "manifest incomplete"
+
+# --- Is it newer, allowed, and in this device's rollout wave? ----------------
+if [[ "$new_ver" == "$cur_ver" ]] || \
+   [[ "$(printf '%s\n%s\n' "$cur_ver" "$new_ver" | sort -V | tail -1)" == "$cur_ver" ]]; then
+  clear_pending; skip "up to date (installed ${cur_ver}, latest ${new_ver})"
+fi
+if grep -qxF "$new_ver" "$BLOCKED" 2>/dev/null; then
+  clear_pending; skip "version ${new_ver} previously failed here (blocklisted)"
+fi
+[[ "$rollout" =~ ^[0-9]+$ ]] || rollout=100
+mid="$(cat /etc/machine-id 2>/dev/null || hostname)"
+bucket=$(( 0x$(printf '%s%s' "$mid" "$new_ver" | sha256sum | cut -c1-4) % 100 ))
+if (( bucket >= rollout )); then
+  clear_pending; skip "not in this rollout wave yet (bucket ${bucket} >= rollout ${rollout}%)"
+fi
+
+# ============================================================================
+#  A valid, newer, allowed update exists.
+# ============================================================================
+if [[ "$MODE" == "check" ]]; then
+  # Do NOT install. Flag it so the connect window can prompt the user.
+  stage_pending "$new_ver"
+  skip "v${new_ver} available — staged for user prompt (installed ${cur_ver})"
+fi
+
+# -------------------------- MODE == apply -----------------------------------
+# Never interrupt an active RDP session — try again next tick / next boot.
+if pgrep -x xfreerdp3 >/dev/null 2>&1 || pgrep -x xfreerdp >/dev/null 2>&1; then
+  skip "an RDP session is active; deferring apply"
+fi
+log_info "update: applying ${cur_ver} -> ${new_ver} (rollout ${rollout}%, bucket ${bucket})"
+
+# --- Download + verify the bundle -------------------------------------------
+fetch "${URL}/${bundle}" "${tmp}/${bundle}" || die "bundle download failed"
+echo "${want_sha}  ${tmp}/${bundle}" | sha256sum -c - >/dev/null 2>&1 || die "bundle sha256 mismatch — refusing"
+
+# --- Stage + validate --------------------------------------------------------
+stage="${RELEASES_DIR}/${new_ver}"
+rm -rf "$stage"; mkdir -p "$stage"
+tar -xzf "${tmp}/${bundle}" -C "$stage" || die "extract failed"
+[[ -x "${stage}/bin/thinclient-connect" && -f "${stage}/lib/thinclient-common.sh" ]] \
+  || die "bundle missing expected files"
+for s in "${stage}"/bin/*; do
+  head -1 "$s" | grep -q 'python3' && { python3 -m py_compile "$s" 2>/dev/null || die "bad python in $s"; } && continue
+  head -1 "$s" | grep -qE 'sh|bash' && { bash -n "$s" 2>/dev/null || die "bad shell in $s"; }
+done
+printf '%s\n' "$new_ver" > "${stage}/VERSION"
+
+# --- Atomic swap + apply -----------------------------------------------------
+prev_target="$(readlink -f /opt/thinclient 2>/dev/null)"
+ln -sfn "$stage" "${RELEASES_DIR}/.next" && mv -Tf "${RELEASES_DIR}/.next" /opt/thinclient
+chmod 0755 /opt/thinclient/bin/* 2>/dev/null || true
+clear_pending   # the offer has been acted on
+log_info "update: applied ${new_ver}; restarting session"
+systemctl restart lightdm 2>/dev/null || true
+
+# --- Health check: did the session come back? --------------------------------
+healthy() {
+  pgrep -f '[/ ]Xorg' >/dev/null 2>&1 || pgrep -x X >/dev/null 2>&1 || return 1
+  pgrep -f 'thinclient-connect' >/dev/null 2>&1 \
+    || pgrep -x xfreerdp3 >/dev/null 2>&1 || pgrep -x xfreerdp >/dev/null 2>&1
+}
+ok=0
+for _ in $(seq 1 30); do sleep 3; healthy && { ok=1; break; }; done
+
+if (( ok == 1 )); then
+  log_info "update: ${new_ver} healthy — committed"
+  ls -1dt "${RELEASES_DIR}"/*/ 2>/dev/null | tail -n +3 | xargs -r rm -rf
+  { echo "product=Esparks IT Solutions — Thin Client"; echo "version=${new_ver}"; } >/etc/thinclient/build-info 2>/dev/null || true
+else
+  log_error "update: ${new_ver} FAILED health check — rolling back to ${prev_target}"
+  [[ -n "$prev_target" ]] && ln -sfn "$prev_target" "${RELEASES_DIR}/.next" && mv -Tf "${RELEASES_DIR}/.next" /opt/thinclient
+  echo "$new_ver" >>"$BLOCKED"
+  rm -rf "$stage"
+  systemctl restart lightdm 2>/dev/null || true
+fi

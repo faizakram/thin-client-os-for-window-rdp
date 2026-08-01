@@ -20,6 +20,7 @@ locales
 keyboard-configuration
 console-setup
 ca-certificates
+curl
 less
 psmisc
 procps

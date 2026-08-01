@@ -9,7 +9,7 @@
 Description=ThinClient environment preparation
 DefaultDependencies=no
 After=local-fs.target
-Before=thinclient-x.service thinclient-watchdog.service
+Before=thinclient-watchdog.service lightdm.service display-manager.service
 RequiresMountsFor=/var/log
 
 [Service]

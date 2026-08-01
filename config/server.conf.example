@@ -54,6 +54,26 @@ MULTIMONITOR=true
 # Dynamic resolution: the remote desktop resizes with the local display.
 DYNAMIC_RESOLUTION=true
 
+# DISPLAY_SCALE — default for the on-screen "Display size" control. Fixes the
+# "everything is tiny" look on a high-resolution (2K/4K) panel by telling the
+# server to render its UI larger (server-side DPI, stays crisp).
+#   auto              -> pick from the detected resolution (4K->200, 1440p->150)
+#   100|125|150|175|200 -> force that desktop scale percentage
+#   fit               -> zoom the whole desktop to fill the screen (always
+#                        enlarges, even if the server ignores DPI; slightly softer)
+# Anyone can still change it live on the connect screen with no rebuild.
+DISPLAY_SCALE=auto
+
+# GFX_CODEC — default for the on-screen "Video" control. Full-motion video (e.g.
+# YouTube in the remote browser) looks blurry without an H.264 GFX codec. This
+# enables the same H.264 pipeline Windows' own RDP client uses.
+#   auto | avc444 -> H.264 4:4:4  (sharpest; sharp text AND video)  [recommended]
+#   avc420        -> H.264 4:2:0  (lighter on bandwidth, slightly softer color)
+#   off           -> legacy bitmap path (no H.264; maximum compatibility)
+# H.264 decode ships in the image; with H.264 on we also send /network:auto so
+# the server adapts bitrate to the link. Change it live on the connect screen.
+GFX_CODEC=auto
+
 # ------------------------------ Device redirection --------------------------
 CAMERA=true
 MICROPHONE=true
@@ -95,3 +115,24 @@ WATCHDOG_INTERVAL=5
 # Any additional raw FreeRDP flags, appended verbatim to the command line.
 # Advanced use only. Example: EXTRA_ARGS="/gfx-progressive /timeout:15000"
 EXTRA_ARGS=
+# ------------------------------ Auto-update ---------------------------------
+# Pull-based OTA. When enabled, the device checks UPDATE_URL on boot + every 6h
+# and verifies the SIGNED manifest against /etc/thinclient/update-pubkey.pem.
+# If a newer release is found, the connect screen shows "Software update
+# available"; the user may postpone it up to UPDATE_MAX_SKIPS times, after which
+# it installs automatically (never during an RDP session), with health-check +
+# rollback. It never touches this file or admin.conf.
+#
+# UPDATE_URL for GitHub Releases must point at a PUBLIC repo so assets download
+# without a token (the bundle is just the /opt/thinclient scripts — no secrets):
+#   https://github.com/<owner>/<releases-repo>/releases/latest/download
+UPDATE_ENABLED=false
+UPDATE_URL=
+UPDATE_CHANNEL=stable
+UPDATE_ALLOW_UNSIGNED=false
+
+# Prompt behaviour: how many times the user may postpone before it auto-installs,
+# and the minimum hours between re-offers while idle at the connect screen (boot
+# and returning from a session always re-offer).
+UPDATE_MAX_SKIPS=3
+UPDATE_PROMPT_HOURS=4

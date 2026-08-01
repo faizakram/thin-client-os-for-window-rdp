@@ -1,0 +1,23 @@
+# =============================================================================
+#  ThinClient OS — OTA update APPLY (Esparks IT Solutions)
+#  Installed to: /etc/systemd/system/thinclient-update-apply.service
+#
+#  NOT timer-triggered. Started on demand by the connect window (via a scoped
+#  sudo rule) when the user accepts the update prompt, or automatically after
+#  the skip limit is reached. Runs as its own systemd unit so it survives the
+#  `systemctl restart lightdm` it performs (it is not a child of the session).
+#  Re-verifies the signed manifest, applies atomically, health-checks, and
+#  rolls back on failure.
+# =============================================================================
+[Unit]
+Description=Esparks ThinClient update apply
+Documentation=file:/opt/thinclient/docs/UPDATES.md
+
+[Service]
+Type=oneshot
+ExecStart=/opt/thinclient/bin/thinclient-update --apply
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=900
+ProtectHome=yes
+ReadWritePaths=/opt /etc/thinclient /var/lib/thinclient /var/log/thinclient /run/thinclient
