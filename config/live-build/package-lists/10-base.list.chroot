@@ -14,6 +14,13 @@ live-config
 live-config-systemd
 systemd-sysv
 systemd-timesyncd
+# tzdata-legacy provides the DEPRECATED zone aliases (e.g. Asia/Calcutta,
+# Asia/Rangoon) that Debian trixie split out of the default tzdata. The manager's
+# zone picker can hand back a legacy alias; without this the device can't resolve
+# it and the clock silently stays on UTC. Installing it makes every valid zone
+# name — canonical or legacy — apply correctly.
+tzdata
+tzdata-legacy
 dbus
 sudo
 locales
@@ -28,3 +35,7 @@ util-linux
 logrotate
 openssl
 whois
+# lsusb — identify a USB WiFi dongle's chipset (support diagnostics via the console)
+usbutils
+# rfkill — unblock a soft-blocked WiFi radio (some USB dongles come up blocked)
+rfkill

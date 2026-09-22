@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+# =============================================================================
+#  thinclient-netbadge — a small always-on-top badge that shows the device's
+#  internet speed + live latency/loss to the RDP server, floating over BOTH the
+#  connect screen and the full-screen RDP session so the operator always sees
+#  their link quality (and sees it turn red the instant the link starts dropping).
+#
+#  DRAGGABLE: press-and-drag to move it anywhere; the spot is remembered across
+#  reboots (~/.thinclient-netbadge-pos). Defaults to the TOP-LEFT so it does NOT
+#  sit on top of the date/time clock (which is usually top-right) — the operator
+#  can park it right next to the clock without covering it.
+#
+#  Value source: the agent publishes /run/thinclient/net-speed (MBPS/LATENCY_MS/
+#  LOSS_PCT/TS). The SAME value is reported to the manager, so device + dashboard
+#  always agree. Colour thresholds MUST match thinclient-connect + the manager.
+#
+#  Float-over-RDP recipe mirrors thinclient-chat: an override-redirect POPUP the
+#  WM never restacks, kept above via a periodic raise, hidden while locked.
+# =============================================================================
+import os
+import sys
+import time
+import math
+import fcntl
+
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, GLib, Gdk
+
+STATE = "/run/thinclient/net-speed"
+# Published by the agent shortly before an access group's working hours end. Shown
+# here because this badge already floats above the full-screen RDP session — it is
+# the one surface the operator is guaranteed to see without leaving their work.
+ACCESS_WARN = "/run/thinclient/access-warn"
+LOCK_SIGNAL = "/run/thinclient/locked"     # present while the screen-lock GUI is up
+LOCK_FILE = "/run/thinclient/.netbadge.lock"
+POS_FILE = os.path.expanduser("~/.thinclient-netbadge-pos")   # where the user parked it
+STALE_SEC = 120                            # hide if the agent stopped updating
+MARGIN = 16
+
+# Speed thresholds (Mbps) — keep in sync with thinclient-connect NET_GREEN/AMBER
+# and the manager. green >= GREEN, amber >= AMBER, red below.
+GREEN = 50
+AMBER = 30
+GOOD = "#3fb950"
+WARN = "#d29922"
+BAD = "#f85149"
+
+
+def _single_instance():
+    """Exit silently if another badge is already running."""
+    try:
+        f = open(LOCK_FILE, "w")
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return f          # keep the fd alive for the process lifetime
+    except OSError:
+        sys.exit(0)
+
+
+def _read_state():
+    d = {}
+    try:
+        for line in open(STATE):
+            if "=" in line:
+                k, v = line.strip().split("=", 1)
+                d[k] = v
+    except OSError:
+        return None
+    return d
+
+
+def _read_warn():
+    """Minutes until the machine locks for the day, or 0. Ignores a stale file so a
+    crashed agent can't leave a permanent scary countdown on screen."""
+    try:
+        d = {}
+        for line in open(ACCESS_WARN):
+            if "=" in line:
+                k, v = line.strip().split("=", 1)
+                d[k] = v
+        n = int(d.get("MINUTES", "0"))
+        ts = int(d.get("TS", "0"))
+    except (OSError, ValueError):
+        return 0
+    if n <= 0 or time.time() - ts > 180:
+        return 0
+    return n
+
+
+def _read_pos():
+    try:
+        x, y = open(POS_FILE).read().split()
+        return int(x), int(y)
+    except Exception:
+        return None
+
+
+def _save_pos(x, y):
+    try:
+        with open(POS_FILE, "w") as f:
+            f.write("%d %d" % (x, y))
+    except OSError:
+        pass
+
+
+class Badge(Gtk.Window):
+    def __init__(self):
+        # POPUP = override-redirect: floats above the FreeRDP /f exclusive-fullscreen
+        # session (a normal TOPLEVEL would map behind it). Never takes focus.
+        super().__init__(type=Gtk.WindowType.POPUP)
+        self.set_decorated(False)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_keep_above(True)
+        self.set_resizable(False)
+        self.set_focus_on_map(False)
+        try:
+            self.stick()
+        except Exception:
+            pass
+
+        self._drag = None          # (start_root_x, start_root_y, win_x, win_y)
+        self._dragging = False
+        self._pos = None           # cached target (x, y)
+
+        # A VISIBLE EventBox carries the rounded background AND the pointer events
+        # (a no-window EventBox swallows clicks) — press/drag to move the badge.
+        eb = Gtk.EventBox()
+        eb.get_style_context().add_class("netbadge")
+        eb.add_events(Gdk.EventMask.BUTTON_PRESS_MASK
+                      | Gdk.EventMask.BUTTON_RELEASE_MASK
+                      | Gdk.EventMask.POINTER_MOTION_MASK)
+        eb.connect("button-press-event", self._on_press)
+        eb.connect("motion-notify-event", self._on_motion)
+        eb.connect("button-release-event", self._on_release)
+        self.lbl = Gtk.Label()
+        self.lbl.set_use_markup(True)
+        self.lbl.set_margin_start(10)
+        self.lbl.set_margin_end(10)
+        self.lbl.set_margin_top(3)
+        self.lbl.set_margin_bottom(3)
+        eb.add(self.lbl)
+        self.add(eb)
+
+        css = Gtk.CssProvider()
+        css.load_from_data(
+            b".netbadge{background-color:rgba(13,17,23,0.82);"
+            b"border-radius:9px;border:1px solid rgba(255,255,255,0.10);}")
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), css,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        self._visible = False
+        self._tick()
+        GLib.timeout_add_seconds(4, self._tick)
+
+    # -- geometry ----------------------------------------------------------- #
+    def _mon(self):
+        scr = self.get_screen()
+        try:
+            geo = scr.get_monitor_geometry(scr.get_primary_monitor())
+            return geo.x, geo.y, geo.width, geo.height
+        except Exception:
+            return 0, 0, scr.get_width(), scr.get_height()
+
+    def _clamp(self, x, y):
+        try:
+            mx, my, mw, mh = self._mon()
+            w, h = self.get_size()
+            x = max(mx, min(x, mx + mw - w))
+            y = max(my, min(y, my + mh - h))
+        except Exception:
+            pass
+        return (x, y)
+
+    def _target_pos(self):
+        if self._pos is None:
+            p = _read_pos()
+            if p:
+                self._pos = self._clamp(p[0], p[1])
+            else:
+                mx, my, _mw, _mh = self._mon()
+                self._pos = (mx + MARGIN, my + MARGIN)   # default TOP-LEFT (clear of the clock)
+        return self._pos
+
+    # -- drag --------------------------------------------------------------- #
+    def _on_press(self, _w, ev):
+        if ev.button != 1:
+            return False
+        wx, wy = self.get_position()
+        self._drag = (ev.x_root, ev.y_root, wx, wy)
+        self._dragging = False
+        return True
+
+    def _on_motion(self, _w, ev):
+        if not self._drag:
+            return False
+        dx = ev.x_root - self._drag[0]
+        dy = ev.y_root - self._drag[1]
+        if not self._dragging and math.hypot(dx, dy) < 6:
+            return False   # below threshold — not a drag yet
+        self._dragging = True
+        nx, ny = self._clamp(int(self._drag[2] + dx), int(self._drag[3] + dy))
+        self.move(nx, ny)
+        return True
+
+    def _on_release(self, _w, ev):
+        if ev.button != 1 or self._drag is None:
+            return False
+        was_drag = self._dragging
+        self._drag = None
+        self._dragging = False
+        if was_drag:
+            x, y = self.get_position()
+            self._pos = self._clamp(x, y)
+            _save_pos(*self._pos)
+        return True
+
+    # -- refresh ------------------------------------------------------------ #
+    def _hide(self):
+        if self._visible:
+            self.hide()
+            self._visible = False
+
+    def _tick(self):
+        if os.path.exists(LOCK_SIGNAL):
+            self._hide()
+            return True
+        # The closing-time warning outranks the speed readout: it stays on screen even
+        # when speed data is missing or stale, which is exactly when a device having a
+        # bad time would otherwise hide the one message the operator must not miss.
+        warn = _read_warn()
+        d = _read_state()
+        fresh = False
+        mbps = lat = loss = 0
+        if d:
+            try:
+                mbps = int(d.get("MBPS", "0"))
+                lat = int(d.get("LATENCY_MS", "-1"))
+                loss = int(d.get("LOSS_PCT", "-1"))
+                ts = int(d.get("TS", "0"))
+                fresh = (time.time() - ts) <= STALE_SEC
+            except ValueError:
+                fresh = False
+        if not fresh and not warn:
+            self._hide()
+            return True
+        if not fresh:
+            # Warning only — no trustworthy speed to show alongside it.
+            self.lbl.set_markup(
+                '<span foreground="%s" weight="bold" size="small">⚠ Locks in %d min</span>'
+                % (BAD, warn))
+            self.show_all()
+            self._visible = True
+            if not self._dragging:
+                self.move(*self._target_pos())
+            gw = self.get_window()
+            if gw is not None:
+                gw.raise_()
+            return True
+
+        color = GOOD if mbps >= GREEN else (WARN if mbps >= AMBER else BAD)
+        txt = "%d Mbps" % mbps
+        if loss and loss > 0:
+            txt += " · %d%% loss" % loss
+            color = BAD
+        elif lat >= 0:
+            txt += " · %d ms" % lat
+            if lat > 300:
+                color = BAD
+            elif lat > 150 and mbps >= AMBER:
+                color = WARN
+        if warn:
+            # Prefix, so it reads first and in the alarm colour regardless of link state.
+            self.lbl.set_markup(
+                '<span foreground="%s" weight="bold" size="small">⚠ Locks in %d min</span>'
+                '<span foreground="%s" weight="bold" size="small">  ·  ● %s</span>'
+                % (BAD, warn, color, txt))
+        else:
+            self.lbl.set_markup(
+                '<span foreground="%s" weight="bold" size="small">● %s</span>'
+                % (color, txt))
+
+        self.show_all()
+        self._visible = True
+        if not self._dragging:
+            self.move(*self._target_pos())
+        gw = self.get_window()
+        if gw is not None:
+            gw.raise_()
+        return True
+
+
+def main():
+    _lock = _single_instance()       # noqa: F841 (held for process lifetime)
+    Badge()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

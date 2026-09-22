@@ -49,12 +49,37 @@
     <popupShow>Never</popupShow>
   </resize>
 
-  <!-- Keyboard: ONLY the hidden admin hotkey exists. -->
+  <!-- Keyboard: the hidden admin hotkey + the user screen-lock (Super+L). -->
   <keyboard>
     <chainQuitKey>C-g</chainQuitKey>
     <keybind key="@@ADMIN_HOTKEY@@">
       <action name="Execute">
         <command>/opt/thinclient/bin/thinclient-adminmode</command>
+      </action>
+    </keybind>
+    <!-- Win+L locks the screen (a password unlocks it). -->
+    <keybind key="W-l">
+      <action name="Execute">
+        <command>/opt/thinclient/bin/thinclient-lock</command>
+      </action>
+    </keybind>
+    <!-- Ctrl+Alt+Shift+R = recover a FROZEN RDP session. FreeRDP occasionally
+         hangs on its H.264/GFX pipeline (spins, stops painting) but stays alive,
+         so the watchdog can't tell it's stuck. openbox still gets this key
+         (FreeRDP runs with -grab-keyboard OFF), so the operator can kill the hung
+         client themselves and drop back to the home screen to reconnect — no
+         power-cycle, no waiting for an admin. -->
+    <keybind key="C-A-S-r">
+      <action name="Execute">
+        <command>sh -c 'pkill -x xfreerdp3; pkill -x xfreerdp'</command>
+      </action>
+    </keybind>
+    <!-- Ctrl+Alt+Shift+C opens the support chat with the admin — works over the
+         RDP session (keyboard isn't grabbed) so the operator can ask for help
+         mid-call without leaving Windows. -->
+    <keybind key="C-A-S-c">
+      <action name="Execute">
+        <command>/opt/thinclient/bin/thinclient-chat --open</command>
       </action>
     </keybind>
   </keyboard>
@@ -75,16 +100,24 @@
     </context>
   </mouse>
 
-  <!-- Force every mapped window to fullscreen, undecorated, focused. -->
+  <!-- Borderless everything, but do NOT force-fullscreen every window. The
+       kiosk's MAIN windows request their OWN fullscreen — the connect form and
+       the lock via GTK fullscreen(), the RDP session via FreeRDP /f — and Openbox
+       honors that. Force-fullscreening EVERY window (the old behavior) blew up
+       small dialogs + yad popups (the "REC" badge, the Wi-Fi picker, the
+       "Installing update" notice) into full grey screens ("N grey areas").
+       Openbox centers new windows (placement center:yes), so dialogs now appear
+       centered at their natural size. -->
   <applications>
     <application class="*">
       <decor>no</decor>
       <focus>yes</focus>
-      <fullscreen>yes</fullscreen>
-      <maximized>true</maximized>
-      <layer>normal</layer>
       <iconic>no</iconic>
     </application>
   </applications>
+  <!-- Do NOT pin a layer on the wildcard above: forcing layer=normal overrode the
+       recording badge's own always-on-top hint, burying the "REC" indicator behind
+       the fullscreen RDP window. Without a forced layer, a window that requests
+       _NET_WM_STATE_ABOVE (the badge) stays above. -->
 
 </openbox_config>

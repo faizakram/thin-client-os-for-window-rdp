@@ -8,7 +8,7 @@
 #  /etc/thinclient/license.conf. Enforcement is off unless LICENSE_ENFORCE=true.
 # =============================================================================
 [Unit]
-Description=Esparks ThinClient management agent (licence + fleet ops)
+Description=Thin Client management agent (licence + fleet ops)
 After=network-online.target NetworkManager-wait-online.service
 Wants=network-online.target
 

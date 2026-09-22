@@ -26,6 +26,10 @@ LOG="/var/log/thinclient/install.log"
 
 log() { printf '%s [install] %s\n' "$(date --iso-8601=seconds 2>/dev/null || date)" "$*" | tee -a "$LOG"; }
 die() { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
+# Success / warning counterparts to log(). These MUST exist here: the script runs
+# under `set -e`, so calling an undefined helper is exit 127 and kills the install.
+ok()   { printf '\033[1;32m[OK]\033[0m %s\n' "$*" | tee -a "$LOG"; }
+warn() { printf '\033[1;33m[!]\033[0m %s\n'  "$*" | tee -a "$LOG" >&2; }
 
 [[ "$(id -u)" -eq 0 ]] || die "Run as root: sudo thinclient-install"
 mkdir -p "$(dirname "$LOG")"
@@ -55,9 +59,139 @@ echo
 read -r -p "Type the disk name (${DISK}) to confirm: " CONFIRM
 [[ "$CONFIRM" == "$DISK" ]] || die "Confirmation did not match. Aborting."
 
+# Device name shown in the Manager dashboard (optional; agent falls back to the
+# hostname if left blank). Collected now, written to the target after the copy.
+echo
+# Require a device name so the machine shows up in the dashboard by a real name
+# instead of the default hostname. Loop until something non-empty is entered, and
+# echo it back so the installer can SEE it was captured.
+DEVNAME=""
+while [[ -z "$DEVNAME" ]]; do
+  read -r -p "Device name for the dashboard (e.g. Reception-PC): " DEVNAME || true
+  DEVNAME="$(printf '%s' "${DEVNAME:-}" | tr -d '\r' | sed 's/^ *//; s/ *$//')"
+  [[ -z "$DEVNAME" ]] && echo "  A device name is required — please type one."
+done
+echo "  ✓ Device name set to: ${DEVNAME}"
+
 # Partition suffix: /dev/sda -> sda1 ; /dev/nvme0n1 -> nvme0n1p1
 part() { case "$DISK" in *[0-9]) echo "${DISK}p${1}";; *) echo "${DISK}${1}";; esac; }
 EFI_PART="$(part 1)"; ROOT_PART="$(part 2)"
+
+# --------------------------------------------------------------------------- #
+# 1b. Identity + approval — deliberately BEFORE anything is erased.
+#
+#     Approval has to be settled while the target disk is still intact. Asking
+#     afterwards (as this used to) meant a refusal arrived when the disk had
+#     already been wiped and written — destroying the machine's previous contents
+#     for an install that was never allowed to finish.
+#
+#     The identity is generated here too, because hwid = sha256(machine-id) and the
+#     approval is bound to it. It's just random bytes, so it needs no disk.
+# --------------------------------------------------------------------------- #
+# Generated with NO external binaries where possible. The kernel's uuid file plus
+# bash string substitution needs nothing read off the install medium — a failing or
+# badly-written USB stick was throwing "od: Input/output error" here, which stopped
+# the install before it began. Fallbacks cover an unusual kernel.
+NEW_MACHINE_ID=""
+if [[ -r /proc/sys/kernel/random/uuid ]]; then
+  read -r _uuid < /proc/sys/kernel/random/uuid
+  NEW_MACHINE_ID="${_uuid//-/}"
+fi
+if [[ "${#NEW_MACHINE_ID}" -ne 32 ]]; then
+  NEW_MACHINE_ID="$(systemd-id128 new 2>/dev/null | tr -d '\n' || true)"
+fi
+if [[ "${#NEW_MACHINE_ID}" -ne 32 ]]; then
+  echo
+  echo "  Could not generate a machine identity."
+  echo
+  echo "  This usually means the USB stick cannot be read reliably. Re-write the"
+  echo "  image (balenaEtcher verifies what it wrote), ideally onto a different stick."
+  echo
+  exit 1
+fi
+# Must match thinclient-agent's device_id(): sha256(machine-id)[:32]
+DEVICE_HWID="$(printf '%s' "$NEW_MACHINE_ID" | sha256sum | cut -c1-32)"
+
+# The live system carries the tenant's baked config; the target doesn't exist yet.
+LIVE_CONF="/etc/thinclient/license.conf"
+CTRL_URL="$(sed -n 's/^CONTROL_URL=//p'  "$LIVE_CONF" 2>/dev/null | head -1 | tr -d '\r')"
+TEN_TOKEN="$(sed -n 's/^TENANT_TOKEN=//p' "$LIVE_CONF" 2>/dev/null | head -1 | tr -d '\r')"
+ENROLL_CREDS=""
+
+if [[ -n "$CTRL_URL" && -n "$TEN_TOKEN" ]]; then
+  ENROLL_BIN="/opt/thinclient/bin/thinclient-enroll"
+  [[ -x "$ENROLL_BIN" ]] || ENROLL_BIN="$(dirname "$0")/../scripts/thinclient-enroll"
+  if [[ -x "$ENROLL_BIN" ]]; then
+    # Wait for the manager to be genuinely reachable before asking for approval.
+    # A freshly-booted live session often has an interface up but no working path
+    # out yet (DHCP, DNS, a slow switch port), and failing at that moment reads to
+    # the operator as "the installer is broken" rather than "the network isn't ready".
+    # Shell expansion, not sed: `\?` in a BRE is a GNU extension, so a sed-based
+    # parse silently yields "https" on any non-GNU sed. Strip scheme, then path,
+    # then port.
+    MGR_HOST="${CTRL_URL#*://}"; MGR_HOST="${MGR_HOST%%/*}"; MGR_HOST="${MGR_HOST%%:*}"
+    log "Waiting for the manager (${MGR_HOST}) to be reachable"
+    NET_OK=0
+    for _i in $(seq 1 12); do            # up to ~90s
+      if curl -s -o /dev/null --max-time 8 "${CTRL_URL}/login" 2>/dev/null; then NET_OK=1; break; fi
+      sleep 6
+    done
+    if [[ "$NET_OK" -eq 0 ]]; then
+      echo
+      echo "  Cannot reach ${MGR_HOST} from this machine."
+      echo
+      echo "  Network check:"
+      ip -4 -o addr show scope global 2>/dev/null | awk '{printf "    address : %s on %s\n", $4, $2}' || true
+      ip route show default 2>/dev/null | awk '{printf "    gateway : %s via %s\n", $3, $5}' || true
+      if getent hosts "$MGR_HOST" >/dev/null 2>&1; then
+        echo "    dns     : OK ($(getent hosts "$MGR_HOST" | awk '{print $1}' | head -1))"
+      else
+        echo "    dns     : FAILED to resolve ${MGR_HOST}  <- check DNS / captive portal"
+      fi
+      if timeout 8 bash -c "exec 3<>/dev/tcp/${MGR_HOST}/443" 2>/dev/null; then
+        echo "    port 443: reachable, but no HTTPS reply  <- a firewall or proxy is filtering it"
+      else
+        echo "    port 443: BLOCKED or unreachable  <- check the cable, VLAN or firewall"
+      fi
+      echo
+      echo "  Approval needs the manager, so nothing has been changed — ${DISK} is untouched."
+      echo "  Fix the network and run 'sudo thinclient-install' again."
+      echo
+      exit 1
+    fi
+    ok "Manager reachable"
+    log "Checking whether this machine needs approval before installing"
+    ENROLL_CREDS="$(mktemp)"
+    set +e
+    # Token via the ENVIRONMENT, never argv: /proc/<pid>/cmdline is world-readable.
+    TC_TENANT_TOKEN="$TEN_TOKEN" \
+    "$ENROLL_BIN" --url "$CTRL_URL" --hwid "$DEVICE_HWID" \
+                  --name "${DEVNAME:-}" --hostname "$(hostname 2>/dev/null || true)" \
+                  --disk "$DISK" --out "$ENROLL_CREDS"
+    ENROLL_RC=$?
+    set -e
+    case "$ENROLL_RC" in
+      0) log "Machine approved — continuing with the installation" ;;
+      3) log "This account does not require approval — the device will register itself on first boot"
+         rm -f "$ENROLL_CREDS"; ENROLL_CREDS="" ;;
+      *)
+         rm -f "$ENROLL_CREDS"
+         echo
+         echo "  Installation cancelled: this machine was not approved."
+         echo
+         echo "  NOTHING has been changed — ${DISK} has not been touched and still"
+         echo "  holds whatever was on it before. Ask your administrator to approve"
+         echo "  this machine, then run 'sudo thinclient-install' again."
+         echo
+         exit 1
+         ;;
+    esac
+  else
+    log "WARNING: thinclient-enroll not found — skipping the approval step"
+  fi
+else
+  log "No tenant token in this image — the device will not join a fleet automatically"
+fi
 
 # --------------------------------------------------------------------------- #
 # 2. Partition + format.
@@ -92,6 +226,69 @@ rsync -aHAXx --info=progress2 \
   / "$TARGET_MNT/"
 
 # --------------------------------------------------------------------------- #
+# 3b. Per-machine identity. Installing the same USB onto several machines must
+#     NOT give them all the live medium's machine-id (identical hwid -> the
+#     manager folds them into ONE device), so each install gets its own.
+#
+#     We GENERATE it here rather than blanking the file and letting first boot do
+#     it, because the approval flow below has to bind to this machine's final
+#     hwid — and that hwid is sha256(machine-id). Deferring it would mean
+#     approving an identity that doesn't exist yet.
+#
+#     thinclient-firstboot still regenerates the id if the hardware fingerprint
+#     later changes (a cloned disk), which correctly forces re-approval.
+# --------------------------------------------------------------------------- #
+# NEW_MACHINE_ID / DEVICE_HWID were generated in §1b, before the disk was touched,
+# because the approval is bound to this hwid. Here we only persist it.
+log "Assigning the unique per-device identity"
+printf '%s\n' "$NEW_MACHINE_ID" >"$TARGET_MNT/etc/machine-id"
+rm -f "$TARGET_MNT/var/lib/dbus/machine-id" \
+      "$TARGET_MNT/var/lib/thinclient/.hwfp" 2>/dev/null || true
+ln -sf /etc/machine-id "$TARGET_MNT/var/lib/dbus/machine-id" 2>/dev/null || true
+
+# --------------------------------------------------------------------------- #
+# 3c. Persist the approved credentials NOW, not at the end.
+#
+#     Learned the hard way: the credential write used to sit after the chroot /
+#     GRUB stage, and when anything there aborted the script the machine was left
+#     bootable but unactivated — no device name, no credentials — which looks like
+#     a successful install and then shows up as a permanently offline device.
+#     The target is mounted and its /etc/thinclient exists as soon as the copy is
+#     done, so there is no reason to wait.
+# --------------------------------------------------------------------------- #
+TCONF="$TARGET_MNT/etc/thinclient/license.conf"
+tc_set_key() {  # <key> <value> — replace or append in the target's license.conf
+  local k="$1" v="$2"
+  [[ -n "$v" ]] || return 0
+  mkdir -p "$(dirname "$TCONF")"; touch "$TCONF"
+  if grep -q "^${k}=" "$TCONF"; then sed -i "s#^${k}=.*#${k}=${v}#" "$TCONF"; else printf '%s=%s\n' "$k" "$v" >>"$TCONF"; fi
+}
+
+if [[ -n "${ENROLL_CREDS:-}" && -s "${ENROLL_CREDS}" ]]; then
+  log "Writing this device's fleet credentials"
+  tc_set_key ENROLL_CODE   "$(sed -n 's/^ENROLL_CODE=//p'   "$ENROLL_CREDS" | head -1 | tr -d '\r')"
+  tc_set_key DEVICE_SECRET "$(sed -n 's/^DEVICE_SECRET=//p' "$ENROLL_CREDS" | head -1 | tr -d '\r')"
+  tc_set_key LICENSE_ENFORCE "true"
+  shred -u "$ENROLL_CREDS" 2>/dev/null || rm -f "$ENROLL_CREDS"
+  ENROLL_CREDS=""
+  ok "Credentials stored — this device is activated"
+fi
+
+# Device name too: it is what identifies the machine in the dashboard, and it was
+# being lost for exactly the same reason.
+if [[ -n "${DEVNAME:-}" ]]; then
+  log "Setting device name: ${DEVNAME}"
+  tc_set_key DEVICE_NAME "$DEVNAME"
+  HN="$(printf '%s' "$DEVNAME" | tr ' ' '-' | tr -cd 'A-Za-z0-9-' | sed 's/^-*//; s/-*$//' | cut -c1-63)"
+  if [[ -n "$HN" ]]; then
+    echo "$HN" >"$TARGET_MNT/etc/hostname"
+    if [[ -f "$TARGET_MNT/etc/hosts" ]] && grep -q '^127\.0\.1\.1' "$TARGET_MNT/etc/hosts"; then
+      sed -i "s#^127\.0\.1\.1.*#127.0.1.1\t${HN}#" "$TARGET_MNT/etc/hosts"
+    fi
+  fi
+fi
+
+# --------------------------------------------------------------------------- #
 # 4. fstab.
 # --------------------------------------------------------------------------- #
 log "Writing /etc/fstab"
@@ -101,22 +298,33 @@ cat >"$TARGET_MNT/etc/fstab" <<EOF
 # ThinClient OS — generated by thinclient-install
 UUID=${ROOT_UUID}  /          ext4  errors=remount-ro,noatime  0 1
 UUID=${EFI_UUID}   /boot/efi  vfat  umask=0077                 0 1
-tmpfs              /tmp       tmpfs defaults,nosuid,nodev       0 0
+# /tmp is tmpfs (RAM): recording segments are staged here for the seconds between
+# ffmpeg writing them and S3 confirming the upload, then deleted. Pin the size —
+# tmpfs otherwise defaults to HALF of physical memory, which on a small machine is
+# room enough to starve the session. 512M is ~4600 segments, far above the agent's
+# own backlog cap, so this bounds the worst case without ever being the binding limit.
+tmpfs              /tmp       tmpfs defaults,nosuid,nodev,size=512m  0 0
 EOF
 
 # --------------------------------------------------------------------------- #
 # 5. Chroot: drop live packages, install GRUB, rebuild initramfs.
 # --------------------------------------------------------------------------- #
 log "Preparing chroot"
+# --rbind (recursive) so nested mounts come along — in particular
+# /sys/firmware/efi/efivars, without which grub-install/efibootmgr cannot
+# register the UEFI NVRAM boot entry ("EFI variables cannot be set on this
+# system"). Cleanup below uses `umount -R`, which handles the nested mounts.
 for fs in dev dev/pts proc sys run; do
   mkdir -p "$TARGET_MNT/$fs"
-  mount --bind "/$fs" "$TARGET_MNT/$fs"
+  mount --rbind "/$fs" "$TARGET_MNT/$fs"
 done
 
 UEFI_MODE=0; [[ -d /sys/firmware/efi ]] && UEFI_MODE=1
 
 log "Installing bootloader inside chroot (UEFI_MODE=${UEFI_MODE})"
-chroot "$TARGET_MNT" /bin/bash -euo pipefail <<CHROOT
+CHROOT_LOG="$(mktemp)"
+set +e
+chroot "$TARGET_MNT" /bin/bash -uo pipefail 2>&1 <<CHROOT | tee "$CHROOT_LOG"
 export DEBIAN_FRONTEND=noninteractive
 
 # Remove live-only components so it boots as a normal installed system.
@@ -124,30 +332,152 @@ apt-get -y purge live-boot live-boot-initramfs-tools live-config live-config-sys
 apt-get -y autoremove 2>/dev/null || true
 
 # GRUB defaults: silent, kiosk-friendly kernel command line.
-sed -i 's|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT="quiet splash loglevel=0 vt.global_cursor_default=0 rd.systemd.show_status=false systemd.show_status=false"|' /etc/default/grub || true
+# Live images don't ship /etc/default/grub — create it so the tweaks below apply
+# (otherwise sed/grep error out and the boot stays verbose).
+if [ ! -f /etc/default/grub ]; then
+  cat >/etc/default/grub <<'GRUBDEF'
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=1
+GRUB_DISTRIBUTOR="ThinClient"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"
+GRUB_CMDLINE_LINUX=""
+GRUBDEF
+fi
+# usbcore.autosuspend=-1: never power-manage USB on this appliance. A suspended
+# webcam that fails to resume drops off the bus (-71/EPROTO) and the recording
+# silently loses its camera track until somebody replugs it; the machine is
+# mains-powered at a desk, so there is nothing to save. This is the ONE part of the
+# camera fix that cannot ship over the air — it needs update-grub and a reboot — so
+# the agent also sets the same default at runtime for the existing fleet.
+sed -i 's|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT="quiet splash loglevel=0 vt.global_cursor_default=0 rd.systemd.show_status=false systemd.show_status=false usbcore.autosuspend=-1"|' /etc/default/grub || true
 sed -i 's|^GRUB_TIMEOUT=.*|GRUB_TIMEOUT=1|' /etc/default/grub || true
 grep -q '^GRUB_TIMEOUT_STYLE' /etc/default/grub || echo 'GRUB_TIMEOUT_STYLE=hidden' >> /etc/default/grub
+# os-prober scans EVERY disk it can see - including the installer's own USB - and is a
+# well-known way for update-grub to fail or hang. An appliance boots one OS, so there
+# is nothing for it to find and no reason to run it.
+grep -q '^GRUB_DISABLE_OS_PROBER' /etc/default/grub || echo 'GRUB_DISABLE_OS_PROBER=true' >> /etc/default/grub
 
-# UEFI bootloader.
+# UEFI bootloader. Two installs:
+#   1. Named entry — registers an NVRAM boot option WHEN efivars are writable.
+#   2. --removable — writes the firmware fallback path /EFI/BOOT/BOOTX64.EFI so
+#      the machine boots even when the installer chroot can't set NVRAM (the
+#      common "EFI variables cannot be set on this system" case). This is what
+#      makes an appliance install boot reliably on any UEFI board.
 if [ "${UEFI_MODE}" = "1" ]; then
-  grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=thinclient --recheck
+  grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=thinclient --recheck || true
+  grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable --recheck || true
 fi
-# BIOS bootloader (also install for hybrid / fallback machines).
+# BIOS bootloader (best-effort; this GPT layout has no bios_grub partition, so on
+# UEFI machines it simply no-ops — expected, not an error).
 grub-install --target=i386-pc --recheck ${DISK} || true
 
-update-grub
-update-initramfs -u -k all
+# These were UNGUARDED, and that was the real fault behind three separate
+# failures: the chroot runs with -e, so one non-zero exit here aborted the whole
+# installer - skipping the activation steps AND, worse, leaving no grub.cfg, which
+# is a disk that cannot boot. Now each has a fallback and cannot kill the run;
+# the outer script verifies the RESULT instead of trusting the exit code.
+update-grub || grub-mkconfig -o /boot/grub/grub.cfg || echo "WARN: grub config generation failed"
+update-initramfs -u -k all || update-initramfs -u || echo "WARN: initramfs rebuild failed"
 
-# Make sure our services are enabled on the installed system.
-systemctl set-default graphical.target
-systemctl enable thinclient-firstboot.service thinclient-x.service thinclient-watchdog.service || true
+# Make sure the CURRENT services are enabled on the installed system.
+# (The display path is LightDM now — the old thinclient-x.service must stay off,
+# or it fights LightDM for the screen.)
+systemctl set-default graphical.target || echo "WARN: could not set the default target"
+systemctl disable thinclient-x.service thinclient-session.service 2>/dev/null || true
+systemctl enable lightdm.service thinclient-firstboot.service thinclient-watchdog.service \
+                 thinclient-agent.service thinclient-provision.service \
+                 NetworkManager.service NetworkManager-wait-online.service 2>/dev/null || true
+systemctl enable thinclient-update.timer 2>/dev/null || true
 CHROOT
+CHROOT_RC=${PIPESTATUS[0]}
+set -e
+if [[ "$CHROOT_RC" -ne 0 ]]; then
+  warn "The bootloader stage reported errors (exit ${CHROOT_RC}). Checking what landed…"
+  grep -iE "^WARN|error|failed" "$CHROOT_LOG" | tail -8 | sed 's/^/    /' || true
+fi
+
+# --------------------------------------------------------------------------- #
+# 5a. Is this disk actually bootable?
+#
+#     An install that finishes without a grub.cfg produces a machine that will
+#     not boot once the USB is removed. That must be a hard, obvious failure —
+#     never something the operator discovers by unplugging the stick.
+# --------------------------------------------------------------------------- #
+BOOT_OK=1
+[[ -s "$TARGET_MNT/boot/grub/grub.cfg" ]] || { BOOT_OK=0; warn "MISSING /boot/grub/grub.cfg"; }
+if [[ "$UEFI_MODE" = "1" ]]; then
+  ls "$TARGET_MNT"/boot/efi/EFI/*/*.efi >/dev/null 2>&1 \
+    || { BOOT_OK=0; warn "MISSING UEFI bootloader under /boot/efi/EFI"; }
+fi
+# Keep the log ON the installed system so a failure can be diagnosed after reboot.
+mkdir -p "$TARGET_MNT/var/log/thinclient" 2>/dev/null || true
+cp -f "$CHROOT_LOG" "$TARGET_MNT/var/log/thinclient/install-chroot.log" 2>/dev/null || true
+rm -f "$CHROOT_LOG"
+
+if [[ "$BOOT_OK" -eq 0 ]]; then
+  echo
+  echo "  INSTALLATION FAILED — this disk would NOT boot."
+  echo
+  echo "  The system was copied, but the bootloader did not install, so the machine"
+  echo "  would only start while the USB stick is plugged in."
+  echo
+  echo "  The bootloader log is at /var/log/thinclient/install-chroot.log on the"
+  echo "  target disk. Please send that, or re-run 'sudo thinclient-install'."
+  echo
+  exit 1
+fi
+ok "Bootloader verified — this disk will boot on its own"
+
+# --------------------------------------------------------------------------- #
+# 5b. Auto-enrol: if an activation file is on the boot USB (or any mounted USB),
+#     bake it into the installed licence config so the machine self-registers on
+#     first boot — no manual step per device.
+# --------------------------------------------------------------------------- #
+ACT="$(find /run/live/medium /media /run/media /mnt -maxdepth 4 -name thinclient-activate.conf -type f 2>/dev/null | head -1)"
+if [[ -n "$ACT" ]]; then
+  log "Baking activation config from ${ACT}"
+  TCONF="$TARGET_MNT/etc/thinclient/license.conf"
+  touch "$TCONF"
+  for k in CONTROL_URL TENANT_TOKEN ENROLL_CODE DEVICE_SECRET LICENSE_ENFORCE; do
+    v="$(sed -n "s/^${k}=//p" "$ACT" | head -1 | tr -d '\r')"
+    [[ -n "$v" ]] || continue
+    if grep -q "^${k}=" "$TCONF"; then sed -i "s#^${k}=.*#${k}=${v}#" "$TCONF"; else echo "${k}=${v}" >>"$TCONF"; fi
+  done
+fi
+
+# --------------------------------------------------------------------------- #
+# 5c. (Device name is now set at §3c, before the chroot, so it survives a failure
+#      in the later stages. Nothing to do here.)
+# --------------------------------------------------------------------------- #
+
+# --------------------------------------------------------------------------- #
+# 5d. Verify activation actually landed — loudly.
+#
+#     An installed-but-unactivated machine is the worst outcome: it boots, it
+#     looks fine, and it never appears in the manager. That failure used to be
+#     silent. Now the installer says so, in terms the operator can act on.
+# --------------------------------------------------------------------------- #
+TCONF="$TARGET_MNT/etc/thinclient/license.conf"
+HAVE_CODE="$(sed -n 's/^ENROLL_CODE=//p'   "$TCONF" 2>/dev/null | head -1 | tr -d '\r')"
+HAVE_SEC="$(sed -n 's/^DEVICE_SECRET=//p' "$TCONF" 2>/dev/null | head -1 | tr -d '\r')"
+HAVE_TOK="$(sed -n 's/^TENANT_TOKEN=//p'  "$TCONF" 2>/dev/null | head -1 | tr -d '\r')"
+
+if [[ -n "$HAVE_CODE" && -n "$HAVE_SEC" ]]; then
+  ok "Activation verified — this device will appear in the manager on first boot"
+elif [[ -n "$HAVE_TOK" ]]; then
+  warn "This machine is INSTALLED but NOT ACTIVATED."
+  warn "It will boot and work, but it will show as offline in the manager because it"
+  warn "has no device credentials. Ask your administrator to approve it and run"
+  warn "'sudo thinclient-install' again, or activate it from a USB stick."
+else
+  warn "No fleet configuration in this image — the device will not join a fleet."
+fi
 
 # --------------------------------------------------------------------------- #
 # 6. Cleanup.
 # --------------------------------------------------------------------------- #
 log "Unmounting"
-for fs in run sys proc dev/pts dev; do umount -l "$TARGET_MNT/$fs" 2>/dev/null || true; done
+for fs in run sys proc dev/pts dev; do umount -R -l "$TARGET_MNT/$fs" 2>/dev/null || true; done
 umount -R "$TARGET_MNT" 2>/dev/null || true
 
 log "Installation complete on ${DISK}."

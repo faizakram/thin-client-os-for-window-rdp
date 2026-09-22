@@ -32,7 +32,8 @@ VERSION="${TC_VERSION:-1.0.0}"
 BOOTAPPEND="boot=live components \
 live-config.username=thinclient live-config.hostname=esparksit live-config.noautologin \
 quiet splash loglevel=0 vt.global_cursor_default=0 \
-rd.systemd.show_status=false systemd.show_status=false udev.log_level=0"
+rd.systemd.show_status=false systemd.show_status=false udev.log_level=0 \
+usbcore.autosuspend=-1"
 # NOTE: hardware KMS (native graphics) is the default so the display runs at the
 # panel's true resolution. The AMD box that black-screened before now has its
 # GPU firmware (firmware-amd-graphics) in the image, so amdgpu KMS initialises
@@ -134,10 +135,10 @@ configure() {
     --backports false \
     --mirror-bootstrap "$MIRROR" \
     --mirror-binary "$MIRROR" \
-    --iso-application "Esparks IT Solutions Thin Client" \
-    --iso-publisher "Esparks IT Solutions Private Limited" \
+    --iso-application "Thin Client" \
+    --iso-publisher "Thin Client" \
     --iso-preparer "build.sh (live-build)" \
-    --iso-volume "ESPARKSIT ${VERSION}"
+    --iso-volume "THINCLIENT ${VERSION}"
 
   ok "live-build configured"
 }
@@ -184,7 +185,10 @@ populate() {
               thinclient-test-connection thinclient-admin thinclient-adminmode \
               thinclient-netctl thinclient-diagnostics thinclient-firstboot \
               thinclient-wifi thinclient-netwait thinclient-connect \
-              thinclient-update thinclient-agent"
+              thinclient-lock thinclient-audio-default thinclient-chat \
+              thinclient-netbadge \
+              thinclient-update thinclient-agent thinclient-provision \
+              thinclient-enroll"
   local b
   for b in $bins; do
     stage "scripts/${b}" "/opt/thinclient/bin/${b}" 0755
@@ -216,12 +220,46 @@ populate() {
     stage "config/license-pubkey.pem" "/etc/thinclient/license-pubkey.pem"             0644
   fi
 
+  # --- Bake fleet auto-enrolment into the shipped license.conf (optional) ------
+  # When TC_TENANT_TOKEN (and/or TC_CONTROL_URL / TC_LICENSE_ENFORCE) is set at
+  # build time, write it into the staged license.conf so EVERY machine installed
+  # from this ISO self-registers into that tenant on first boot — no activation
+  # USB, no manual step. Injected here at build time; NEVER committed to git.
+  local LCONF="${BUILD_DIR}/config/includes.chroot/etc/thinclient/license.conf"
+  local kv k v
+  for kv in "CONTROL_URL=${TC_CONTROL_URL:-}" "TENANT_TOKEN=${TC_TENANT_TOKEN:-}" "LICENSE_ENFORCE=${TC_LICENSE_ENFORCE:-}"; do
+    k="${kv%%=*}"; v="${kv#*=}"
+    [[ -n "$v" ]] || continue
+    if grep -q "^${k}=" "$LCONF"; then sed -i "s#^${k}=.*#${k}=${v}#" "$LCONF"; else printf '%s=%s\n' "$k" "$v" >>"$LCONF"; fi
+  done
+  if [[ -n "${TC_TENANT_TOKEN:-}" ]]; then
+    ok "Baked fleet auto-enrol token into license.conf — installs self-register"
+  fi
+
+  # udev rule: activate the device from a USB stick on insert (no shell needed)
+  stage "config/udev/99-thinclient-provision.rules" "/etc/udev/rules.d/99-thinclient-provision.rules" 0644
+  # USB Wi-Fi stability: stop rtl88xxau dongles power-cycling (drops Wi-Fi + RDP).
+  # (The agent also writes these at runtime so OTA devices get the fix without a
+  # reflash; baking them makes the modprobe params apply from the first module load.)
+  stage "config/udev/72-thinclient-wifi-nopm.rules" "/etc/udev/rules.d/72-thinclient-wifi-nopm.rules" 0644
+  stage "config/modprobe.d/thinclient-wifi.conf"    "/etc/modprobe.d/thinclient-wifi.conf"            0644
+  stage "config/NetworkManager/conf.d/wifi-powersave.conf" "/etc/NetworkManager/conf.d/wifi-powersave.conf" 0644
+  # USB webcam stability: never autosuspend a camera. A webcam that is suspended and
+  # fails to resume drops off the bus (-71/EPROTO) and the recording silently loses
+  # its camera track until somebody physically replugs it. The agent also applies
+  # this at runtime, so the existing fleet gets it over the air; baking it means a
+  # fresh install is correct from the very first boot.
+  stage "config/udev/73-thinclient-camera-nopm.rules" "/etc/udev/rules.d/73-thinclient-camera-nopm.rules" 0644
+
   # --- systemd units (.service + .timer) ---------------------------------
   local u
   for u in "${PROJECT_ROOT}"/systemd/*.service "${PROJECT_ROOT}"/systemd/*.timer; do
     [[ -e "$u" ]] || continue
     stage "systemd/$(basename "$u")" "/etc/systemd/system/$(basename "$u")" 0644
   done
+
+  # --- tmpfiles.d: shared /run/thinclient signal dir (activity + recording) ---
+  stage "config/tmpfiles.d/thinclient.conf" "/usr/lib/tmpfiles.d/thinclient.conf" 0644
 
   # --- Plymouth theme ----------------------------------------------------
   stage "assets/plymouth/thinclient/thinclient.plymouth" "/usr/share/plymouth/themes/thinclient/thinclient.plymouth" 0644
@@ -276,7 +314,30 @@ build() {
   cp -f "$produced" "$OUTPUT_ISO"
   ( cd "${PROJECT_ROOT}/iso" && sha256sum "$(basename "$OUTPUT_ISO")" >"$(basename "$OUTPUT_ISO").sha256" )
 
+  # A tenant-specific image MUST be identifiable from its filename. An ISO carries a
+  # baked enrolment token, so flashing the wrong tenant's image silently enrols the
+  # machine into the wrong fleet — a mistake that is invisible until it has happened.
+  # Hard link, not a copy: same inode, so the second name costs no extra disk.
+  local tenant_slug=""
+  if [[ -n "${TC_TENANT_NAME:-}" ]]; then
+    tenant_slug="$(printf '%s' "$TC_TENANT_NAME" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-*//; s/-*$//')"
+  elif [[ -n "${TC_TENANT_TOKEN:-}" ]]; then
+    tenant_slug="tenant"   # token baked but nobody told us whose — still flag it
+  fi
+  local NAMED_ISO=""
+  if [[ -n "$tenant_slug" ]]; then
+    NAMED_ISO="${PROJECT_ROOT}/iso/thinclient-${VERSION}-${tenant_slug}.iso"
+    ln -f "$OUTPUT_ISO" "$NAMED_ISO" 2>/dev/null || cp -f "$OUTPUT_ISO" "$NAMED_ISO"
+    ( cd "${PROJECT_ROOT}/iso" && sha256sum "$(basename "$NAMED_ISO")" >"$(basename "$NAMED_ISO").sha256" )
+  fi
+
   ok "ISO ready: ${OUTPUT_ISO}"
+  if [[ -n "$NAMED_ISO" ]]; then
+    ok "Tenant image: ${NAMED_ISO}"
+    if [[ "$tenant_slug" == "tenant" ]]; then
+      warn "Set TC_TENANT_NAME=<tenant> so the filename names the tenant, not just 'tenant'"
+    fi
+  fi
   printf '    size: %s\n' "$(du -h "$OUTPUT_ISO" | cut -f1)"
   printf '    sha256: %s\n' "$(cut -d' ' -f1 "${OUTPUT_ISO}.sha256")"
   cat <<EOF

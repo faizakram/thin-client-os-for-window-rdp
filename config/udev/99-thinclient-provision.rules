@@ -1,0 +1,4 @@
+# Trigger device activation when a USB filesystem is plugged in, so the admin
+# can activate a running kiosk without a reboot. Installed to:
+#   /etc/udev/rules.d/99-thinclient-provision.rules
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{ID_FS_USAGE}=="filesystem", RUN+="/bin/systemctl start --no-block thinclient-provision.service"

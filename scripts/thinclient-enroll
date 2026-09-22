@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+# =============================================================================
+#  thinclient-enroll — approval-gated enrolment, run BY THE INSTALLER.
+#
+#  Why this exists: the tenant enrolment token is baked into the ISO, so anyone
+#  who copies that ISO could otherwise self-register unlimited devices into the
+#  tenant, unattended. This walks the machine through human approval instead:
+#
+#     1. ask the manager to approve THIS machine  -> get a pairing code
+#     2. show that pairing code on screen
+#     3. an admin checks it matches, approves, and reads out a one-time password
+#     4. type that password here -> the manager hands over this device's
+#        credentials, exactly once, and only for this hardware id
+#
+#  It runs in the installer because that is where a human is already sitting. The
+#  agent never sees an un-approved credential: it simply finds ENROLL_CODE /
+#  DEVICE_SECRET already present and gets on with its life.
+#
+#  Exit codes:  0 = enrolled   3 = tenant doesn't require approval (let the agent
+#  self-register as before)   1 = refused / expired / aborted / unreachable
+# =============================================================================
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+POLL_SECS = 5
+# Matches the server's request TTL; polling past it is pointless.
+MAX_WAIT_SECS = 60 * 60
+OTP_TRIES = 5
+# Transport failures get retried silently before the operator is bothered: the claim
+# is re-issuable server-side, so repeating it with the same password is safe and is
+# the difference between a blip and a failed installation.
+NET_RETRIES = 4
+_LAST_ERR = [""]
+
+
+def _say(msg=""):
+    print(msg, flush=True)
+
+
+def _curl(url, payload=None, timeout=30):
+    """POST json (or GET when payload is None). Returns (http_status, dict|None)."""
+    cmd = ["curl", "-sS", "--connect-timeout", "10", "--max-time", str(timeout),
+           "-w", "\n%{http_code}"]
+    if payload is not None:
+        cmd += ["-X", "POST", "-H", "Content-Type: application/json", "-d", json.dumps(payload)]
+    cmd.append(url)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 10)
+    except Exception as e:
+        _LAST_ERR[0] = "curl could not run: %s" % e
+        return (0, None)
+    if r.returncode != 0:
+        # curl's own diagnosis (-S writes it to stderr). Throwing this away is what
+        # made three separate field failures indistinguishable from a wrong password.
+        why = (r.stderr or "").strip().replace("\n", " ")[-160:]
+        _LAST_ERR[0] = "network error (curl %d)%s" % (r.returncode, (": " + why) if why else "")
+        return (0, None)
+    # -w appended the status on its own last line; everything before it is the body.
+    out = (r.stdout or "").strip()
+    body, _, tail = out.rpartition("\n")
+    try:
+        status = int(tail)
+    except ValueError:
+        return (0, None)
+    try:
+        return (status, json.loads(body) if body.strip() else {})
+    except Exception:
+        _LAST_ERR[0] = "server sent an unreadable reply (HTTP %s): %s" % (status, body[:120])
+        return (status, {})
+
+
+def machine_facts(disk=""):
+    """A few recognisable details, so the approver can tell WHICH machine this is.
+    Best-effort only — never fail enrolment because a sysfs file is missing."""
+    facts = {}
+
+    def rd(path):
+        try:
+            with open(path) as f:
+                return f.read().strip()
+        except OSError:
+            return ""
+
+    model = rd("/sys/class/dmi/id/product_name")
+    vendor = rd("/sys/class/dmi/id/sys_vendor")
+    if vendor or model:
+        facts["model"] = ("%s %s" % (vendor, model)).strip()
+    serial = rd("/sys/class/dmi/id/product_serial")
+    if serial and serial.lower() not in ("none", "default string", "to be filled by o.e.m."):
+        facts["serial"] = serial
+    try:
+        for line in open("/proc/cpuinfo"):
+            if line.startswith("model name"):
+                facts["cpu"] = line.split(":", 1)[1].strip()
+                break
+    except OSError:
+        pass
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemTotal"):
+                kb = int(line.split()[1])
+                facts["ram"] = "%d GB" % max(1, round(kb / 1024 / 1024))
+                break
+    except OSError:
+        pass
+    if disk:
+        facts["disk"] = disk
+    return facts
+
+
+def banner(pairing_code):
+    line = "=" * 58
+    _say()
+    _say(line)
+    _say("  THIS MACHINE NEEDS APPROVAL BEFORE IT CAN BE INSTALLED")
+    _say(line)
+    _say()
+    _say("  Give your administrator this code:")
+    _say()
+    _say("        >>>   %s   <<<" % pairing_code)
+    _say()
+    _say("  They will check it matches what you just read out, approve")
+    _say("  this machine, and give you a one-time password.")
+    _say()
+    _say(line)
+    _say()
+
+
+def wait_for_approval(url, req_id, hwid):
+    """Poll until approved. Returns True when it's time to ask for the password."""
+    started = time.time()
+    last = ""
+    status_url = "%s/api/install/status?request_id=%s&hwid=%s" % (url, req_id, hwid)
+    while time.time() - started < MAX_WAIT_SECS:
+        code, body = _curl(status_url, None)
+        if code == 200 and body:
+            st = body.get("status", "")
+            if st == "approved":
+                _say()
+                _say("  Approved by your administrator.")
+                return True
+            if st in ("denied", "expired", "claimed"):
+                _say()
+                _say("  %s" % body.get("message", "This request can no longer be used."))
+                return False
+            if st != last:
+                last = st
+                mins = int((time.time() - started) / 60)
+                _say("  Waiting for approval… (%s)" % ("just asked" if mins < 1 else "%d min" % mins))
+        elif code == 0:
+            _say("  Can't reach the manager — retrying…")
+        # A quiet dot keeps the operator confident it hasn't hung.
+        for _ in range(POLL_SECS):
+            time.sleep(1)
+    _say()
+    _say("  Timed out waiting for approval. Run the installer again when someone")
+    _say("  is available to approve this machine.")
+    return False
+
+
+def claim(url, req_id, hwid):
+    """Prompt for the one-time password and exchange it for credentials."""
+    if not sys.stdin.isatty():
+        _say("  No terminal to read the one-time password from — aborting.")
+        return None
+    for attempt in range(1, OTP_TRIES + 1):
+        try:
+            otp = input("  One-time password from your administrator: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            _say()
+            return None
+        if not otp:
+            continue
+        code, body = (0, None)
+        for tries in range(NET_RETRIES):
+            _LAST_ERR[0] = ""
+            code, body = _curl("%s/api/install/claim" % url,
+                               {"request_id": req_id, "hwid": hwid, "otp": otp})
+            if code == 200 and body and body.get("enroll_code") and body.get("secret"):
+                return body
+            # Only a TRANSPORT failure is worth repeating; a refusal is a real answer.
+            if code != 0 and not (code == 200 and not (body or {}).get("enroll_code")):
+                break
+            if tries < NET_RETRIES - 1:
+                wait = 2 * (2 ** tries)          # 2s, 4s, 8s
+                _say("  Couldn't reach the manager — retrying in %ds… (%s)"
+                     % (wait, _LAST_ERR[0] or "no detail"))
+                time.sleep(wait)
+        msg = (body or {}).get("error") or _LAST_ERR[0] or "That didn't work."
+        _say("  %s" % msg)
+        if code in (409, 404) or "expired" in msg.lower() or "Too many" in msg:
+            return None
+        if attempt == OTP_TRIES:
+            _say("  Out of attempts.")
+            return None
+    return None
+
+
+def write_conf(path, pairs):
+    """Merge keys into a license.conf without disturbing anything else in it."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = []
+    for key, val in pairs.items():
+        hit = False
+        for i, ln in enumerate(lines):
+            if ln.startswith(key + "="):
+                lines[i] = "%s=%s" % (key, val)
+                hit = True
+                break
+        if not hit:
+            lines.append("%s=%s" % (key, val))
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(lines).rstrip("\n") + "\n")
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)      # holds this device's secret
+    except OSError:
+        pass
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--url", required=True, help="manager base URL")
+    # NOT --token by default: process arguments are world-readable via
+    # /proc/<pid>/cmdline, so any local user (the kiosk operator included) could read
+    # the tenant token straight out of `ps` while an install ran. The environment is
+    # only readable by the process owner and root, so the caller passes it that way.
+    ap.add_argument("--token", default="", help="(discouraged) tenant token; prefer TC_TENANT_TOKEN")
+    ap.add_argument("--hwid", required=True, help="this machine's hardware id")
+    ap.add_argument("--name", default="", help="device name for the dashboard")
+    ap.add_argument("--hostname", default="")
+    ap.add_argument("--disk", default="")
+    ap.add_argument("--out", required=True, help="license.conf to write credentials into")
+    a = ap.parse_args()
+
+    url = a.url.rstrip("/")
+    token = os.environ.get("TC_TENANT_TOKEN", "") or a.token
+    if not token:
+        _say("  No tenant token supplied (set TC_TENANT_TOKEN).")
+        return 1
+    payload = {"tenant_token": token, "hwid": a.hwid,
+               "machine": machine_facts(a.disk)}
+    if a.name:
+        payload["name"] = a.name
+    if a.hostname:
+        payload["hostname"] = a.hostname
+
+    code, body = (0, None)
+    for tries in range(NET_RETRIES):
+        _LAST_ERR[0] = ""
+        code, body = _curl("%s/api/install/request" % url, payload, timeout=45)
+        if code != 0:
+            break
+        if tries < NET_RETRIES - 1:
+            wait = 3 * (2 ** tries)          # 3s, 6s, 12s
+            _say("  Manager not reachable yet — retrying in %ds… (%s)"
+                 % (wait, _LAST_ERR[0] or "no detail"))
+            time.sleep(wait)
+    if code == 0:
+        _say()
+        _say("  Cannot reach the manager at %s" % url)
+        if _LAST_ERR[0]:
+            _say("  Reason: %s" % _LAST_ERR[0])
+        _say("  This machine must be online to be approved. Check the network and")
+        _say("  run the installer again.")
+        return 1
+    if code == 401:
+        _say()
+        _say("  This installation token isn't valid for %s." % url)
+        return 1
+    if code == 429:
+        _say()
+        _say("  %s" % (body or {}).get("error", "Too many attempts — try again later."))
+        return 1
+    if code != 200 or not body:
+        _say()
+        _say("  Unexpected reply from the manager (HTTP %s)." % code)
+        return 1
+
+    # Tenant hasn't switched approval on: behave exactly as before and let the
+    # agent self-register on first boot.
+    if body.get("approval_required") is False:
+        return 3
+
+    req_id = body.get("request_id", "")
+    pairing = body.get("pairing_code", "")
+    if not req_id or not pairing:
+        _say("  The manager didn't return an approval request.")
+        return 1
+
+    banner(pairing)
+    if not wait_for_approval(url, req_id, a.hwid):
+        return 1
+    got = claim(url, req_id, a.hwid)
+    if not got:
+        return 1
+
+    write_conf(a.out, {"ENROLL_CODE": got["enroll_code"], "DEVICE_SECRET": got["secret"]})
+    _say()
+    _say("  This machine is approved and activated. Installation will continue.")
+    _say()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

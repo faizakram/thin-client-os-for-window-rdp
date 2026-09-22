@@ -1,0 +1,760 @@
+#!/usr/bin/env python3
+# =============================================================================
+#  ThinClient OS — user screen lock
+#  Installed to: /opt/thinclient/bin/thinclient-lock
+#
+#  Bound to Super+L (Win+L). Covers the screen, grabs keyboard + pointer so the
+#  RDP session behind it stays inaccessible, and requires a password to unlock.
+#  A simple default password ("0000") ships; the user can change it right on the
+#  lock screen, and a tenant admin can reset it remotely (agent -> set-password).
+#  Password hashes are per-user PBKDF2 — no admin rights, no plaintext at rest.
+#
+#  Usage:
+#     thinclient-lock                      # lock the screen (GUI)
+#     thinclient-lock set-password PW [USER]   # set/reset a user's lock password
+# =============================================================================
+import fcntl
+import hashlib
+import json
+import hmac
+import os
+import time
+
+LOCK_FILE = os.path.expanduser("~/.thinclient-lock")
+DEFAULT_PW = "0000"
+_ITER = 120000
+# Shared runtime signal the agent reads to know the screen is locked (feeds the
+# activity view + the recording lock overlay/markers).
+LOCK_SIGNAL = "/run/thinclient/locked"
+# When the manager locks a device the agent writes this file. While it exists the
+# operator CANNOT unlock — only the manager (or the agent's auto-expiry window)
+# clears it. The lock screen watches it: blocks the password unlock + auto-dismisses
+# when it clears.
+ADMIN_LOCK = os.environ.get("TC_LICENSE_ADMIN_LOCK", "/var/lib/thinclient/license/admin-lock")
+
+# --- Reaching the administrator from an admin lock -----------------------------
+#
+# An admin lock is the one the operator CANNOT clear. Without a way to reach the
+# person who set it, they are stranded at a screen that tells them to wait, with no
+# way to say "I'm here" or ask why. The floating chat launcher is no help: it hides
+# itself whenever this lock is up, because an override-redirect bubble would float
+# over the lock screen and would have to fight it for the keyboard.
+#
+# So the messaging lives INSIDE this window instead. The lock already owns the seat
+# grab, so there is nothing to hand back and forth — and, more importantly, nothing
+# new is ever mapped. An admin lock exists to keep the operator away from the
+# desktop; a chat panel that could open an image viewer or a file chooser would be
+# a hole in exactly the thing being enforced. Plain text in, plain text out.
+CHAT_LOG = "/var/lib/thinclient/chat/log.jsonl"
+CHAT_OUTBOX = "/run/thinclient/chat-outbox"
+# Touched while the operator has the message pane open, so the agent polls chat
+# quickly instead of on its lazy interval — a reply during a lockout should not
+# take a minute to land.
+CHAT_ACTIVE = "/run/thinclient/chat-active"
+CHAT_UNREAD = "/run/thinclient/chat-unread"
+MSG_MAX = 2000
+
+# The chat bubble, drawn exactly as the floating launcher draws it.
+#
+# The operator already knows this shape: it is the thing they press to talk to an
+# administrator every other day. Putting a different affordance on the lock screen
+# would make them learn a second one at the worst possible moment — while locked out
+# and wanting help. Same circle, same gradient, same speech glyph.
+#
+# These constants are DUPLICATED from thinclient-chat rather than shared, because the
+# bundle ships only shell files in lib/ and a chat import would drag a whole GUI
+# application (and its single-instance lock) into the locker. tests/test-lock-chat.py
+# fails if the two ever drift apart.
+BUBBLE_A1 = (0x3d, 0x7b, 0xf5)   # accent start (blue)   — thinclient-chat C_A1
+BUBBLE_A2 = (0x6d, 0x5e, 0xfc)   # accent end   (violet) — thinclient-chat C_A2
+BUBBLE_BADGE = (0xff, 0x4d, 0x4f)
+BUBBLE_SIZE = 60   # thinclient-chat launcher SIZE — same bubble, same size
+
+try:
+    import cairo   # noqa: F401
+    import math
+    HAVE_CAIRO = True
+except Exception:
+    HAVE_CAIRO = False
+
+
+def _chat_unread():
+    """How many messages are waiting. Shown as the same badge the launcher uses, so a
+    locked-out operator can see the administrator has already replied."""
+    try:
+        return int((open(CHAT_UNREAD).read().strip() or "0"))
+    except Exception:
+        return 1 if os.path.exists(CHAT_UNREAD) else 0
+
+
+def _chat_history(limit=40):
+    """Recent conversation, oldest first, as (who, text) — text only.
+
+    Attachments are deliberately reduced to a note. A screenshot or an image would
+    mean loading a file from disk and offering to open it, and neither belongs on a
+    screen whose whole job is that nothing else can be reached from it.
+    """
+    out = []
+    try:
+        with open(CHAT_LOG) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    m = json.loads(line)
+                except Exception:
+                    continue
+                who = "You" if m.get("sender") == "device" else "Administrator"
+                body = str(m.get("body") or "").strip()
+                if not body and m.get("attachment"):
+                    body = "(attachment — you can open it after unlocking)"
+                if body:
+                    out.append((who, body[:MSG_MAX]))
+    except OSError:
+        pass
+    # Anything typed here that the agent has not yet delivered, so a message the
+    # operator just sent does not vanish from the screen while it waits.
+    try:
+        for name in sorted(os.listdir(CHAT_OUTBOX)):
+            if not name.endswith(".txt"):
+                continue                      # JSON entries are reactions/screenshots
+            try:
+                with open(os.path.join(CHAT_OUTBOX, name)) as f:
+                    body = f.read().strip()
+            except OSError:
+                continue
+            if body:
+                out.append(("You", body[:MSG_MAX] + "  (sending…)"))
+    except OSError:
+        pass
+    return out[-limit:]
+
+
+def _chat_send(body):
+    """Queue one plain-text message for the agent to deliver. Best-effort."""
+    body = (body or "").strip()[:MSG_MAX]
+    if not body:
+        return False
+    try:
+        os.makedirs(CHAT_OUTBOX, exist_ok=True)
+        path = os.path.join(CHAT_OUTBOX, "%d-%d.txt" % (int(time.time() * 1000), os.getpid()))
+        with open(path, "w") as f:
+            f.write(body)
+        return True
+    except OSError:
+        return False
+
+
+def _chat_stamp():
+    """Cheap change detector for the log, so the view only redraws when it must."""
+    try:
+        st = os.stat(CHAT_LOG)
+        return (st.st_mtime, st.st_size)
+    except OSError:
+        return (0, 0)
+
+def _admin_locked():
+    return os.path.exists(ADMIN_LOCK)
+
+
+def _admin_lock_is_schedule():
+    """True when the lock carries working-hours text (4th line of the lock file)."""
+    try:
+        parts = open(ADMIN_LOCK).read().split("\n")
+        return len(parts) > 3 and bool("\n".join(parts[3:]).strip())
+    except Exception:
+        return False
+
+
+def _admin_lock_sub():
+    """Mode/duration-aware sub-message for the admin-lock screen (file format
+    '<epoch>\\n<mode>\\n<hours>'; an old single-line file = timed)."""
+    import time as _t
+    try:
+        parts = open(ADMIN_LOCK).read().split("\n")
+        ts = int((parts[0].strip() if parts and parts[0].strip() else "0"))
+        mode = parts[1].strip() if len(parts) > 1 and parts[1].strip() else "timed"
+        hours = float(parts[2].strip()) if len(parts) > 2 and parts[2].strip() else 24.0
+        msg = "\n".join(parts[3:]).strip() if len(parts) > 3 else ""
+    except Exception:
+        ts, mode, hours, msg = 0, "timed", 24.0, ""
+    # A WORKING-HOURS lock ships its own text (which hours apply and when the machine
+    # comes back). It replaces the generic wording entirely — being told "your hours
+    # are 09:00–18:00, back at 09:00 tomorrow" is far more use than "ask an admin".
+    if msg:
+        return msg
+    if mode == "permanent" or ts <= 0:
+        return "You can’t unlock this device — it stays locked until your administrator unlocks it."
+    remaining = hours - (_t.time() - ts) / 3600.0
+    if remaining <= 0:
+        return "You can’t unlock this device — please wait for your administrator to unlock it."
+    if remaining >= 1:
+        n = int(round(remaining)); rem = "about %d hour%s" % (n, "" if n == 1 else "s")
+    else:
+        rem = "under an hour"
+    return "You can’t unlock this device. It unlocks automatically in %s, or when your administrator unlocks it." % rem
+
+
+def _lock_signal(on):
+    try:
+        if on:
+            os.makedirs("/run/thinclient", exist_ok=True)
+            open(LOCK_SIGNAL, "w").close()
+        elif os.path.exists(LOCK_SIGNAL):
+            os.remove(LOCK_SIGNAL)
+    except OSError:
+        pass
+
+
+def _current_zone():
+    """The machine's live IANA zone (e.g. 'Asia/Kolkata'), read from
+    /etc/localtime. The lock clock seeds os.environ['TZ'] from this before
+    tzset() — glibc's tzset() keys its re-read on the TZ *string*, so with TZ
+    unset it no-ops and an already-open lock would stay stuck on the zone it
+    first resolved (UTC at boot, before the agent applied the policy zone)."""
+    try:
+        real = os.path.realpath("/etc/localtime")
+        i = real.find("/zoneinfo/")
+        if i != -1:
+            return real[i + len("/zoneinfo/"):]
+    except Exception:
+        pass
+    try:
+        with open("/etc/timezone") as f:
+            z = f.read().strip()
+            if z:
+                return z
+    except Exception:
+        pass
+    return None
+
+
+def _hash(pw, salt_hex):
+    return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt_hex), _ITER).hex()
+
+
+def _load(path=None):
+    try:
+        with open(path or LOCK_FILE) as f:
+            salt, h = f.read().strip().split(":", 1)
+            return salt, h
+    except Exception:
+        return None
+
+
+def verify(pw):
+    rec = _load()
+    if rec is None:
+        return pw == DEFAULT_PW          # factory default until the user changes it
+    salt, h = rec
+    try:
+        return hmac.compare_digest(_hash(pw, salt), h)
+    except Exception:
+        return False
+
+
+def set_password(pw, path=None):
+    target = path or LOCK_FILE
+    salt = os.urandom(8).hex()
+    tmp = target + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("%s:%s\n" % (salt, _hash(pw, salt)))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, target)
+
+
+CSS = b"""
+.lockroot { background:#0b1220; }
+.lockroot label { color:#e8eef8; }
+.lockclock { font-size:52px; font-weight:800; }
+.locktitle { font-size:22px; font-weight:700; }
+.locksub  { color:#9fb0c7; font-size:14px; }
+.lockerr  { color:#fb7185; font-size:13px; }
+.lockentry { font-size:16px; padding:10px 12px; min-width:300px; color:#ffffff;
+  background:#1a2740; border:1px solid #2b3a56; border-radius:8px; }
+.lockentry:focus { border-color:#3b82f6; }
+.lockbtn { font-size:14px; font-weight:600; padding:9px 22px; border-radius:8px;
+  background:#1d4ed8; border:0; color:#fff; }
+.lockbtn:hover { background:#2563eb; }
+.locklink { color:#8698b1; font-size:12.5px; }
+/* Messaging the administrator, from inside the lock. Deliberately plainer than the
+   chat panel: this is a way to reach somebody, not a place to spend time. */
+.lockmsg { background:#111c33; border:1px solid #23324d; border-radius:12px; padding:14px; }
+.lockmsgtitle { font-size:13px; font-weight:700; color:#cfe0f5; }
+.lockmsgwho { font-size:10.5px; font-weight:800; color:#8fa6c8; letter-spacing:.3px; }
+.lockmsgbody { font-size:13px; color:#e8eef8; }
+.lockmsgmine { color:#bcd2f5; }
+.lockmsgempty { color:#7d8ea8; font-size:12.5px; }
+.lockmsgsent { color:#6ee7a8; font-size:12px; }
+/* The chat bubble sits on the lock ground, so the button itself is invisible:
+   only the bubble and its label should read. */
+.lockbubblebtn { background:none; border:0; padding:6px 10px; }
+.lockbubblebtn:hover { background:rgba(255,255,255,.06); border-radius:12px; }
+.lockbubblelabel { color:#cfe0f5; font-size:13.5px; font-weight:600; }
+/* No pycairo: the launcher's own flat accent tile + envelope glyph. */
+.lockbubblefallback { background-image:linear-gradient(135deg,#3d7bf5,#6d5efc);
+  border-radius:28px; padding:8px 14px; }
+"""
+
+
+def run_lock_gui():
+    """Show the fullscreen lock (GTK). Imported lazily so the set-password CLI
+    path never needs a display or the GTK stack."""
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk, Gdk, GLib
+
+    class LockScreen(Gtk.Window):
+        def __init__(self):
+            super().__init__(type=Gtk.WindowType.TOPLEVEL)
+            self.mode = "unlock"        # unlock | cur | new | confirm | adminwait
+            self._new_pw = None
+            self._was_admin = False     # did this lock session ever see an admin lock?
+
+            prov = Gtk.CssProvider(); prov.load_from_data(CSS)
+            Gtk.StyleContext.add_provider_for_screen(
+                Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+            self.set_decorated(False)
+            self.get_style_context().add_class("lockroot")
+            self.set_position(Gtk.WindowPosition.CENTER_ALWAYS)   # no top-left flash before fullscreen
+            self.fullscreen()
+            self.set_keep_above(True)
+            self.set_skip_taskbar_hint(True)
+            self.set_skip_pager_hint(True)
+            self.connect("delete-event", lambda *a: True)   # cannot be closed
+
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+            box.set_valign(Gtk.Align.CENTER); box.set_halign(Gtk.Align.CENTER)
+
+            self.clock = Gtk.Label(); self.clock.get_style_context().add_class("lockclock")
+            box.pack_start(self.clock, False, False, 0)
+            self.datelbl = Gtk.Label(); self.datelbl.get_style_context().add_class("locksub")
+            box.pack_start(self.datelbl, False, False, 0)
+
+            self.title_lbl = Gtk.Label(label="Screen locked"); self.title_lbl.get_style_context().add_class("locktitle")
+            box.pack_start(self.title_lbl, False, False, 0)
+            self.sub_lbl = Gtk.Label(label="Enter your password to unlock"); self.sub_lbl.get_style_context().add_class("locksub")
+            box.pack_start(self.sub_lbl, False, False, 0)
+
+            self.entry = Gtk.Entry(); self.entry.set_visibility(False); self.entry.set_placeholder_text("Password")
+            self.entry.get_style_context().add_class("lockentry"); self.entry.set_halign(Gtk.Align.CENTER)
+            self.entry.connect("activate", self._submit)
+            box.pack_start(self.entry, False, False, 0)
+
+            self.err = Gtk.Label(label=""); self.err.get_style_context().add_class("lockerr")
+            box.pack_start(self.err, False, False, 0)
+
+            self.btn = Gtk.Button(label="Unlock"); self.btn.get_style_context().add_class("lockbtn")
+            self.btn.set_halign(Gtk.Align.CENTER); self.btn.connect("clicked", self._submit)
+            box.pack_start(self.btn, False, False, 0)
+
+            self.change_link = Gtk.Button(label="Change password"); self.change_link.set_relief(Gtk.ReliefStyle.NONE)
+            self.change_link.get_style_context().add_class("locklink")
+            self.change_link.connect("clicked", self._start_change)
+            box.pack_start(self.change_link, False, False, 6)
+
+            # --- reaching the administrator (admin lock only) ------------------
+            # The chat bubble the operator already uses, with a word beside it. Icon
+            # alone would be the more elegant thing on a screen they visit daily —
+            # but they land here locked out and wanting help, which is the worst
+            # moment to make somebody guess what a symbol does. The bubble gives
+            # instant recognition, the label removes the guess.
+            self.msg_link = Gtk.Button()
+            self.msg_link.set_relief(Gtk.ReliefStyle.NONE)
+            self.msg_link.get_style_context().add_class("lockbubblebtn")
+            self.msg_link.set_halign(Gtk.Align.CENTER)
+            self.msg_link.set_no_show_all(True)          # only ever shown in adminwait
+            self.msg_link.connect("clicked", self._open_msg)
+            self.msg_link.add(self._build_bubble(Gtk))
+            box.pack_start(self.msg_link, False, False, 4)
+
+            self.msg_box = self._build_msg_pane(Gtk)
+            self.msg_box.set_no_show_all(True)
+            box.pack_start(self.msg_box, False, False, 0)
+            self._msg_open = False
+            self._msg_stamp = None
+
+            # LAST, once every widget it touches exists.
+            #
+            # _tick() is not just the clock: when the device is already admin-locked it
+            # rewrites the title, the subtitle and the buttons. Running it from the
+            # middle of __init__ meant that on a device that was ALREADY locked by an
+            # administrator, the very first call hit self.title_lbl before it had been
+            # created and killed the lock screen on construction. The boot lock then
+            # retried sixty times and fell through to the connect window, so the one
+            # screen that should have said "Locked by your administrator" never
+            # appeared. Caught by driving the real GTK stack under Xvfb; it had been
+            # shipping since at least 1.0.143.
+            self._tick(); GLib.timeout_add_seconds(1, self._tick)
+
+            self.add(box)
+            self.connect("show", lambda *a: GLib.timeout_add(80, self._grab))
+
+        def _build_bubble(self, Gtk):
+            """The launcher's bubble, beside a label. Cairo when it is available,
+            and the launcher's own text glyph when it is not — the chat launcher has
+            exactly the same fallback, so the two still match on a device without
+            pycairo."""
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            row.set_halign(Gtk.Align.CENTER)
+            if HAVE_CAIRO:
+                self.bubble = Gtk.DrawingArea()
+                self.bubble.set_size_request(BUBBLE_SIZE, BUBBLE_SIZE)
+                self.bubble.connect("draw", self._draw_bubble)
+                row.pack_start(self.bubble, False, False, 0)
+            else:
+                self.bubble = None
+                glyph = Gtk.Label()
+                glyph.set_markup("<span foreground='#ffffff' size='xx-large'>✉</span>")
+                glyph.get_style_context().add_class("lockbubblefallback")
+                row.pack_start(glyph, False, False, 0)
+            lbl = Gtk.Label(label="Message your administrator")
+            lbl.get_style_context().add_class("lockbubblelabel")
+            row.pack_start(lbl, False, False, 0)
+            return row
+
+        def _draw_bubble(self, _w, cr):
+            # Kept deliberately identical to thinclient-chat's launcher: same circle,
+            # same diagonal gradient, same highlight, hairline ring, speech glyph and
+            # unread badge.
+            sz = BUBBLE_SIZE
+            grad = cairo.LinearGradient(0, 0, sz, sz)
+            grad.add_color_stop_rgb(0, BUBBLE_A1[0] / 255, BUBBLE_A1[1] / 255, BUBBLE_A1[2] / 255)
+            grad.add_color_stop_rgb(1, BUBBLE_A2[0] / 255, BUBBLE_A2[1] / 255, BUBBLE_A2[2] / 255)
+            cr.arc(sz / 2.0, sz / 2.0, sz / 2.0 - 1, 0, 2 * math.pi)
+            cr.set_source(grad); cr.fill()
+            cr.arc(sz / 2.0, sz / 2.0, sz / 2.0 - 1, math.pi, 2 * math.pi)
+            cr.set_source_rgba(1, 1, 1, 0.10); cr.fill()
+            cr.set_line_width(1.4); cr.set_source_rgba(1, 1, 1, 0.28)
+            cr.arc(sz / 2.0, sz / 2.0, sz / 2.0 - 1.4, 0, 2 * math.pi); cr.stroke()
+            cr.set_source_rgb(1, 1, 1)
+            self._speech(cr, sz / 2.0, sz / 2.0 - 1, sz * 0.42)
+            unread = _chat_unread()
+            if unread:
+                bx, by, br = sz - 11, 11, 9
+                cr.set_source_rgb(1, 1, 1); cr.arc(bx, by, br + 1.6, 0, 2 * math.pi); cr.fill()
+                cr.set_source_rgb(BUBBLE_BADGE[0] / 255, BUBBLE_BADGE[1] / 255, BUBBLE_BADGE[2] / 255)
+                cr.arc(bx, by, br, 0, 2 * math.pi); cr.fill()
+                cr.set_source_rgb(1, 1, 1)
+                cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+                cr.set_font_size(11)
+                txt = str(unread) if unread < 10 else "9+"
+                ext = cr.text_extents(txt)
+                cr.move_to(bx - ext.width / 2 - ext.x_bearing, by - ext.height / 2 - ext.y_bearing)
+                cr.show_text(txt)
+            return False
+
+        def _speech(self, cr, cx, cy, w):
+            h = w * 0.74; x = cx - w / 2.0; y = cy - h / 2.0; r = w * 0.24
+            cr.new_sub_path()
+            cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+            cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+            cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+            cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+            cr.close_path(); cr.fill()
+            cr.move_to(x + w * 0.30, y + h - 1)
+            cr.line_to(x + w * 0.12, y + h + h * 0.26)
+            cr.line_to(x + w * 0.52, y + h - 1)
+            cr.close_path(); cr.fill()
+
+        def _build_msg_pane(self, Gtk):
+            """The conversation, the box to type in, and nothing else.
+
+            No attachments, no image viewer, no file chooser — see the note at the
+            top of this file. Everything lives in the lock's own window, so the seat
+            grab never has to be released and no new window is ever mapped."""
+            pane = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            pane.get_style_context().add_class("lockmsg")
+            pane.set_halign(Gtk.Align.CENTER)
+
+            title = Gtk.Label(label="Message your administrator")
+            title.get_style_context().add_class("lockmsgtitle")
+            title.set_halign(Gtk.Align.START)
+            pane.pack_start(title, False, False, 0)
+
+            self.msg_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            scroller = Gtk.ScrolledWindow()
+            scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scroller.set_size_request(420, 200)
+            scroller.add(self.msg_list)
+            self._msg_scroll = scroller
+            pane.pack_start(scroller, False, False, 0)
+
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            self.msg_entry = Gtk.Entry()
+            self.msg_entry.set_placeholder_text("Type a message…")
+            self.msg_entry.set_max_length(MSG_MAX)
+            self.msg_entry.get_style_context().add_class("lockentry")
+            self.msg_entry.connect("activate", self._send_msg)
+            row.pack_start(self.msg_entry, True, True, 0)
+            send = Gtk.Button(label="Send")
+            send.get_style_context().add_class("lockbtn")
+            send.connect("clicked", self._send_msg)
+            row.pack_start(send, False, False, 0)
+            pane.pack_start(row, False, False, 0)
+
+            self.msg_note = Gtk.Label(label="")
+            self.msg_note.get_style_context().add_class("lockmsgsent")
+            self.msg_note.set_halign(Gtk.Align.START)
+            pane.pack_start(self.msg_note, False, False, 0)
+
+            close = Gtk.Button(label="Hide messages")
+            close.set_relief(Gtk.ReliefStyle.NONE)
+            close.get_style_context().add_class("locklink")
+            close.connect("clicked", self._close_msg)
+            pane.pack_start(close, False, False, 0)
+            return pane
+
+        def _open_msg(self, *_):
+            self._msg_open = True
+            self.msg_link.hide()
+            # The pane is built with no-show-all so the window's own show_all() at
+            # startup cannot reveal it on an ordinary lock. That same flag makes
+            # show_all() a no-op here, so it has to be lifted before the children
+            # will map — otherwise the pane appears empty.
+            self.msg_box.set_no_show_all(False)
+            self.msg_box.show_all()
+            self._render_msgs(force=True)
+            self.msg_entry.grab_focus()
+
+        def _close_msg(self, *_):
+            self._msg_open = False
+            self.msg_box.hide()
+            self.msg_box.set_no_show_all(True)
+            self.msg_link.set_no_show_all(False)
+            self.msg_link.show_all()
+
+        def _send_msg(self, *_):
+            body = self.msg_entry.get_text().strip()
+            if not body:
+                return
+            ok = _chat_send(body)
+            self.msg_entry.set_text("")
+            self.msg_note.set_text(
+                "Sent — your administrator will see it in the console."
+                if ok else "Couldn't send that. It will work again once the device is back online.")
+            self._render_msgs(force=True)
+            self.msg_entry.grab_focus()
+
+        def _render_msgs(self, force=False):
+            """Redraw only when the conversation actually changed — this runs once a
+            second behind a lock screen that may be up for hours."""
+            from gi.repository import Gtk, GLib
+            hist = _chat_history()
+            key = (_chat_stamp(), len(hist))
+            if not force and key == self._msg_stamp:
+                return
+            self._msg_stamp = key
+            for child in self.msg_list.get_children():
+                self.msg_list.remove(child)
+            if not hist:
+                empty = Gtk.Label(label="No messages yet. Send one and your administrator will see it.")
+                empty.get_style_context().add_class("lockmsgempty")
+                empty.set_halign(Gtk.Align.START)
+                empty.set_line_wrap(True)
+                self.msg_list.pack_start(empty, False, False, 0)
+            for who, body in hist:
+                item = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+                tag = Gtk.Label(label=who.upper())
+                tag.get_style_context().add_class("lockmsgwho")
+                tag.set_halign(Gtk.Align.START)
+                item.pack_start(tag, False, False, 0)
+                txt = Gtk.Label(label=body)
+                txt.get_style_context().add_class("lockmsgbody")
+                if who == "You":
+                    txt.get_style_context().add_class("lockmsgmine")
+                txt.set_halign(Gtk.Align.START)
+                txt.set_line_wrap(True)
+                txt.set_max_width_chars(52)
+                txt.set_xalign(0.0)
+                item.pack_start(txt, False, False, 0)
+                self.msg_list.pack_start(item, False, False, 0)
+            self.msg_list.show_all()
+            # Newest message in view, once GTK has laid the new rows out.
+            GLib.idle_add(self._scroll_msgs_to_end)
+
+        def _scroll_msgs_to_end(self):
+            try:
+                adj = self._msg_scroll.get_vadjustment()
+                adj.set_value(max(0, adj.get_upper() - adj.get_page_size()))
+            except Exception:
+                pass
+            return False
+
+        def _tick(self):
+            # Local time in the machine's configured timezone (set by the agent
+            # from the tenant/device policy). %Z shows the zone (e.g. IST/UTC).
+            # Seed TZ from the live /etc/localtime, THEN tzset(): glibc keys its
+            # re-read on the TZ string, so with TZ unset tzset() no-ops and this
+            # process would stay on whatever zone it first saw (UTC at boot,
+            # before the agent applied the policy zone). Setting TZ to the current
+            # zone forces the re-read, so the boot lock self-corrects within 1s of
+            # the agent applying the zone — and a mid-session change reflects live.
+            z = _current_zone()
+            if z and os.environ.get("TZ") != z:
+                os.environ["TZ"] = z
+            try: time.tzset()
+            except Exception: pass
+            # 12-hour clock (e.g. "2:32 PM"); lstrip drops the leading zero so it
+            # reads "9:05 AM" not "09:05 AM". Kept consistent with the connect screen.
+            self.clock.set_text(time.strftime("%I:%M %p").lstrip("0"))
+            self.datelbl.set_text(time.strftime("%A, %d %B · %Z"))
+            # Admin lock: the operator cannot unlock — reflect it live, and auto-
+            # dismiss the lock once the manager (or the auto-expiry) clears it.
+            if _admin_locked():
+                self._was_admin = True
+                if self.mode != "adminwait":
+                    self.mode = "adminwait"
+                    self.title_lbl.set_text(
+                        "Outside your working hours" if _admin_lock_is_schedule()
+                        else "Locked by your administrator")
+                    self.sub_lbl.set_text(_admin_lock_sub())
+                    self.err.set_text("")
+                    # no-show-all as well as hide: the window's show_all() runs AFTER
+                    # __init__, so on a device that was already admin-locked a plain
+                    # hide() here would be undone a moment later and the operator would
+                    # be staring at a password box that cannot work.
+                    for w in (self.entry, self.btn, self.change_link):
+                        w.set_no_show_all(True); w.hide()
+                    # The operator cannot clear this lock, so give them the one thing
+                    # they still need: a way to reach whoever set it. Only here — on an
+                    # ordinary lock they simply type their password.
+                    # show_all(), not show(): show() maps this widget ONLY. The
+                    # bubble and its label are children, and with no-show-all set on
+                    # the button the window's own show_all() skipped the whole subtree
+                    # — so show() left an empty button on screen with no bubble in it.
+                    # That shipped in 1.0.146 and is exactly why the icon was missing.
+                    self.msg_link.set_no_show_all(False)
+                    self.msg_link.show_all()
+                if self.bubble is not None:
+                    self.bubble.queue_draw()      # keep the unread badge current
+                if self._msg_open:
+                    # Keep the conversation live, and ask the agent to poll chat
+                    # quickly while somebody is actually waiting on a reply.
+                    try:
+                        open(CHAT_ACTIVE, "w").close()
+                    except OSError:
+                        pass
+                    self._render_msgs()
+            elif self._was_admin:
+                self._ungrab_quit()   # admin unlocked (or lock auto-expired) → release
+            return True
+
+        def _grab(self):
+            try:
+                seat = self.get_display().get_default_seat()
+                st = seat.grab(self.get_window(),
+                               Gdk.SeatCapabilities.KEYBOARD | Gdk.SeatCapabilities.POINTER,
+                               True, None, None, None, None)
+                self.entry.grab_focus()
+                return st != Gdk.GrabStatus.SUCCESS   # keep retrying until grabbed
+            except Exception:
+                return False
+
+        def _ungrab_quit(self):
+            try:
+                self.get_display().get_default_seat().ungrab()
+            except Exception:
+                pass
+            Gtk.main_quit()
+
+        def _flash(self, msg):
+            self.err.set_text(msg)
+            self.entry.set_text(""); self.entry.grab_focus()
+
+        def _submit(self, *a):
+            pw = self.entry.get_text()
+            if self.mode == "adminwait" or _admin_locked():
+                self._flash("You can’t unlock right now — locked by your administrator. Please wait.")
+                return
+            if self.mode == "unlock":
+                if verify(pw):
+                    self._ungrab_quit()
+                else:
+                    self._flash("Incorrect password")
+            elif self.mode == "cur":
+                if verify(pw):
+                    self.mode = "new"; self._new_pw = None
+                    self.sub_lbl.set_text("Enter a NEW password"); self.err.set_text("")
+                    self.entry.set_text(""); self.entry.grab_focus()
+                else:
+                    self._flash("Current password is wrong")
+            elif self.mode == "new":
+                if not pw:
+                    self._flash("Password can't be empty"); return
+                self._new_pw = pw; self.mode = "confirm"
+                self.sub_lbl.set_text("Re-enter the new password")
+                self.entry.set_text(""); self.entry.grab_focus()
+            elif self.mode == "confirm":
+                if pw == self._new_pw:
+                    try:
+                        set_password(pw)
+                        self._ungrab_quit()          # new password proven -> unlock
+                    except Exception as e:
+                        self._flash("Could not save: %s" % e)
+                else:
+                    self.mode = "new"; self._new_pw = None
+                    self.sub_lbl.set_text("Didn’t match — enter a NEW password"); self.entry.set_text("")
+
+        def _start_change(self, *a):
+            self.mode = "cur"
+            self.title_lbl.set_text("Change lock password")
+            self.sub_lbl.set_text("Enter your CURRENT password")
+            self.err.set_text(""); self.entry.set_text("")
+            self.btn.set_label("Next"); self.change_link.hide()
+            self.entry.grab_focus()
+
+    win = LockScreen()
+    win.show_all()
+    # Re-assert fullscreen after mapping — if the WM wasn't managing yet the lock
+    # could otherwise appear as a small box instead of covering the screen.
+    win.fullscreen()
+    GLib.timeout_add(400, lambda: (win.fullscreen(), False)[1])
+    Gtk.main()
+
+
+def _cli_set_password(argv):
+    import pwd
+    global LOCK_FILE
+    pw = argv[2]
+    user = argv[3] if len(argv) > 3 else (os.environ.get("SUDO_USER") or "thinclient")
+    try:
+        rec = pwd.getpwnam(user)
+    except KeyError:
+        import sys
+        print("no such user: %s" % user, file=sys.stderr)
+        return 2
+    LOCK_FILE = os.path.join(rec.pw_dir, ".thinclient-lock")
+    set_password(pw)
+    try:
+        os.chown(LOCK_FILE, rec.pw_uid, rec.pw_gid)
+    except Exception:
+        pass
+    return 0
+
+
+def main():
+    import sys
+    # Headless CLI (no GTK/display): set/reset a user's lock password — used by
+    # the agent to apply a tenant admin's remote reset of a forgotten PIN.
+    if len(sys.argv) >= 3 and sys.argv[1] == "set-password":
+        return _cli_set_password(sys.argv)
+
+    # single instance: a second Super+L press must not stack lockers
+    try:
+        fd = os.open(os.path.expanduser("~/.thinclient-lock.pid"), os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except Exception:
+        return 0
+    _lock_signal(True)
+    try:
+        run_lock_gui()
+    finally:
+        _lock_signal(False)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

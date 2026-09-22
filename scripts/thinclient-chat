@@ -1,0 +1,1228 @@
+#!/usr/bin/env python3
+# =============================================================================
+#  ThinClient OS - support chat (operator <-> admin)
+#  Installed to: /opt/thinclient/bin/thinclient-chat
+#
+#  A persistent, always-on floating LAUNCHER bubble in the bottom-right corner
+#  (like a website chat widget) - visible on the desktop AND over the full
+#  screen RDP session. Clicking it opens a clean chat panel; a red badge shows
+#  unread admin replies.
+#
+#     thinclient-chat            -> run the launcher (started by the session)
+#     thinclient-chat --open     -> ask the running launcher to open the panel
+#
+#  Two render paths, chosen automatically:
+#     * pycairo present  -> a true, shaped, round gradient bubble (X-Shape, so
+#                           it floats over any background without a compositor)
+#     * no pycairo       -> a solid accent tile launcher (opaque, no dark
+#                           corners over RDP) - same behaviour, still premium
+#
+#  Pure UI over a local store that thinclient-agent syncs with the manager:
+#     log:    /var/lib/thinclient/chat/log.jsonl   (agent-written, both ways)
+#     outbox: /run/thinclient/chat-outbox/         (we drop; agent sends + logs)
+#     unread: /run/thinclient/chat-unread          (count; cleared when opened)
+#     open:   /run/thinclient/chat-open            (touch to open the panel)
+# =============================================================================
+import gi, json, math, os, sys, time, fcntl
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, Gdk, GLib, Pango, GdkPixbuf   # noqa: E402
+try:
+    import cairo   # pycairo (python3-cairo/-gi-cairo) -> shaped round bubble
+    HAVE_CAIRO = True
+except Exception:
+    HAVE_CAIRO = False
+
+CHAT_DIR = "/var/lib/thinclient/chat"
+CHAT_LOG = os.path.join(CHAT_DIR, "log.jsonl")
+CHAT_OUTBOX = "/run/thinclient/chat-outbox"
+CHAT_UNREAD = "/run/thinclient/chat-unread"
+CHAT_OPEN = "/run/thinclient/chat-open"
+CHAT_ACTIVE = "/run/thinclient/chat-active"   # touched while the panel is open -> agent polls chat fast
+CHAT_TYPING = "/run/thinclient/chat-typing"          # we touch this while the operator types
+CHAT_ADMIN_TYPING = "/run/thinclient/chat-admin-typing"  # agent writes this when an admin is typing
+LOCK = "/run/thinclient/.chat-launcher.lock"
+LOCK_SIGNAL = "/run/thinclient/locked"   # present while the screen lock GUI is up
+POS_FILE = os.path.expanduser("~/.thinclient-chat-pos")   # where the user parked the bubble
+
+# ---- palette (deliberate: deep navy ground, blue->violet accent) ------------
+C_GROUND = "#0b1120"
+C_SURFACE = "#141d33"
+C_THEM = "#212d4d"
+C_TEXT = "#eaf0fb"
+C_MUTED = "#93a1c0"
+C_A1 = (0x3d, 0x7b, 0xf5)   # accent start (blue)
+C_A2 = (0x6d, 0x5e, 0xfc)   # accent end   (violet)
+C_BADGE = (0xff, 0x4d, 0x4f)
+
+# Standard emoji palette for the composer + the quick-reaction set (must match
+# the manager's REACTIONS list so a reaction round-trips).
+EMOJIS = ["😀", "😂", "😊", "😍", "👍", "👎", "❤️", "🙏",
+          "🎉", "😄", "😢", "😡", "😮", "🤔", "👏", "🔥"]
+REACTIONS = ["👍", "👎", "❤️", "😂", "😮", "😢", "😡", "🙏"]
+
+
+def _hx(rgb):
+    return "#%02x%02x%02x" % rgb
+
+
+CSS = ("""
+window.chatwin { background: %(ground)s; border: 1px solid #26365c; }
+box.chat-header { background-image: linear-gradient(120deg,%(a1)s,%(a2)s); }
+.chat-avatar { background: rgba(255,255,255,.18); color:#ffffff; font-size:17px;
+               border-radius:22px; min-width:40px; min-height:40px; }
+.chat-title { color:#ffffff; font-weight:800; font-size:15px; }
+.chat-sub   { color: rgba(255,255,255,.85); font-size:11px; }
+.chat-dot   { color:#34d399; font-size:9px; }
+button.chat-close { color:#ffffff; background:transparent; border:0; padding:2px 10px;
+                    box-shadow:none; font-size:15px; }
+button.chat-close:hover { background: rgba(255,255,255,.22); border-radius:9px; }
+/* Bubbles: generous radius with ONE squared corner as the tail. Inside a run the
+   tail is suppressed (.grp-mid) so consecutive messages read as one stack. The
+   shadow is what lifts them off the ground and stops the panel looking flat. */
+.bubble { padding:9px 13px; font-size:13.5px; box-shadow:0 1px 3px rgba(0,0,0,.28); }
+.them { background:%(them)s; color:%(text)s;
+        border-radius:17px; border-bottom-left-radius:6px; }
+.me   { background-image: linear-gradient(135deg,%(a1)s,%(a2)s); color:#ffffff;
+        border-radius:17px; border-bottom-right-radius:6px; }
+.them.grp-mid { border-bottom-left-radius:17px; }
+.me.grp-mid   { border-bottom-right-radius:17px; }
+/* The time, dim and inside the bubble - not a separate line under it. */
+.stamp { font-size:9.5px; color:rgba(255,255,255,.62); margin-top:1px; }
+.them .stamp { color:%(muted)s; }
+.meta { color:%(muted)s; font-size:10px; }
+/* Per-bubble actions, revealed on hover only. */
+/* Tap-menu items - plain rows, not chunky GTK buttons. */
+button.pop-item { background:transparent; border:0; box-shadow:none; color:%(text)s;
+                  font-size:13px; padding:6px 16px; min-height:0; }
+button.pop-item:hover { background:%(them)s; border-radius:8px; }
+/* Typing bubble - same shape as a message, so it sits in the flow naturally. */
+.typing-bubble { padding:8px 14px; }
+.typing-dots { color:%(muted)s; font-size:15px; letter-spacing:1px; }
+.sender-tag { color:#c8d3ec; font-weight:800; font-size:10px; letter-spacing:.3px; }
+/* Day separator - a quiet centred label dividing one day from the next. */
+label.day-sep { color:%(muted)s; font-size:9.5px; font-weight:700; letter-spacing:.08em;
+  background:%(surface)s; border-radius:999px; padding:3px 11px; margin:14px 0 4px; }
+/* "Admin is typing..." - deliberately understated; it is a hint, not a message. */
+label.typing { color:%(muted)s; font-size:11px; font-style:italic; margin:2px 0 0 4px; }
+/* Quoted parent inside a bubble: a rail plus dimmed text reads as "what this answers". */
+box.quote { border-left:3px solid rgba(255,255,255,.4); padding:3px 0 3px 8px;
+  margin-bottom:3px; opacity:.82; }
+label.quote-who { font-size:10px; }
+box.quote label { font-size:11px; }
+/* "Replying to..." strip above the composer. */
+box.chat-replybar { background:%(them)s; border-radius:11px; padding:7px 10px;
+  margin:0 10px 6px; border-left:3px solid %(a1)s; }
+box.chat-replybar label { font-size:11px; color:%(text)s; }
+/* a small pill hanging off a bubble showing the counterpart's quick reaction */
+.reaction-chip { background:%(surface)s; border:1px solid #2b3c5f; border-radius:11px;
+                 padding:0 6px; font-size:12px; }
+/* the little "react" trigger shown beside an admin bubble */
+button.react-btn { color:%(muted)s; background:transparent; border:0; box-shadow:none;
+                   padding:0 4px; font-size:14px; min-width:0; min-height:0; opacity:.55; }
+button.react-btn:hover { opacity:1; color:%(text)s; }
+/* emoji / reaction popovers: a tidy grid of tappable glyphs */
+grid.emoji-grid button, box.react-row button { background:transparent; border:0;
+                   box-shadow:none; font-size:20px; padding:4px 6px; min-width:0; min-height:0; }
+grid.emoji-grid button:hover, box.react-row button:hover { background:%(them)s; border-radius:9px; }
+button.chat-emoji { background:transparent; border:0; box-shadow:none; color:%(muted)s;
+                    font-size:19px; padding:0 6px; min-width:0; min-height:0; }
+button.chat-emoji:hover { color:%(text)s; }
+.chat-hint { color:%(muted)s; font-size:13px; }
+.chat-inputbar { background:%(surface)s; }
+entry.chat-entry { background:%(ground)s; color:%(text)s; border:1px solid #2b3c5f;
+                   border-radius:21px; padding:9px 15px; }
+entry.chat-entry:focus { border-color:%(a1)s; }
+button.chat-send { background-image: linear-gradient(120deg,%(a1)s,%(a2)s); color:#ffffff;
+                   border:0; border-radius:21px; min-width:42px; min-height:42px;
+                   padding:0; box-shadow:none; }
+button.chat-send:hover { background-image: linear-gradient(120deg,%(a2)s,#7d70ff); }
+/* solid-tile fallback launcher (no pycairo): the whole window is the accent
+   tile, so there are no opaque corner artifacts over the RDP session. */
+window.launcher { background-image: linear-gradient(135deg,%(a1)s,%(a2)s); }
+eventbox.fab-tile { background-image: linear-gradient(135deg,%(a1)s,%(a2)s); border-radius:16px; }
+.fab-badge { background:%(badge)s; color:#ffffff; font-size:10px; font-weight:800;
+             border-radius:9px; padding:0 5px; margin:5px; }
+""" % {
+    "ground": C_GROUND, "surface": C_SURFACE, "them": C_THEM, "text": C_TEXT,
+    "muted": C_MUTED, "a1": _hx(C_A1), "a2": _hx(C_A2), "badge": _hx(C_BADGE),
+}).encode("ascii")
+
+
+def _install_css():
+    try:
+        prov = Gtk.CssProvider(); prov.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    except Exception:
+        pass
+
+
+def _read_log():
+    out = []
+    try:
+        with open(CHAT_LOG) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    pass
+    except OSError:
+        pass
+    return out
+
+
+def _read_outbox():
+    # Pending operator messages the agent hasn't flushed yet. Reaction entries are
+    # JSON ({"reactTo":...}) — skip those; they aren't chat bubbles.
+    out = []
+    try:
+        for name in sorted(os.listdir(CHAT_OUTBOX)):
+            try:
+                with open(os.path.join(CHAT_OUTBOX, name)) as f:
+                    body = f.read().strip()
+            except OSError:
+                continue
+            if not body:
+                continue
+            if body.startswith("{"):
+                # JSON outbox item: reactions have no bubble; a screenshot shows a
+                # brief "sharing…" placeholder until the agent uploads + logs it.
+                try:
+                    j = json.loads(body)
+                    if j.get("screenshot"):
+                        cap = str(j.get("body", "")).strip()
+                        out.append({"sender": "device", "at": 0, "pending": True,
+                                    "body": (cap + "\n" if cap else "") + "📷 Sharing screenshot…"})
+                except Exception:
+                    pass
+                continue
+            out.append({"sender": "device", "body": body, "at": 0, "pending": True})
+    except OSError:
+        pass
+    return out
+
+
+def _unread_count():
+    try:
+        return int((open(CHAT_UNREAD).read().strip() or "0"))
+    except Exception:
+        return 1 if os.path.exists(CHAT_UNREAD) else 0
+
+
+def _clear_unread():
+    try:
+        os.remove(CHAT_UNREAD)
+    except OSError:
+        pass
+
+
+def _read_pos():
+    try:
+        x, y = open(POS_FILE).read().split()
+        return int(x), int(y)
+    except Exception:
+        return None
+
+
+def _save_pos(x, y):
+    try:
+        with open(POS_FILE, "w") as f:
+            f.write("%d %d" % (x, y))
+    except OSError:
+        pass
+
+
+def _float_window(w):
+    """Common recipe for an always-on, undecorated, all-workspaces window that
+    reliably maps over the connect screen AND the full-screen RDP session."""
+    w.set_decorated(False)
+    w.set_skip_taskbar_hint(True)
+    w.set_skip_pager_hint(True)
+    w.set_keep_above(True)
+    w.set_resizable(False)
+    w.set_focus_on_map(False)   # don't steal focus, but DO map/show (unlike accept_focus)
+    try:
+        w.stick()               # visible on every workspace
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- #
+#  The chat panel (opens from the bubble)
+# --------------------------------------------------------------------------- #
+class ChatWindow(Gtk.Window):
+    def __init__(self, on_close):
+        # Override-redirect (POPUP), like the launcher bubble: a normal TOPLEVEL
+        # maps BEHIND a FreeRDP /f exclusive-fullscreen session (invisible until the
+        # RDP session ends). Override-redirect floats above everything — including
+        # the RDP session — and an explicit keyboard grab (see present_chat) keeps
+        # the reply box typeable since such windows get no WM focus.
+        super().__init__(type=Gtk.WindowType.POPUP)
+        self._on_close = on_close
+        self._sig = None         # last-rendered log signature (skip idle re-renders)
+        self._seat = None        # active keyboard grab while the panel is open
+        _float_window(self)
+        self.set_default_size(384, 566)
+        self.get_style_context().add_class("chatwin")
+        self._build()
+        _clear_unread()
+        self._render()
+        self.connect("key-press-event", self._key)
+        self.connect("realize", lambda *_: self._place())
+        GLib.timeout_add_seconds(2, self._tick)
+
+    def _build(self):
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL); self.add(outer)
+
+        hb = Gtk.Box(spacing=11); hb.get_style_context().add_class("chat-header")
+        hb.set_border_width(14)
+        av = Gtk.Label(label="✉"); av.get_style_context().add_class("chat-avatar")
+        av.set_valign(Gtk.Align.CENTER)
+        hb.pack_start(av, False, False, 0)
+        tt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL); tt.set_valign(Gtk.Align.CENTER)
+        t = Gtk.Label(label="Support"); t.set_xalign(0.0); t.get_style_context().add_class("chat-title")
+        sr = Gtk.Box(spacing=5)
+        dot = Gtk.Label(label="●"); dot.get_style_context().add_class("chat-dot")
+        s = Gtk.Label(label="We're online — message your admin")
+        s.set_xalign(0.0); s.get_style_context().add_class("chat-sub")
+        sr.pack_start(dot, False, False, 0); sr.pack_start(s, False, False, 0)
+        tt.pack_start(t, False, False, 0); tt.pack_start(sr, False, False, 0)
+        hb.pack_start(tt, True, True, 0)
+        close = Gtk.Button(label="✕"); close.get_style_context().add_class("chat-close")
+        close.set_valign(Gtk.Align.START)
+        close.connect("clicked", lambda *_: self._close())
+        hb.pack_end(close, False, False, 0)
+        outer.pack_start(hb, False, False, 0)
+
+        self.scroll = Gtk.ScrolledWindow()
+        self.scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.list.set_border_width(14)
+        self.scroll.add(self.list); outer.pack_start(self.scroll, True, True, 0)
+
+        ib = Gtk.Box(spacing=9); ib.set_border_width(12)
+        ib.get_style_context().add_class("chat-inputbar")
+        # "Replying to…" strip. Built once and simply hidden when unused, so it
+        # cannot disturb the layout while inactive.
+        self.reply_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.reply_bar.get_style_context().add_class("chat-replybar")
+        self.reply_lbl = Gtk.Label(); self.reply_lbl.set_xalign(0)
+        self.reply_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        rb_x = Gtk.Button(label="✕"); rb_x.get_style_context().add_class("chat-emoji")
+        rb_x.set_tooltip_text("Cancel reply")
+        rb_x.connect("clicked", lambda *_: self._set_reply(None))
+        self.reply_bar.pack_start(self.reply_lbl, True, True, 0)
+        self.reply_bar.pack_end(rb_x, False, False, 0)
+        # GTK's show_all() would otherwise reveal this bar even with no reply set,
+        # leaving an empty strip above the composer. no_show_all makes visibility
+        # explicitly ours to control.
+        self.reply_bar.set_no_show_all(True)
+        self.reply_bar.hide()
+        self._reply_to = None
+        emo = Gtk.Button(label="😊"); emo.get_style_context().add_class("chat-emoji")
+        emo.set_valign(Gtk.Align.CENTER); emo.set_tooltip_text("Emoji")
+        emo.connect("clicked", self._emoji_popover)
+        shot = Gtk.Button(label="📷"); shot.get_style_context().add_class("chat-emoji")
+        shot.set_valign(Gtk.Align.CENTER); shot.set_tooltip_text("Share a screenshot of your screen")
+        shot.connect("clicked", self._send_screenshot)
+        self.entry = Gtk.Entry(); self.entry.get_style_context().add_class("chat-entry")
+        self.entry.set_placeholder_text("Type a message…"); self.entry.connect("activate", self._send)
+        self.entry.connect("changed", self._on_typing)
+        send = Gtk.Button(); send.get_style_context().add_class("chat-send")
+        try:
+            send.set_image(Gtk.Image.new_from_icon_name("mail-send-symbolic", Gtk.IconSize.BUTTON))
+            send.set_always_show_image(True)
+        except Exception:
+            send.set_label("Send")
+        send.set_valign(Gtk.Align.CENTER); send.connect("clicked", self._send)
+        ib.pack_start(emo, False, False, 0)
+        ib.pack_start(shot, False, False, 0)
+        ib.pack_start(self.entry, True, True, 0); ib.pack_end(send, False, False, 0)
+        outer.pack_start(self.reply_bar, False, False, 0)
+        outer.pack_start(ib, False, False, 0)
+
+    def _set_reply(self, msg):
+        """Set (or clear) the message being replied to, and reflect it in the bar."""
+        self._reply_to = msg
+        if not msg:
+            self.reply_bar.hide()
+            return
+        who = "Admin" if msg.get("sender") == "admin" else "You"
+        body = (msg.get("body") or "").strip()
+        if not body and msg.get("att"):
+            body = "📷 image"
+        self.reply_lbl.set_markup(
+            "<b>Replying to %s</b>  %s" % (GLib.markup_escape_text(who),
+                                           GLib.markup_escape_text(body[:60])))
+        self.reply_lbl.show()
+        for ch in self.reply_bar.get_children():
+            ch.show()
+        self.reply_bar.show()
+        self.entry.grab_focus()
+
+    def _emoji_popover(self, btn):
+        # A tidy 4-wide grid of the standard emoji set; clicking inserts at the
+        # caret and keeps the picker open so several can be added in a row.
+        pop = Gtk.Popover(); pop.set_relative_to(btn)
+        grid = Gtk.Grid(); grid.get_style_context().add_class("emoji-grid")
+        grid.set_border_width(6); grid.set_row_spacing(2); grid.set_column_spacing(2)
+        for i, e in enumerate(EMOJIS):
+            b = Gtk.Button(label=e)
+            b.connect("clicked", lambda _w, em=e: self._insert_emoji(em))
+            grid.attach(b, i % 4, i // 4, 1, 1)
+        pop.add(grid); grid.show_all(); pop.popup()
+
+    def _insert_emoji(self, e):
+        pos = self.entry.get_position()
+        self.entry.insert_text(e, pos)
+        self.entry.set_position(pos + len(e))
+        self.entry.grab_focus()
+
+    def _place(self):
+        try:
+            disp = Gdk.Display.get_default()
+            mon = disp.get_primary_monitor() or disp.get_monitor(0)
+            g = mon.get_workarea()
+            w, h = self.get_size()
+            self.move(g.x + g.width - w - 24, g.y + g.height - h - 98)
+        except Exception:
+            pass
+
+    def _key(self, _w, ev):
+        if ev.keyval == Gdk.KEY_Escape:
+            self._close()
+        return False
+
+    def _grab_kbd(self):
+        # Route the keyboard to the chat panel. Override-redirect windows get no WM
+        # focus, so over a fullscreen RDP session typing would otherwise go to RDP.
+        # (Same seat-grab the lock screen uses.) Best-effort — visibility works even
+        # if the grab fails.
+        try:
+            gw = self.get_window()
+            if gw is None:
+                return
+            seat = Gdk.Display.get_default().get_default_seat()
+            seat.grab(gw, Gdk.SeatCapabilities.KEYBOARD, False, None, None, None)
+            self._seat = seat
+        except Exception:
+            self._seat = None
+
+    def _ungrab_kbd(self):
+        # MUST run before the screen locks (the lock needs the keyboard for its own
+        # grab) — see the launcher's lock guard.
+        try:
+            if self._seat is not None:
+                self._seat.ungrab()
+        except Exception:
+            pass
+        self._seat = None
+
+    def _close(self):
+        self._ungrab_kbd()
+        self.hide()
+        try: os.remove(CHAT_ACTIVE)   # stop the fast cadence promptly on close
+        except OSError: pass
+        if self._on_close:
+            self._on_close()
+
+    def _bubble(self, m, first=True, last=True):
+        """One message. `first`/`last` mark its place in a run from the same sender:
+        a run then reads as one stack (shared corners, one name, one timestamp)
+        instead of a column of identical boxes - which is what looked dated."""
+        mine = (m.get("sender") == "device")
+        wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        wrap.set_halign(Gtk.Align.END if mine else Gtk.Align.START)
+
+        # Admin alias - "Admin 2" / "Super Admin 1", NEVER a real identity. Once
+        # per run, not on every bubble.
+        if not mine and first:
+            tag = Gtk.Label(label=(m.get("from") or "Admin"))
+            tag.set_xalign(0.0)
+            tag.get_style_context().add_class("sender-tag")
+            wrap.pack_start(tag, False, False, 0)
+
+        row = Gtk.Box(spacing=4)
+        row.set_halign(Gtk.Align.END if mine else Gtk.Align.START)
+
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        ctx = inner.get_style_context()
+        ctx.add_class("bubble")
+        ctx.add_class("me" if mine else "them")
+        if not last:
+            ctx.add_class("grp-mid")     # only the run's last bubble gets the tail
+
+        q = m.get("reply")
+        if q:
+            qb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            qb.get_style_context().add_class("quote")
+            qwho = Gtk.Label(); qwho.set_xalign(0.0)
+            qwho.set_markup("<b>%s</b>" % GLib.markup_escape_text(
+                "Admin" if q.get("from") == "admin" else "You"))
+            qwho.get_style_context().add_class("quote-who")
+            qtxt = Gtk.Label(label=(q.get("body") or ("[image]" if q.get("is_image") else "")))
+            qtxt.set_xalign(0.0); qtxt.set_ellipsize(Pango.EllipsizeMode.END)
+            qtxt.set_max_width_chars(28)
+            qb.pack_start(qwho, False, False, 0)
+            qb.pack_start(qtxt, False, False, 0)
+            inner.pack_start(qb, False, False, 0)
+
+        body = m.get("body", "")
+        if body:
+            lbl = Gtk.Label(label=body)
+            lbl.set_line_wrap(True); lbl.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            lbl.set_xalign(0.0); lbl.set_max_width_chars(30)
+            lbl.set_selectable(True)     # let the operator copy an error string out
+            inner.pack_start(lbl, False, False, 0)
+
+        att = m.get("att")
+        if att and os.path.exists(att):
+            im = self._att_image(att)
+            if im is not None:
+                inner.pack_start(im, False, False, 0)
+
+        # Time INSIDE the bubble, bottom-right and dim. This removes the repeated
+        # "You  11:44" line that used to sit under every single message.
+        if last:
+            when = "sending..." if m.get("pending") else ""
+            if not when and m.get("at"):
+                try:
+                    when = time.strftime("%H:%M", time.localtime(float(m["at"])))
+                except Exception:
+                    when = ""
+            if when:
+                tl = Gtk.Label(label=when)
+                tl.set_xalign(1.0)
+                tl.get_style_context().add_class("stamp")
+                inner.pack_start(tl, False, False, 0)
+
+        row.pack_start(inner, False, False, 0)   # the bubble itself
+
+        # Actions on TAP, not hover. A button beside every bubble was the biggest
+        # source of clutter, and a hover reveal is unreachable by touch and proved
+        # unverifiable headlessly - a tap works with a mouse or a finger, and can't
+        # be triggered by accident the way a bare click-to-reply could.
+        eb = Gtk.EventBox()
+        eb.set_visible_window(False)
+        eb.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        eb.add(row)
+        eb.set_tooltip_text("Tap for reply and react")
+
+        def _menu(_w, ev, msg=m, anchor=inner):
+            if ev.type != Gdk.EventType.BUTTON_PRESS:
+                return False
+            pop = Gtk.Popover()
+            pop.set_relative_to(anchor)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            box.set_border_width(5)
+
+            b = Gtk.Button(label="Reply")
+            b.get_style_context().add_class("pop-item")
+            b.connect("clicked", lambda _x: (pop.popdown(), self._set_reply(msg)))
+            box.pack_start(b, False, False, 0)
+
+            mid_ = msg.get("id")
+            if msg.get("sender") != "device" and mid_:
+                r = Gtk.Button(label="React")
+                r.get_style_context().add_class("pop-item")
+                r.connect("clicked",
+                          lambda _x, i=str(mid_): (pop.popdown(), self._react_popover(anchor, i)))
+                box.pack_start(r, False, False, 0)
+
+            pop.add(box)
+            box.show_all()
+            pop.popup()
+            return True
+
+        eb.connect("button-press-event", _menu)
+        wrap.pack_start(eb, False, False, 0)
+
+        if m.get("reaction"):
+            chip = Gtk.Label(label=m["reaction"])
+            chip.get_style_context().add_class("reaction-chip")
+            cw = Gtk.Box(); cw.set_halign(Gtk.Align.END if mine else Gtk.Align.START)
+            cw.pack_start(chip, False, False, 0)
+            wrap.pack_start(cw, False, False, 0)
+
+        return wrap
+
+    def _react_popover(self, _btn, mid):
+        # Tap-to-react: the 8-emoji quick set. Re-tapping the same one clears it
+        # (toggle handled server-side). Written to the outbox; the agent relays it.
+        pop = Gtk.Popover(); pop.set_relative_to(_btn)
+        rowb = Gtk.Box(spacing=2); rowb.get_style_context().add_class("react-row")
+        rowb.set_border_width(4)
+        for e in REACTIONS:
+            b = Gtk.Button(label=e)
+            b.connect("clicked", lambda _w, em=e: (self._send_reaction(mid, em), pop.popdown()))
+            rowb.pack_start(b, False, False, 0)
+        pop.add(rowb); rowb.show_all(); pop.popup()
+
+    def _send_reaction(self, mid, emoji):
+        try:
+            os.makedirs(CHAT_OUTBOX, exist_ok=True)
+            path = os.path.join(CHAT_OUTBOX, "%d-%d.rx.json" % (int(time.time() * 1000), os.getpid()))
+            with open(path, "w") as f:
+                json.dump({"reactTo": mid, "reaction": emoji}, f)
+        except OSError:
+            pass
+
+    def _log_sig(self):
+        st = (0, 0)
+        try:
+            s = os.stat(CHAT_LOG); st = (s.st_mtime, s.st_size)
+        except OSError:
+            pass
+        try:
+            ob = len(os.listdir(CHAT_OUTBOX))
+        except OSError:
+            ob = 0
+        return (st[0], st[1], ob)
+
+    def _near_bottom(self):
+        try:
+            adj = self.scroll.get_vadjustment()
+            return (adj.get_upper() - adj.get_page_size() - adj.get_value()) < 48
+        except Exception:
+            return True
+
+    def _render(self, force_scroll=None):
+        # Auto-scroll only if the user is already at the bottom (force_scroll=True
+        # on send) — never yank them back while they scroll up to read history.
+        stick = self._near_bottom() if force_scroll is None else force_scroll
+        for c in self.list.get_children():
+            self.list.remove(c)
+        msgs = _read_log() + _read_outbox()
+        if not msgs:
+            hint = Gtk.Label()
+            hint.set_markup("<span size='xx-large'>✉</span>\n\n"
+                            "<b>No messages yet</b>\nTell the admin what's happening —\n"
+                            "replies show up right here.")
+            hint.get_style_context().add_class("chat-hint")
+            hint.set_justify(Gtk.Justification.CENTER)
+            self.list.pack_start(hint, True, False, 26)
+        def _at(msg):
+            try:
+                return float(msg.get("at") or 0) or time.time()
+            except Exception:
+                return time.time()
+
+        def _same_run(a, b):
+            """Same side within 4 minutes = one run. Collapsing runs is most of what
+            turns a column of identical boxes into something that reads as a chat."""
+            if a is None or b is None or a.get("sender") != b.get("sender"):
+                return False
+            return abs(_at(b) - _at(a)) <= 240
+
+        prev_day = None
+        for i, m in enumerate(msgs):
+            prev = msgs[i - 1] if i > 0 else None
+            nxt = msgs[i + 1] if i + 1 < len(msgs) else None
+            day = self._day_key(m.get("at"))
+            if day and day != prev_day:
+                self.list.pack_start(self._day_sep(m.get("at")), False, False, 0)
+                prev_day = day
+                prev = None                      # a separator starts a fresh run
+            first = not _same_run(prev, m)
+            last = not _same_run(m, nxt)
+            b = self._bubble(m, first=first, last=last)
+            # Tight inside a run, roomy between runs - the vertical rhythm matters
+            # more to how modern this feels than any single colour choice.
+            b.set_margin_top(9 if first else 1)
+            self.list.pack_start(b, False, False, 0)
+
+        # "Admin is typing…" sits at the end, where the next message will appear.
+        if self._admin_typing():
+            self.list.pack_start(self._typing_row(), False, False, 0)
+
+        self.list.show_all()
+        # _render() also runs during __init__, BEFORE the composer (and reply_bar)
+        # exist — so this must not assume the widget is there. Referencing it
+        # unguarded raised AttributeError and killed the panel on startup.
+        bar = getattr(self, "reply_bar", None)
+        if bar is not None and not getattr(self, "_reply_to", None):
+            bar.hide()
+        self._sig = self._log_sig()
+        if stick:
+            GLib.idle_add(self._scroll_bottom)
+
+    def _typing_row(self):
+        """Animated typing bubble. GTK3 CSS has no keyframes, so cycle the dots from
+        a timeout that stops itself as soon as the widget is gone."""
+        box = Gtk.Box(spacing=0)
+        box.set_halign(Gtk.Align.START)
+        box.set_margin_top(9)
+        holder = Gtk.Box()
+        for c in ("bubble", "them", "typing-bubble"):
+            holder.get_style_context().add_class(c)
+        frames = ["\u2022 \u00b7 \u00b7", "\u00b7 \u2022 \u00b7", "\u00b7 \u00b7 \u2022"]
+        dots = Gtk.Label(label=frames[0])
+        dots.get_style_context().add_class("typing-dots")
+        holder.pack_start(dots, False, False, 0)
+        box.pack_start(holder, False, False, 0)
+        state = {"i": 0}
+
+        def tick():
+            if not dots.get_parent():
+                return False
+            state["i"] = (state["i"] + 1) % 3
+            dots.set_text(frames[state["i"]])
+            return True
+
+        GLib.timeout_add(380, tick)
+        return box
+
+    @staticmethod
+    def _day_key(at):
+        # Pending outbox items deliberately carry at=0 (they have no server time
+        # yet). Treating that literally put them under "Thu 01 Jan" 1970, which is
+        # what appeared on a real device. An unsent message belongs to today.
+        try:
+            t = float(at) or time.time()
+        except Exception:
+            t = time.time()
+        try:
+            return time.strftime("%Y-%m-%d", time.localtime(t))
+        except Exception:
+            return None
+
+    def _day_sep(self, at):
+        """Today / Yesterday / a dated label, so a long history stays navigable."""
+        try:
+            t = float(at) or time.time()
+        except Exception:
+            t = time.time()
+        day = time.strftime("%Y-%m-%d", time.localtime(t))
+        today = time.strftime("%Y-%m-%d", time.localtime())
+        yest = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400))
+        if day == today:
+            text = "Today"
+        elif day == yest:
+            text = "Yesterday"
+        else:
+            text = time.strftime("%a %d %b", time.localtime(t))
+        lbl = Gtk.Label(label=text)
+        lbl.get_style_context().add_class("day-sep")
+        lbl.set_halign(Gtk.Align.CENTER)
+        return lbl
+
+    def _scroll_bottom(self):
+        try:
+            adj = self.scroll.get_vadjustment()
+            adj.set_value(max(0, adj.get_upper() - adj.get_page_size()))
+        except Exception:
+            pass
+        return False
+
+    def _tick(self):
+        if not self.get_visible():
+            return True
+        try:
+            open(CHAT_ACTIVE, "w").close()   # heartbeat -> agent uses the fast chat cadence
+        except OSError:
+            pass
+        _clear_unread()
+        try:                                # stay above RDP if it re-raises itself
+            gw = self.get_window()
+            if gw:
+                gw.raise_()
+        except Exception:
+            pass
+        # Typing is not in the log, so fold it into the change signal — otherwise the
+        # indicator would only appear when a message happened to arrive.
+        typing_now = self._admin_typing()
+        if typing_now != getattr(self, "_typing_shown", False):
+            self._typing_shown = typing_now
+            self._render()
+        if self._log_sig() != self._sig:   # only rebuild when the log changed
+            self._render()
+        return True
+
+    def _on_typing(self, *_):
+        """Heartbeat while the operator types. Rate-limited to once a second: the
+        agent only needs to know 'still typing', not every keystroke."""
+        now = time.time()
+        if now - getattr(self, "_typed_at", 0) < 1.0:
+            return
+        self._typed_at = now
+        try:
+            open(CHAT_TYPING, "w").close()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _admin_typing() -> bool:
+        """True while the agent says an admin is typing. A short window, so a stale
+        file can never leave the indicator stuck on."""
+        try:
+            return (time.time() - os.stat(CHAT_ADMIN_TYPING).st_mtime) < 8
+        except OSError:
+            return False
+
+    def _clear_typing(self):
+        try:
+            os.remove(CHAT_TYPING)
+        except OSError:
+            pass
+        self._typed_at = 0
+
+    def _send(self, *_):
+        body = self.entry.get_text().strip()
+        if not body:
+            return
+        try:
+            os.makedirs(CHAT_OUTBOX, exist_ok=True)
+            if getattr(self, "_reply_to", None):
+                # JSON form so the agent can forward the quote; plain text otherwise,
+                # which keeps older agents working unchanged.
+                path = os.path.join(CHAT_OUTBOX, "%d-%d.json" % (int(time.time() * 1000), os.getpid()))
+                with open(path, "w") as f:
+                    json.dump({"body": body[:2000], "reply_to": self._reply_to.get("id", "")}, f)
+            else:
+                path = os.path.join(CHAT_OUTBOX, "%d-%d.txt" % (int(time.time() * 1000), os.getpid()))
+                with open(path, "w") as f:
+                    f.write(body[:2000])
+        except OSError:
+            pass
+        self.entry.set_text("")
+        self._set_reply(None)
+        self._clear_typing()
+        self._render(force_scroll=True)
+
+    def _att_image(self, path):
+        # Inline thumbnail of a shared image; click to view it full-size.
+        try:
+            pb = GdkPixbuf.Pixbuf.new_from_file(path)
+            w, h = pb.get_width(), pb.get_height()
+            mx = 240
+            if w > mx:
+                pb = pb.scale_simple(mx, max(1, int(h * mx / w)), GdkPixbuf.InterpType.BILINEAR)
+            img = Gtk.Image.new_from_pixbuf(pb)
+            ev = Gtk.EventBox(); ev.add(img)
+            ev.connect("button-press-event", lambda *_a: self._open_image(path))
+            return ev
+        except Exception:
+            return None
+
+    def _open_image(self, path):
+        # Open the shared image full-size in a centered window (click / Esc closes).
+        try:
+            win = Gtk.Window(); win.set_title("Shared image")
+            win.set_position(Gtk.WindowPosition.CENTER); win.set_keep_above(True)
+            disp = Gdk.Display.get_default(); mon = disp.get_primary_monitor() or disp.get_monitor(0)
+            g = mon.get_workarea()
+            pb = GdkPixbuf.Pixbuf.new_from_file(path)
+            w, h = pb.get_width(), pb.get_height()
+            sc = min((g.width * 0.9) / w, (g.height * 0.9) / h, 1.0)
+            if sc < 1.0:
+                pb = pb.scale_simple(int(w * sc), int(h * sc), GdkPixbuf.InterpType.BILINEAR)
+            ev = Gtk.EventBox(); ev.add(Gtk.Image.new_from_pixbuf(pb))
+            ev.connect("button-press-event", lambda *_a: win.destroy())
+            win.add(ev)
+            win.connect("key-press-event", lambda _w, e: win.destroy() if e.keyval == Gdk.KEY_Escape else None)
+            win.show_all()
+        except Exception:
+            pass
+
+    def _send_screenshot(self, *_):
+        # Queue a screenshot request; the agent captures the screen + uploads it.
+        # Hide the panel briefly so the capture shows the operator's screen, not us.
+        cap = self.entry.get_text().strip()
+        try:
+            os.makedirs(CHAT_OUTBOX, exist_ok=True)
+            path = os.path.join(CHAT_OUTBOX, "%d-%d.shot.json" % (int(time.time() * 1000), os.getpid()))
+            with open(path, "w") as f:
+                json.dump({"screenshot": True, "body": cap}, f)
+        except OSError:
+            return
+        self.entry.set_text("")
+        try:
+            self.hide()
+            GLib.timeout_add(3500, lambda: (self.present_chat(), False)[1])
+        except Exception:
+            pass
+
+    def present_chat(self):
+        _clear_unread()
+        try:
+            open(CHAT_ACTIVE, "w").close()   # go fast immediately on open
+        except OSError:
+            pass
+        self.show_all()
+        self._place()
+        try:                       # ride above the RDP session (override-redirect)
+            gw = self.get_window()
+            if gw:
+                gw.raise_()
+        except Exception:
+            pass
+        self.entry.grab_focus()
+        self._grab_kbd()           # make the reply box typeable over fullscreen RDP
+        self._render(force_scroll=True)   # open shows the latest message
+
+
+# --------------------------------------------------------------------------- #
+#  The persistent floating launcher bubble (bottom-right, over everything)
+# --------------------------------------------------------------------------- #
+class Launcher:
+    SIZE = 60
+    MARGIN = 22
+
+    def __init__(self):
+        self.win = None
+        self.unread = _unread_count()
+        self._drag = None        # (start_root_x, start_root_y, win_x, win_y)
+        self._dragging = False
+        self._pulse = 0.0        # 0..1 attention-flash phase while unread (0 = idle)
+        self._pos = None         # cached target (x, y); avoids a disk read each tick
+        # POPUP = override-redirect: the WM never restacks it, so it floats above
+        # EVERYTHING - the maximized home screen AND the full-screen RDP session -
+        # without ever taking input focus (proven: keep-above/maximize can't beat
+        # a fullscreen RDP window, override-redirect can). A periodic raise keeps
+        # it on top when a new window maps.
+        self.b = Gtk.Window(type=Gtk.WindowType.POPUP)
+        _float_window(self.b)
+        self.b.get_style_context().add_class("launcher")
+        self.b.set_size_request(self.SIZE, self.SIZE)
+        self.da = None
+        self._fab = None
+
+        # press/motion/release distinguish a click (open chat) from a drag
+        # (reposition anywhere). The handlers go on the widget that OWNS the
+        # top-most window under the cursor, so events are actually delivered.
+        _M = (Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
+              | Gdk.EventMask.POINTER_MOTION_MASK)
+        if HAVE_CAIRO:
+            # Premium path: a shaped, gradient, round bubble drawn with Cairo.
+            self.b.set_app_paintable(True)
+            self._rgba(self.b)
+            self.da = Gtk.DrawingArea(); self.da.set_size_request(self.SIZE, self.SIZE)
+            self.da.add_events(_M)
+            self.da.connect("draw", self._draw)
+            self.da.connect("button-press-event", self._on_press)
+            self.da.connect("motion-notify-event", self._on_motion)
+            self.da.connect("button-release-event", self._on_release)
+            self.b.add(self.da)
+            self.b.connect("realize", lambda *_: (self._place(), self._shape()))
+        else:
+            # Fallback (no pycairo): a solid accent tile (EventBox paints the
+            # gradient + receives events) with a centered white glyph + badge.
+            eb = Gtk.EventBox(); eb.get_style_context().add_class("fab-tile")
+            eb.add_events(_M)
+            eb.connect("button-press-event", self._on_press)
+            eb.connect("motion-notify-event", self._on_motion)
+            eb.connect("button-release-event", self._on_release)
+            ov = Gtk.Overlay()
+            glyph = Gtk.Label(); glyph.set_markup("<span foreground='#ffffff' size='xx-large'>✉</span>")
+            ov.add(glyph)
+            self._fab = Gtk.Label(); self._fab.set_use_markup(True)
+            self._fab.get_style_context().add_class("fab-badge")
+            self._fab.set_halign(Gtk.Align.END); self._fab.set_valign(Gtk.Align.START)
+            self._fab.set_no_show_all(True)
+            ov.add_overlay(self._fab)
+            eb.add(ov)
+            self.b.add(eb)
+            self.b.connect("realize", lambda *_: self._place())
+            self._update_fab()
+            # If pycairo gets installed later (the agent pulls it best-effort),
+            # hot-swap into the shaped round-bubble path with no reboot.
+            GLib.timeout_add_seconds(20, self._maybe_upgrade)
+        self.b.show_all()
+        self._place()
+        GLib.timeout_add(1000, self._tick)
+        GLib.timeout_add(70, self._pulse_tick)   # smooth attention flash while unread
+
+    def _maybe_upgrade(self):
+        # Fallback path only: detect a freshly-installed pycairo and re-exec into
+        # the shaped round-bubble path. The single-instance lock fd is close-on-exec
+        # (Python 3 default), so it releases and the new process re-acquires it.
+        try:
+            import importlib
+            importlib.import_module("cairo")
+        except Exception:
+            return True   # not available yet; keep polling
+        try:
+            os.execv(sys.executable, [sys.executable] + sys.argv)  # does not return
+        except Exception:
+            return True
+        return False
+
+    def _update_fab(self):
+        if self._fab is None:
+            return
+        if self.unread:
+            self._fab.set_markup("<b>%s</b>" % (self.unread if self.unread < 10 else "9+"))
+            self._fab.show()
+        else:
+            self._fab.hide()
+
+    def _rgba(self, w):
+        try:
+            vis = w.get_screen().get_rgba_visual()
+            if vis:
+                w.set_visual(vis)
+        except Exception:
+            pass
+
+    def _workarea(self):
+        disp = Gdk.Display.get_default()
+        mon = disp.get_primary_monitor() or disp.get_monitor(0)
+        return mon.get_workarea()
+
+    def _clamp(self, x, y):
+        try:
+            g = self._workarea()
+            x = max(g.x, min(x, g.x + g.width - self.SIZE))
+            y = max(g.y, min(y, g.y + g.height - self.SIZE))
+        except Exception:
+            pass
+        return x, y
+
+    def _target_pos(self):
+        # Cached parked position: read the saved file ONCE (not every tick), else
+        # default to the bottom-right corner. Updated in-place on drop.
+        if self._pos is None:
+            try:
+                p = _read_pos()
+                if p:
+                    self._pos = self._clamp(p[0], p[1])
+                else:
+                    g = self._workarea()
+                    self._pos = (g.x + g.width - self.SIZE - self.MARGIN,
+                                 g.y + g.height - self.SIZE - self.MARGIN)
+            except Exception:
+                self._pos = (0, 0)
+        return self._pos
+
+    def _place(self):
+        try:
+            self.b.move(*self._target_pos())
+        except Exception:
+            pass
+
+    def _shape(self):
+        # Clip the window to a circle so its corners show whatever is behind
+        # (the RDP session) even without a compositor (X-Shape extension).
+        try:
+            s = cairo.ImageSurface(cairo.FORMAT_A1, self.SIZE, self.SIZE)
+            cr = cairo.Context(s)
+            cr.arc(self.SIZE / 2.0, self.SIZE / 2.0, self.SIZE / 2.0, 0, 2 * math.pi); cr.fill()
+            region = Gdk.cairo_region_create_from_surface(s)
+            gw = self.b.get_window()
+            if gw:
+                gw.shape_combine_region(region, 0, 0)
+        except Exception:
+            pass
+
+    def _draw(self, _w, cr):
+        sz = self.SIZE
+        cr.set_operator(cairo.OPERATOR_CLEAR); cr.paint(); cr.set_operator(cairo.OPERATOR_OVER)
+        # accent circle (diagonal gradient)
+        grad = cairo.LinearGradient(0, 0, sz, sz)
+        grad.add_color_stop_rgb(0, C_A1[0] / 255, C_A1[1] / 255, C_A1[2] / 255)
+        grad.add_color_stop_rgb(1, C_A2[0] / 255, C_A2[1] / 255, C_A2[2] / 255)
+        cr.arc(sz / 2.0, sz / 2.0, sz / 2.0 - 1, 0, 2 * math.pi)
+        cr.set_source(grad); cr.fill()
+        # soft top highlight for depth
+        cr.arc(sz / 2.0, sz / 2.0, sz / 2.0 - 1, math.pi, 2 * math.pi)
+        cr.set_source_rgba(1, 1, 1, 0.10); cr.fill()
+        # crisp hairline ring so the bubble reads on any background
+        cr.set_line_width(1.4); cr.set_source_rgba(1, 1, 1, 0.28)
+        cr.arc(sz / 2.0, sz / 2.0, sz / 2.0 - 1.4, 0, 2 * math.pi); cr.stroke()
+        # attention ripple while unread — a bright ring travelling inward (stays
+        # inside the circular X-Shape so it shows without a compositor)
+        if self.unread and self._pulse > 0:
+            p = self._pulse
+            cr.set_line_width(2.2); cr.set_source_rgba(1, 1, 1, 0.55 * (1.0 - p))
+            cr.arc(sz / 2.0, sz / 2.0, (sz / 2.0 - 2.0) - p * 7.0, 0, 2 * math.pi); cr.stroke()
+        # white speech-bubble glyph
+        cr.set_source_rgb(1, 1, 1)
+        self._speech(cr, sz / 2.0, sz / 2.0 - 1, sz * 0.42)
+        # unread badge (top-right) with a white ring so it pops off the accent
+        if self.unread:
+            bx, by, br = sz - 12, 12, 10
+            cr.set_source_rgb(1, 1, 1); cr.arc(bx, by, br + 1.6, 0, 2 * math.pi); cr.fill()
+            cr.set_source_rgb(C_BADGE[0] / 255, C_BADGE[1] / 255, C_BADGE[2] / 255)
+            cr.arc(bx, by, br, 0, 2 * math.pi); cr.fill()
+            cr.set_source_rgb(1, 1, 1)
+            cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            cr.set_font_size(12)
+            txt = str(self.unread) if self.unread < 10 else "9+"
+            ext = cr.text_extents(txt)
+            cr.move_to(bx - ext.width / 2 - ext.x_bearing, by - ext.height / 2 - ext.y_bearing)
+            cr.show_text(txt)
+        return False
+
+    def _speech(self, cr, cx, cy, w):
+        h = w * 0.74; x = cx - w / 2.0; y = cy - h / 2.0; r = w * 0.24
+        cr.new_sub_path()
+        cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+        cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+        cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+        cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+        cr.close_path(); cr.fill()
+        # little tail bottom-left
+        cr.move_to(x + w * 0.30, y + h - 1)
+        cr.line_to(x + w * 0.12, y + h + h * 0.26)
+        cr.line_to(x + w * 0.52, y + h - 1)
+        cr.close_path(); cr.fill()
+
+    def _on_press(self, _w, ev):
+        if ev.button != 1:
+            return False
+        wx, wy = self.b.get_position()
+        self._drag = (ev.x_root, ev.y_root, wx, wy)
+        self._dragging = False
+        return True
+
+    def _on_motion(self, _w, ev):
+        if not self._drag:
+            return False
+        dx = ev.x_root - self._drag[0]; dy = ev.y_root - self._drag[1]
+        if not self._dragging and math.hypot(dx, dy) < 6:
+            return False   # below threshold — still a click, not a drag
+        self._dragging = True
+        nx, ny = self._clamp(int(self._drag[2] + dx), int(self._drag[3] + dy))
+        self.b.move(nx, ny)
+        return True
+
+    def _on_release(self, _w, ev):
+        if ev.button != 1 or self._drag is None:
+            return False
+        was_drag = self._dragging
+        self._drag = None; self._dragging = False
+        if was_drag:
+            x, y = self.b.get_position()
+            self._pos = self._clamp(x, y)
+            _save_pos(*self._pos)
+        else:
+            self._toggle()   # a real click — open/close the panel
+        return True
+
+    def _toggle(self):
+        if self.win is None:
+            self.win = ChatWindow(on_close=self._redraw)
+        if self.win.get_visible():
+            self.win._close()
+        else:
+            self.win.present_chat()
+        self._redraw()
+
+    def _open(self):
+        if self.win is None:
+            self.win = ChatWindow(on_close=self._redraw)
+        self.win.present_chat()
+        self._redraw()
+
+    def _redraw(self):
+        self.unread = _unread_count()
+        if self.da is not None:
+            self.da.queue_draw()
+        else:
+            self._update_fab()
+
+    def _pulse_tick(self):
+        # Flash for attention while there ARE unread admin messages and the panel
+        # is closed. Idle (unread cleared or panel open) -> settle back to steady.
+        active = self.unread and not (self.win is not None and self.win.get_visible())
+        if not active:
+            if self._pulse != 0.0:
+                self._pulse = 0.0
+                if self.da is not None:
+                    self.da.queue_draw()
+                else:
+                    self._update_fab()
+            return True
+        self._pulse = (self._pulse + 0.06) % 1.0
+        if self.da is not None:
+            self.da.queue_draw()          # cairo: draws an inward ripple (see _draw)
+        elif self._fab is not None:       # fallback: blink the count badge
+            if self._pulse < 0.5:
+                self._fab.set_markup("<b>%s</b>" % (self.unread if self.unread < 10 else "9+"))
+                self._fab.show()
+            else:
+                self._fab.hide()
+        return True
+
+    def _ensure_visible(self):
+        # Self-heal: keep the override-redirect bubble mapped + raised above any
+        # window that mapped over it (e.g. the RDP session starting). Only MOVE it
+        # when it has actually drifted from its parked spot (no per-tick disk read
+        # or redundant move). While the screen is LOCKED, hide it entirely — an
+        # override-redirect window would otherwise float over the lock screen.
+        try:
+            if os.path.exists(LOCK_SIGNAL):
+                if self.b.get_visible():
+                    self.b.hide()
+                if self.win is not None and self.win.get_visible():
+                    self.win._ungrab_kbd()   # release the keyboard so the LOCK can grab it
+                    self.win.hide()
+                return
+            if not self.b.get_visible():
+                self.b.show_all()
+            gw = self.b.get_window()
+            if gw:
+                gw.raise_()
+            if not self._dragging:
+                tgt = self._target_pos()
+                if tuple(self.b.get_position()) != tuple(tgt):
+                    self.b.move(*tgt)
+        except Exception:
+            pass
+
+    def _tick(self):
+        self._ensure_visible()
+        if os.path.exists(LOCK_SIGNAL):        # never open chat over the lock screen
+            return True
+        trigger = False
+        if os.path.exists(CHAT_OPEN):          # explicit open (hotkey / --open)
+            try: os.remove(CHAT_OPEN)
+            except OSError: pass
+            trigger = True
+        # A NEW inbound admin message POPS the chat open (not just a flashing bubble)
+        # so the operator can't miss it. Only on an INCREASE — never on startup with
+        # pre-existing unread, and (guarded above) never over the lock screen; unread
+        # that piled up while locked opens the panel on unlock. _open()->present_chat()
+        # clears the unread count, so it won't reopen until the next message arrives.
+        cur = _unread_count()
+        already = self.win is not None and self.win.get_visible()
+        if trigger or (cur > self.unread and not already):
+            self._open()                       # pop the panel (explicit or new message)
+        elif cur != self.unread:               # count changed while open/cleared -> refresh badge
+            self._redraw()
+        return True
+
+
+def main():
+    if "--open" in sys.argv[1:]:
+        # Poke the running launcher to open (or, if none, fall through to run one).
+        try:
+            os.makedirs("/run/thinclient", exist_ok=True)
+            open(CHAT_OPEN, "w").close()
+        except OSError:
+            pass
+        try:
+            fd = os.open(LOCK, os.O_CREAT | os.O_RDWR, 0o644)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)
+        except (OSError, IOError):
+            return  # launcher is running; it will pick up the trigger
+        # No launcher running -> fall through and start one (it consumes the trigger).
+
+    # Single instance for the persistent launcher.
+    try:
+        fd = os.open(LOCK, os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, IOError):
+        return  # already running
+
+    _install_css()
+    Launcher()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

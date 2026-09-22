@@ -10,7 +10,7 @@
 #  rolls back on failure.
 # =============================================================================
 [Unit]
-Description=Esparks ThinClient update apply
+Description=Thin Client update apply
 Documentation=file:/opt/thinclient/docs/UPDATES.md
 
 [Service]

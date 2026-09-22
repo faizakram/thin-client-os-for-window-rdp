@@ -38,12 +38,42 @@ PENDING="${STATE_DIR}/pending"     # world-readable flag the connect window poll
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 
 # --- Single instance ---------------------------------------------------------
+# The check and the apply share this lock. A CHECK may bail cheaply if anything
+# else holds it (the 6-hour timer or the next poll simply retriggers it). But an
+# APPLY must NOT silently no-op just because a short check happens to be mid-flight
+# — that raced at EVERY boot (the connect window auto-applies while the agent, on
+# seeing a newer release, kicks a check at the same instant), so a forced/boot
+# apply kept exiting "another run in progress" and the device stayed on its old
+# version. So an apply WAITS for the lock (a check releases it in ~2s) instead.
 exec 8>"${STATE_DIR}/.lock" 2>/dev/null || true
-flock -n 8 || { log_info "update: another run in progress"; exit 0; }
+if [[ "$MODE" == "apply" ]]; then
+  flock -w 300 8 || { log_info "update: apply timed out waiting for the update lock"; exit 0; }
+else
+  flock -n 8 || { log_info "update: another run in progress"; exit 0; }
+fi
 
-die()  { log_error "update: $*"; exit 1; }
+# Record the OUTCOME of an update attempt where the agent can read it and report it.
+# Until now the updater logged only to the device's own log, so a fleet stuck mid-
+# update showed a spinner on the dashboard and nothing else: no attempt, no reason, no
+# error text. Every failure funnels through die(), so recording it here catches them
+# all — bad signature, sha mismatch, download failure, failed health check.
+UPD_STATE="/var/lib/thinclient/update-last"
+upd_state() {   # $1 = ok|failed|rolled_back   $2 = message
+  local msg="${2//$'\n'/ }"
+  { printf 'at=%s\nversion=%s\nresult=%s\nmessage=%s\n' \
+      "$(date -u +%s)" "${new_ver:-}" "$1" "${msg:0:200}"; } >"$UPD_STATE" 2>/dev/null || true
+  chmod 0644 "$UPD_STATE" 2>/dev/null || true
+}
+
+die()  { upd_state failed "$*"; log_error "update: $*"; exit 1; }
 skip() { log_info "update: $*"; exit 0; }
 clear_pending() { rm -f "$PENDING" 2>/dev/null || true; }
+# Deterministic pre-swap failure (a genuinely BAD bundle: sha mismatch, corrupt
+# archive, missing/invalid files). Blocklist the version + clear the pending flag
+# so --check skips it and the connect window stops offering it — otherwise the
+# same broken release is re-downloaded and re-applied on every tick forever.
+# (Transient failures like a network download error keep using plain die/retry.)
+blocklist_die() { echo "$new_ver" >>"$BLOCKED" 2>/dev/null || true; clear_pending; die "$*"; }
 stage_pending() { # $1 = version
   printf 'version=%s\n' "$1" > "$PENDING" 2>/dev/null || true
   chmod 0644 "$PENDING" 2>/dev/null || true
@@ -97,7 +127,14 @@ fi
 [[ "$rollout" =~ ^[0-9]+$ ]] || rollout=100
 mid="$(cat /etc/machine-id 2>/dev/null || hostname)"
 bucket=$(( 0x$(printf '%s%s' "$mid" "$new_ver" | sha256sum | cut -c1-4) % 100 ))
-if (( bucket >= rollout )); then
+# An admin FORCE (the agent drops this marker on a manager "Force update") installs
+# REGARDLESS of the rollout wave — so a manual push ALWAYS works, even at rollout=0
+# (which is exactly how the admin keeps auto-updates off while still pushing to
+# chosen machines). Detect it HERE, before the rollout gate, or the gate would skip
+# a forced update before it was ever considered.
+FORCE_MARK="/run/thinclient/update-force"
+forced=0; [[ -e "$FORCE_MARK" ]] && forced=1
+if (( ! forced )) && (( bucket >= rollout )); then
   clear_pending; skip "not in this rollout wave yet (bucket ${bucket} >= rollout ${rollout}%)"
 fi
 
@@ -105,31 +142,57 @@ fi
 #  A valid, newer, allowed update exists.
 # ============================================================================
 if [[ "$MODE" == "check" ]]; then
-  # Do NOT install. Flag it so the connect window can prompt the user.
+  # Flag it either way, so the connect window can still offer it to the operator.
   stage_pending "$new_ver"
+  # AUTO-APPLY (UPDATE_AUTO, default on): a device that is online and in this
+  # release's rollout wave installs by itself — nobody should have to click Update on
+  # every machine to get a fleet onto a current build. The rollout wave is still what
+  # decides eligibility, so a canary published at ROLLOUT=0 is NOT auto-pushed.
+  #
+  # This hands off to --apply rather than installing here, which is deliberate: apply
+  # already refuses to interrupt a live RDP session (only an admin's explicit force
+  # does that), so an operator mid-session is never yanked — the update lands on a
+  # later tick, at the next boot, or from the operator's own prompt. The staged flag
+  # above is what keeps that prompt available in the meantime.
+  if [[ "$(tc_bool "$(conf_get UPDATE_AUTO true)")" == "true" ]]; then
+    log_info "update: v${new_ver} available and in this device's wave — applying automatically"
+    systemctl start --no-block thinclient-update-apply.service 2>/dev/null \
+      || log_info "update: could not start the apply service; the timer/prompt will retry"
+    skip "v${new_ver} handed to the apply service (installed ${cur_ver})"
+  fi
   skip "v${new_ver} available — staged for user prompt (installed ${cur_ver})"
 fi
 
 # -------------------------- MODE == apply -----------------------------------
-# Never interrupt an active RDP session — try again next tick / next boot.
-if pgrep -x xfreerdp3 >/dev/null 2>&1 || pgrep -x xfreerdp >/dev/null 2>&1; then
+# Never interrupt an active RDP session — try again next tick / next boot. EXCEPT
+# when an admin explicitly FORCED the update (agent drops /run/thinclient/update-force):
+# forcing means "install now even mid-session" — the session is interrupted and
+# reconnects (the Windows session persists server-side). Consume the marker so a
+# later routine apply still defers normally.
+if (( forced )); then
+  rm -f "$FORCE_MARK"
+  log_info "update: admin-forced — applying regardless of rollout wave / active session"
+elif pgrep -x xfreerdp3 >/dev/null 2>&1 || pgrep -x xfreerdp >/dev/null 2>&1; then
   skip "an RDP session is active; deferring apply"
 fi
 log_info "update: applying ${cur_ver} -> ${new_ver} (rollout ${rollout}%, bucket ${bucket})"
 
 # --- Download + verify the bundle -------------------------------------------
+# Download failure is TRANSIENT (network) -> plain die, retry next tick.
 fetch "${URL}/${bundle}" "${tmp}/${bundle}" || die "bundle download failed"
-echo "${want_sha}  ${tmp}/${bundle}" | sha256sum -c - >/dev/null 2>&1 || die "bundle sha256 mismatch — refusing"
+# Everything below is DETERMINISTIC: a bundle that fails these will fail forever,
+# so blocklist the version instead of re-downloading + re-applying it every tick.
+echo "${want_sha}  ${tmp}/${bundle}" | sha256sum -c - >/dev/null 2>&1 || blocklist_die "bundle sha256 mismatch — refusing"
 
 # --- Stage + validate --------------------------------------------------------
 stage="${RELEASES_DIR}/${new_ver}"
 rm -rf "$stage"; mkdir -p "$stage"
-tar -xzf "${tmp}/${bundle}" -C "$stage" || die "extract failed"
+tar -xzf "${tmp}/${bundle}" -C "$stage" || blocklist_die "extract failed"
 [[ -x "${stage}/bin/thinclient-connect" && -f "${stage}/lib/thinclient-common.sh" ]] \
-  || die "bundle missing expected files"
+  || blocklist_die "bundle missing expected files"
 for s in "${stage}"/bin/*; do
-  head -1 "$s" | grep -q 'python3' && { python3 -m py_compile "$s" 2>/dev/null || die "bad python in $s"; } && continue
-  head -1 "$s" | grep -qE 'sh|bash' && { bash -n "$s" 2>/dev/null || die "bad shell in $s"; }
+  head -1 "$s" | grep -q 'python3' && { python3 -m py_compile "$s" 2>/dev/null || blocklist_die "bad python in $s"; } && continue
+  head -1 "$s" | grep -qE 'sh|bash' && { bash -n "$s" 2>/dev/null || blocklist_die "bad shell in $s"; }
 done
 printf '%s\n' "$new_ver" > "${stage}/VERSION"
 
@@ -138,6 +201,9 @@ prev_target="$(readlink -f /opt/thinclient 2>/dev/null)"
 ln -sfn "$stage" "${RELEASES_DIR}/.next" && mv -Tf "${RELEASES_DIR}/.next" /opt/thinclient
 chmod 0755 /opt/thinclient/bin/* 2>/dev/null || true
 clear_pending   # the offer has been acted on
+# Restart the agent so the NEW code takes effect immediately (e.g. its one-time
+# session hardening) without waiting for a second reboot.
+systemctl restart thinclient-agent.service 2>/dev/null || true
 log_info "update: applied ${new_ver}; restarting session"
 systemctl restart lightdm 2>/dev/null || true
 
@@ -151,10 +217,12 @@ ok=0
 for _ in $(seq 1 30); do sleep 3; healthy && { ok=1; break; }; done
 
 if (( ok == 1 )); then
+  upd_state ok "installed ${new_ver}"
   log_info "update: ${new_ver} healthy — committed"
   ls -1dt "${RELEASES_DIR}"/*/ 2>/dev/null | tail -n +3 | xargs -r rm -rf
-  { echo "product=Esparks IT Solutions — Thin Client"; echo "version=${new_ver}"; } >/etc/thinclient/build-info 2>/dev/null || true
+  { echo "product=Thin Client"; echo "version=${new_ver}"; } >/etc/thinclient/build-info 2>/dev/null || true
 else
+  upd_state rolled_back "session did not come back after 90s; rolled back to ${prev_target##*/}"
   log_error "update: ${new_ver} FAILED health check — rolling back to ${prev_target}"
   [[ -n "$prev_target" ]] && ln -sfn "$prev_target" "${RELEASES_DIR}/.next" && mv -Tf "${RELEASES_DIR}/.next" /opt/thinclient
   echo "$new_ver" >>"$BLOCKED"

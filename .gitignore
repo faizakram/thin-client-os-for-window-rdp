@@ -17,3 +17,8 @@ update-signing-key.pem
 
 # OTA release bundles produced by make-update-bundle.sh
 dist/
+tmp/*
+
+# Python bytecode — build output, never source.
+__pycache__/
+*.pyc

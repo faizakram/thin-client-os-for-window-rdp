@@ -6,6 +6,13 @@ iputils-ping
 netcat-openbsd
 wireless-tools
 wpasupplicant
+# --- Mobile / USB tethering (phone-as-modem over a cable) ---------------------
+# iPhone USB Personal Hotspot needs usbmuxd (the pairing daemon) + the
+# libimobiledevice tools; the in-tree ipheth module + NetworkManager auto-DHCP do
+# the rest (tap "Trust" on the phone, no thin-client typing). Android RNDIS/USB
+# tethering and USB LTE dongles (ModemManager + usb_modeswitch) already work.
+usbmuxd
+libimobiledevice-utils
 # --- Audio stack (PipeWire with PulseAudio compat for FreeRDP redirection) ---
 pipewire
 pipewire-pulse
@@ -16,3 +23,7 @@ libspa-0.2-bluetooth
 usbutils
 libusb-1.0-0
 v4l-utils
+
+# --- Media capture / encoding (screen + camera + mic recording -> storage) ---
+ffmpeg
+pipewire-alsa

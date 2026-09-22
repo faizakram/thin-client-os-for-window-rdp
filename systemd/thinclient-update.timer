@@ -6,7 +6,7 @@
 #  the fleet so a release wave doesn't hit GitHub (or your session) all at once.
 # =============================================================================
 [Unit]
-Description=Esparks ThinClient update schedule
+Description=Thin Client update schedule
 
 [Timer]
 OnBootSec=2min

@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  ThinClient OS — auto-select a USB headset as the default audio device
+#  Installed to: /opt/thinclient/bin/thinclient-audio-default
+#
+#  When a USB headset is connected, make it the default PipeWire SINK (speaker)
+#  AND SOURCE (microphone) so the RDP session's audio out + mic both use it.
+#  WirePlumber then moves the already-connected FreeRDP audio streams onto it, so
+#  it takes effect even mid-call. When the headset is unplugged, PipeWire falls
+#  back to the built-in device on its own.
+#
+#  Triggered by:
+#    * udev on USB sound-card add — /etc/udev/rules.d/89-thinclient-audio.rules
+#      (installed by thinclient-firstboot). udev runs as root, so we re-exec as
+#      the kiosk user to reach that user's PipeWire graph.
+#    * thinclient-xsession once at session start (already the kiosk user), to
+#      pick up a headset that was already plugged in at boot.
+#
+#  Uses ONLY wpctl (WirePlumber), which is always present — so it ships by OTA
+#  with no extra package.
+# =============================================================================
+set -uo pipefail
+
+SESSION_USER="$(sed -n 's/^SESSION_USER=//p' /etc/thinclient/server.conf 2>/dev/null | head -1)"
+SESSION_USER="${SESSION_USER:-thinclient}"
+
+# root/udev context has no PipeWire session — re-exec as the kiosk user with its
+# runtime dir so wpctl talks to that user's graph.
+if [ "$(id -un)" != "$SESSION_USER" ]; then
+  uid="$(id -u "$SESSION_USER" 2>/dev/null)" || exit 0
+  [ -S "/run/user/${uid}/pipewire-0" ] || sleep 2      # give the session a beat
+  exec sudo -n -u "$SESSION_USER" \
+      XDG_RUNTIME_DIR="/run/user/${uid}" \
+      DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${uid}/bus" \
+      /opt/thinclient/bin/thinclient-audio-default
+fi
+
+command -v wpctl >/dev/null 2>&1 || exit 0
+sleep 1   # let PipeWire enumerate a just-plugged device
+
+# Pick the default sink/source by WHAT THE DEVICE IS (a USB audio node), NOT by its
+# friendly name. The old approach matched only "USB / Headset / Headphone" in the
+# description, so an oddly-named headset like "Jabra EVOLVE LINK" was never routed
+# and the operator heard nothing. We now list every sink/source node id and inspect
+# it: a USB audio device is identified by device.bus=usb or a "usb" node.name (the
+# ALSA path always carries it). A real headset is preferred over e.g. a webcam mic.
+
+# List the node ids under a `wpctl status` section (Sinks: / Sources:).
+list_ids() {   # $1 = section keyword
+  wpctl status 2>/dev/null | awk -v sec="$1:" '
+    index($0, sec) { grab=1; next }
+    /Sinks:|Sources:|Filters:|Streams:|Devices:|Clients:|Video|Settings/ { grab=0 }
+    grab && match($0, /[0-9]+\./) { print substr($0, RSTART, RLENGTH-1) }'
+}
+is_usb_audio() {   # $1 = node id
+  wpctl inspect "$1" 2>/dev/null | grep -qiE \
+    'device\.bus = "usb"|node\.name = "[^"]*usb|alsa\.card_name = "[^"]*(usb|jabra|evolve|plantron|poly|sennheiser|epos|dsea|logitech|headset|edge|hyperx|corsair)'
+}
+# Branded-headset match is only a FALLBACK — the reliable signal is structural (a
+# headset's mic + speaker share one USB device; a webcam has a mic but no speaker).
+is_headset() {     # $1 = node id
+  wpctl inspect "$1" 2>/dev/null | grep -qiE \
+    'jabra|evolve|plantron|poly|sennheiser|epos|dsea|headset|hands.?free|hyperx|corsair|steelseries|razer|earphone|earbud'
+}
+# The ALSA card token a device's sink AND source share, e.g.
+# "usb-DSEA_A_S__EPOS_PC_8_USB-00" — lets us pair a mic to its own speaker.
+card_token() {     # $1 = node id
+  wpctl inspect "$1" 2>/dev/null \
+    | sed -n 's/.*node\.name = "alsa_\(output\|input\)\.\([^"]*\)".*/\2/p' \
+    | sed -E 's/\.(analog|mono|stereo|iec958|hdmi|pro)[^"]*$//' | head -1
+}
+name_of() {        # $1 = node id -> human name (for the log line)
+  wpctl inspect "$1" 2>/dev/null | sed -n 's/.*node\.description = "\([^"]*\)".*/\1/p' | head -1
+}
+first_usb() {      # $1 = ids -> first USB audio node
+  for id in $1; do is_usb_audio "$id" && { printf '%s' "$id"; return; }; done
+}
+src_on_card() {    # $1 = source ids, $2 = card token -> the source on that card
+  [ -n "$2" ] || return
+  for id in $1; do [ "$(card_token "$id")" = "$2" ] && { printf '%s' "$id"; return; }; done
+}
+
+sinks="$(list_ids Sinks)"
+sources="$(list_ids Sources)"
+
+# Speaker: the USB sink (a USB headset/speaker; a webcam has none).
+sink_id="$(first_usb "$sinks")"
+
+# Mic: the source on the SAME physical device as that speaker — the headset's OWN
+# mic, never a webcam mic that merely happens to be USB. Only if that can't be
+# paired do we accept a branded USB headset source (a rare mic-only USB headset);
+# we NEVER fall through to an arbitrary USB source (that is how a webcam won before).
+src_id="$(src_on_card "$sources" "$(card_token "$sink_id")")"
+if [ -z "$src_id" ]; then
+  for id in $sources; do
+    is_usb_audio "$id" && is_headset "$id" && { src_id="$id"; break; }
+  done
+fi
+
+changed=0
+[ -n "${sink_id:-}" ] && wpctl set-default "$sink_id" 2>/dev/null && changed=1
+[ -n "${src_id:-}"  ] && wpctl set-default "$src_id"  2>/dev/null && changed=1
+
+logger -t thinclient-audio \
+  "headset routing: sink=${sink_id:-none}[$(name_of "${sink_id:-}")] source=${src_id:-none}[$(name_of "${src_id:-}")] changed=${changed}" \
+  2>/dev/null || true
+exit 0

@@ -1,0 +1,87 @@
+#!/bin/sh
+# =============================================================================
+#  Out-of-tree USB WiFi drivers: Realtek 88XXau family (RTL8811AU / RTL8812AU /
+#  RTL8814AU / RTL8821AU) — the TP-Link Archer T2U / T2U Nano and most cheap
+#  "AC600 / 600 Mbps" USB dongles. These chips are NOT in the mainline kernel
+#  (Debian dropped the DKMS package), so we compile the maintained morrownr
+#  sources against THIS ISO's kernel and drop the .ko into updates/ (udev
+#  auto-loads by USB modalias). Modules: 8821au.ko (8811AU/8821AU) and
+#  8812au.ko (8812AU/8814AU).
+#
+#  Already covered IN-TREE (no build needed):
+#    * TP-Link TL-WN725N            RTL8188EUS  -> r8188eu / rtl8xxxu
+#    * TP-Link Nano AC1300 / T3U     RTL8812BU   -> rtw88_8822bu
+#
+#  KERNEL API NOTE: morrownr's source already carries the new cfg80211
+#  set_monitor_channel() signature (gains `struct net_device *dev`), but gates
+#  it behind KERNEL_VERSION(6,13,0). Debian BACKPORTED that change into the
+#  trixie-security 6.12.101 kernel we ship, so the guard is wrong for us and the
+#  build fails with an "incompatible pointer type" error. We surgically lower
+#  ONLY that one guard (anchored to the set_monitor_channel signature so no
+#  other callback is touched) to KERNEL_VERSION(6,12,0). Re-verify this when the
+#  security kernel jumps to a new upstream base.
+#
+#  Everything is logged to /var/log/thinclient/usb-wifi-build.log INSIDE the
+#  image (extractable from the squashfs) so a failure is diagnosable. Always
+#  exits 0 so a build issue never breaks the ISO — verify the .ko landed after.
+# =============================================================================
+mkdir -p /var/log/thinclient
+exec >>/var/log/thinclient/usb-wifi-build.log 2>&1
+echo "=================== usb-wifi hook START ==================="
+set -x
+
+KVER="$(ls /lib/modules 2>/dev/null | sort -V | tail -1)"
+getent hosts github.com || echo "WARN: no DNS for github.com"
+apt-get install -y --no-install-recommends \
+    linux-headers-amd64 build-essential bc git ca-certificates perl
+echo "apt-install exit=$?"
+command -v git; command -v make; command -v gcc; command -v perl
+ls -ld "/lib/modules/${KVER}/build"
+mkdir -p "/lib/modules/${KVER}/updates"
+
+# Lower the 6.13.0 guard that wraps set_monitor_channel's net_device param down
+# to 6.12.0 (Debian backported the API into 6.12.101). Anchored to the function
+# signature so it only touches this one callback.
+patch_monitor_guard() {
+    perl -0777 -i -pe \
+      's/(cfg80211_rtw_set_monitor_channel\(struct wiphy \*wiphy\n)#if \(LINUX_VERSION_CODE >= KERNEL_VERSION\(6, 13, 0\)\)/${1}#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0))/' \
+      "$1/os_dep/linux/ioctl_cfg80211.c"
+}
+
+# Build one morrownr driver repo in isolation; a failure here never aborts the
+# hook (set +e around it) so a second driver still gets its chance.
+build_driver() {
+    repo="$1"; name="$2"
+    echo "----- building ${name} from ${repo} -----"
+    d="$(mktemp -d)"
+    if git clone --depth 1 "https://github.com/morrownr/${repo}" "$d"; then
+        patch_monitor_guard "$d"
+        grep -n "KERNEL_VERSION(6, 12, 0)" "$d/os_dep/linux/ioctl_cfg80211.c" | head -2
+        if make -C "$d" -j"$(nproc)" KVER="$KVER" KSRC="/lib/modules/${KVER}/build"; then
+            find "$d" -name '*.ko' -exec install -m 0644 {} "/lib/modules/${KVER}/updates/" \;
+            echo "OK: ${name} built + installed"
+        else
+            echo "FAIL: ${name} make failed"
+        fi
+    else
+        echo "FAIL: ${name} clone failed"
+    fi
+    rm -rf "$d"
+}
+
+set +e
+build_driver "8821au-20210708" "8821au (RTL8811AU/8821AU)"
+build_driver "8812au-20210820" "8812au (RTL8812AU/8814AU)"
+set -e
+
+depmod -a "$KVER"
+echo "INSTALLED into updates/:"; ls -l "/lib/modules/${KVER}/updates/"
+echo "--- modalias sanity (TP-Link Archer T2U family 2357:* / 0bda:*):"
+grep -E "2357|0bda" "/lib/modules/${KVER}/modules.alias" | grep -Ei "8821au|8812au" | head -20
+
+# Slim back down (built .ko stays in updates/).
+apt-get purge -y linux-headers-amd64 build-essential git || true
+apt-get autoremove -y || true
+set +x
+echo "=================== usb-wifi hook END ==================="
+exit 0

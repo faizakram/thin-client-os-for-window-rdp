@@ -1,0 +1,17 @@
+# ThinClient: never autosuspend a webcam.
+#
+# A USB webcam that is suspended and resumed repeatedly eventually fails to resume,
+# drops off the bus with -71/EPROTO, and the recording silently loses its camera
+# track until somebody physically replugs it. On a mains-powered desk appliance USB
+# power saving buys nothing and costs a camera.
+#
+# Vendor matching only. bInterfaceClass belongs to the usb_INTERFACE while
+# power/control lives on the usb_DEVICE that owns it, so an interface-class rule
+# here would silently never match — the agent's sysfs sweep covers other vendors,
+# and the installer sets usbcore.autosuspend=-1 as the global default.
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="0c45", TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="046d", TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="1908", TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="eb1a", TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="05a3", TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="2bdf", TEST=="power/control", ATTR{power/control}="on"

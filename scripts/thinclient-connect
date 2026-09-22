@@ -25,24 +25,45 @@
 #  Video: without an H.264 GFX codec, full-motion video (YouTube etc.) renders
 #  through legacy bitmap codecs and looks blurry/smeared on motion. The "Video"
 #  control enables the H.264 GFX pipeline (what Windows mstsc uses):
-#    Auto / High -> /gfx:AVC444 (H.264 4:4:4 — sharp text AND video)
-#    Balanced    -> /gfx:AVC420 (H.264 4:2:0 — lighter on bandwidth)
-#    Compat      -> no /gfx (legacy bitmap path, maximum compatibility)
+#    Auto (default) / Balanced -> /gfx:AVC420 (H.264 4:2:0 — ~half the client
+#                   decode cost, so FreeRDP won't starve/freeze while the box also
+#                   encodes the monitor/record streams)
+#    High         -> /gfx:AVC444 (H.264 4:4:4 — sharpest text, heaviest to decode)
+#    Compat       -> no /gfx (legacy bitmap path, maximum compatibility)
 #  With H.264 on we add /network:auto so the server adapts bitrate over WAN.
 #  H.264 decode ships in the image (libavcodec); all flags verified against
 #  Debian's FreeRDP 3.15 and against the live server's GFX capabilities.
 # =============================================================================
-import gi, os, re, subprocess, tempfile
+import base64, gi, glob, hashlib, os, re, subprocess, sys, tempfile, threading, time
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GLib, Gdk
 
+# Internet-speed color thresholds (Mbps) — MUST match the manager + the net badge.
+NET_GREEN = 50   # >= green
+NET_AMBER = 30   # >= amber, below = red
+
 CONF = os.environ.get("TC_CONF", "/etc/thinclient/server.conf")
+# Per-device saved RDP connection (IP/user/password/port/domain). Written on the
+# first SUCCESSFUL connect and auto-filled afterwards so the operator enters the
+# credentials only once. Lives in the kiosk user's home (persists on an installed
+# disk; ephemeral on a live USB), mode 0600. The password is obfuscated with a
+# device-local key — NOT strong encryption; the screen lock is the access control.
+PROFILE = os.environ.get("TC_RDP_PROFILE", os.path.expanduser("~/.thinclient-rdp"))
+# Server-managed RDP profile written by thinclient-agent from the manager. When
+# present it takes precedence over the local PROFILE: the form pre-fills the IP +
+# username, connects with a password the operator can never see, and the operator
+# may override for ONE session (reverts on restart, when the agent re-writes this).
+MANAGED_RDP = os.environ.get("TC_MANAGED_RDP", "/var/lib/thinclient/rdp-managed")
 LOGDIR = os.environ.get("TC_LOG_DIR", "/var/log/thinclient")
 
 # OTA update prompt state. `thinclient-update --check` (root, on a timer) writes
 # PENDING_FILE when a newer signed release is available; this window prompts the
 # user and tracks how many times they deferred in SKIP_CACHE (user-owned).
 PENDING_FILE = os.environ.get("TC_UPDATE_PENDING", "/var/lib/thinclient/updates/pending")
+# Written by the agent (in the world-writable run dir, so this session-user window
+# can also remove it) when an admin clicks "Force update now" — tells this window
+# to apply the pending update SILENTLY (no confirmation / skip prompt).
+FORCE_SILENT_FILE = "/run/thinclient/update-force-silent"
 SKIP_CACHE = os.path.join(
     os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
     "thinclient", "update-skips")
@@ -71,19 +92,153 @@ LICENSE_CONF = os.environ.get("TC_LICENSE_CONF", "/etc/thinclient/license.conf")
 LICENSE_STATE = os.environ.get("TC_LICENSE_STATE", "/var/lib/thinclient/license/state")
 LICENSE_ADMIN_LOCK = os.environ.get("TC_LICENSE_ADMIN_LOCK", "/var/lib/thinclient/license/admin-lock")
 
+def _admin_lock_message():
+    """User-facing admin-lock message, aware of the lock's mode + remaining time
+    (file format: '<epoch>\\n<mode>\\n<hours>'; an old single-line file = timed)."""
+    try:
+        parts = open(LICENSE_ADMIN_LOCK).read().split("\n")
+        ts = int((parts[0].strip() if parts and parts[0].strip() else "0"))
+        mode = parts[1].strip() if len(parts) > 1 and parts[1].strip() else "timed"
+        hours = float(parts[2].strip()) if len(parts) > 2 and parts[2].strip() else 24.0
+        msg = "\n".join(parts[3:]).strip() if len(parts) > 3 else ""
+    except Exception:
+        ts, mode, hours, msg = 0, "timed", 24.0, ""
+    # Working-hours lock: show the group's own text instead of the generic wording.
+    if msg:
+        return "🕒 " + msg
+    if mode == "permanent" or ts <= 0:
+        return "🔒 Locked by your administrator. This device stays locked until they unlock it — you can't unlock it yourself."
+    remaining = hours - (time.time() - ts) / 3600.0
+    if remaining <= 0:
+        return "🔒 Locked by your administrator — you can't unlock this. Please wait for them to unlock it."
+    if remaining >= 1:
+        n = int(round(remaining)); rem = "about %d hour%s" % (n, "" if n == 1 else "s")
+    else:
+        rem = "under an hour"
+    return "🔒 Locked by your administrator — you can't unlock this. It unlocks automatically in %s (or when they unlock it)." % rem
+
+
 def license_block_reason():
-    """Return a user-facing message if the device is locked and enforcement is
-    ON; otherwise None (disabled/unconfigured never blocks)."""
+    """Return a user-facing message if the device must not start a session, else
+    None. An explicit admin LOCK is a management action and ALWAYS blocks — it is
+    independent of billing. The licence-EXPIRY kill-switch only applies when
+    LICENSE_ENFORCE is switched on (so an unlicensed appliance never self-locks)."""
+    if os.path.exists(LICENSE_ADMIN_LOCK):
+        return _admin_lock_message()
     enforce = (_read_kv(LICENSE_CONF).get("LICENSE_ENFORCE", "false") or "false").lower()
     if enforce not in ("true", "1", "yes", "on"):
         return None
-    if os.path.exists(LICENSE_ADMIN_LOCK):
-        return "This device has been locked by your administrator."
-    if _read_kv(LICENSE_STATE).get("state", "") == "locked":
+    st = _read_kv(LICENSE_STATE)
+    if st.get("state", "") == "locked":
+        # Tell the operator WHICH failure this is. write_state() records `exp` only
+        # when a signed licence was actually verified, so no `exp` means this device
+        # has never held one — it could not enrol or cannot reach the manager. Calling
+        # that "expired" sends the admin hunting for a billing problem when the real
+        # fault is enrolment or connectivity, which is a very different fix.
+        if not st.get("exp"):
+            # If the agent is asking to be adopted, show the code the administrator
+            # needs. Without it the operator can only report "it says not licensed",
+            # which tells the admin nothing about WHICH machine is waiting.
+            code = ""
+            try:
+                with open("/var/lib/thinclient/adopt/code") as f:
+                    code = f.read().strip()
+            except OSError:
+                pass
+            if code:
+                return ("This device is waiting to be added to your account.\n"
+                        "Give your administrator this code:  %s" % code)
+            return ("This device is not licensed yet — it has not been able to "
+                    "register with the management server. Please contact your "
+                    "administrator.")
         return "This device's licence has expired. Please contact your administrator."
     return None
 
+# Shared runtime signal the agent reads to know an RDP session is live (feeds the
+# tenant-admin activity view: working hours = time an RDP session was connected).
+RDP_SIGNAL = "/run/thinclient/rdp-connected"
+# The agent's session-freeze watchdog drops this right before it kills a hung
+# FreeRDP, so we show the operator a clear "session reset - reconnect" screen
+# rather than dumping them back at the blank connect form.
+FREEZE_MARK = "/run/thinclient/rdp-froze"
+
+def _rdp_signal(on):
+    try:
+        if on:
+            os.makedirs("/run/thinclient", exist_ok=True)
+            open(RDP_SIGNAL, "w").close()
+        elif os.path.exists(RDP_SIGNAL):
+            os.remove(RDP_SIGNAL)
+    except OSError:
+        pass
+
+def _consume_freeze_mark():
+    """True (once) if the agent reset a frozen session while this one was running."""
+    try:
+        if os.path.exists(FREEZE_MARK):
+            os.remove(FREEZE_MARK)
+            return True
+    except OSError:
+        pass
+    return False
+
+def _current_zone():
+    """The machine's live IANA zone (e.g. 'Asia/Kolkata') from /etc/localtime.
+    The header clock seeds os.environ['TZ'] from this before tzset() — glibc keys
+    its re-read on the TZ string, so with TZ unset tzset() no-ops and the clock
+    would stay on the zone it first saw (UTC at boot, before the agent applied the
+    policy zone). Same pattern as the lock screen; keeps them in sync."""
+    try:
+        real = os.path.realpath("/etc/localtime")
+        i = real.find("/zoneinfo/")
+        if i != -1:
+            return real[i + len("/zoneinfo/"):]
+    except Exception:
+        pass
+    try:
+        with open("/etc/timezone") as f:
+            z = f.read().strip()
+            if z:
+                return z
+    except Exception:
+        pass
+    return None
+
+
+def _lock_on_startup():
+    """Show the screen lock BEFORE the connect form (login-before-desktop). Run
+    from HERE (not the X-session script) so this connect process is already alive
+    while the user is at the lock — otherwise the watchdog/rescue see 'no session'
+    during the lock and restart X (black screen) or drop to the tty diagnostic.
+
+    Fails CLOSED: the locker returns 0 only on a genuine unlock. If it crashes or
+    cannot display, we must NOT fall through and reveal the connect form (it can
+    carry a pre-filled RDP password) — so retry instead of exposing the desktop."""
+    import time as _t
+    lock = "/opt/thinclient/bin/thinclient-lock"
+    if not (os.path.exists(lock) and os.access(lock, os.X_OK)):
+        return
+    for _ in range(60):
+        try:
+            rc = subprocess.run([lock]).returncode   # blocks; 0 = genuine unlock
+        except Exception:
+            rc = -1
+        if rc == 0:
+            return
+        sys.stderr.write("thinclient-connect: boot lock did not unlock cleanly (rc=%s); retrying\n" % rc)
+        _t.sleep(1)
+    # Persistently unable to display the lock (broken locker) — proceed rather than
+    # brick the device forever. Last-resort fail-open, and it is logged above.
+    sys.stderr.write("thinclient-connect: boot lock unavailable after retries; proceeding\n")
+
 def rdp_bin():
+    # Prefer the PCM-only FreeRDP (built without the FFmpeg audio DSP -> no AAC mic
+    # encoder -> no NaN deadlock/freeze) when the agent has installed it. Fully
+    # reversible: RDP_PCM=0, or the dir absent, falls back to the system client.
+    if conf_get("RDP_PCM", "1").lower() not in ("0", "false", "no", "off"):
+        for pcm in ("/opt/freerdp-pcm/bin/xfreerdp3", "/opt/freerdp-pcm/bin/xfreerdp"):
+            if os.access(pcm, os.X_OK):
+                return pcm
     for b in ("xfreerdp3", "xfreerdp"):
         p = subprocess.run(["which", b], capture_output=True, text=True)
         if p.returncode == 0:
@@ -103,6 +258,107 @@ def conf_get(key, default=""):
     except OSError:
         pass
     return default
+
+def _obf_key():
+    """Device-local key for obfuscating the saved password. Derived from the
+    machine-id so the token isn't literal plaintext in the file/backups. It is
+    only obfuscation (the key lives on the same disk) — the screen lock is the
+    real access control, per the deployment's policy."""
+    try:
+        with open("/etc/machine-id") as f:
+            mid = f.read().strip()
+    except OSError:
+        mid = "thinclient"
+    return hashlib.sha256(("tc-rdp:" + mid).encode()).digest()
+
+def _obfuscate(s):
+    if not s:
+        return ""
+    k = _obf_key()
+    b = s.encode("utf-8")
+    return base64.b64encode(bytes(c ^ k[i % len(k)] for i, c in enumerate(b))).decode("ascii")
+
+def _deobfuscate(tok):
+    if not tok:
+        return ""
+    try:
+        x = base64.b64decode(tok.encode("ascii"))
+        k = _obf_key()
+        return bytes(c ^ k[i % len(k)] for i, c in enumerate(x)).decode("utf-8")
+    except Exception:
+        return ""
+
+def profile_get(key, default=""):
+    """Read a field from the saved per-device RDP profile (PROFILE)."""
+    try:
+        with open(PROFILE) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                if k.strip() == key:
+                    return v.strip()
+    except OSError:
+        pass
+    return default
+
+def save_profile(host, port, user, pw, dom):
+    """Persist the last SUCCESSFUL connection so it auto-fills next time. Atomic
+    write, mode 0600, password obfuscated. Failures are non-fatal (best effort)."""
+    try:
+        tmp = PROFILE + ".tmp"
+        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write("# ThinClient saved RDP connection (per-device, auto-filled).\n")
+            f.write("# PASSWORD_OBF is obfuscated with a device-local key, not\n")
+            f.write("# strong encryption. A reflash/disk wipe clears it.\n")
+            f.write("SERVER_IP=%s\n" % host)
+            f.write("PORT=%s\n" % port)
+            f.write("USERNAME=%s\n" % user)
+            f.write("DOMAIN=%s\n" % dom)
+            f.write("PASSWORD_OBF=%s\n" % _obfuscate(pw))
+        os.replace(tmp, PROFILE)
+    except OSError:
+        pass
+
+def managed_rdp():
+    """The server-managed RDP profile (written by the agent from the manager), or
+    None. host/user are cleartext; the password is obfuscated with the same
+    machine-id key, so _deobfuscate recovers it. Returns {host, user, pw}."""
+    host = user = pwobf = ""
+    try:
+        with open(MANAGED_RDP) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k = k.strip(); v = v.strip()
+                if k == "HOST": host = v
+                elif k == "USER": user = v
+                elif k == "PASSWORD_OBF": pwobf = v
+    except OSError:
+        return None
+    if not host:
+        return None
+    return {"host": host, "user": user, "pw": _deobfuscate(pwobf)}
+
+def _mask_ip(v):
+    """Show the operator only the last octet of the admin-set server IP, e.g.
+    '•••.•••.•••.152' — the rest is hidden. A non-IPv4 host (a name) is fully
+    masked. The real address is kept separately and used for the connection."""
+    v = (v or "").strip()
+    if not v:
+        return ""
+    p = v.split(".")
+    if len(p) == 4 and all(o.isdigit() and 0 <= int(o) <= 255 for o in p):
+        return "•••.•••.•••.%s" % p[3]
+    return "••••••••"
+
+def _mask_user(v):
+    """The username is admin-set too — fully star it on the operator's screen."""
+    return "••••••••" if (v or "").strip() else ""
 
 def net_status():
     """Return 'lan' if wired is connected, 'wifi' if Wi-Fi is connected, else ''."""
@@ -169,26 +425,143 @@ def auto_scale_pct(width):
 CSS = b"""
 window { background-color: #0b1220; }
 .card { background-color: #0e1728; border: 1px solid #1b2740;
-        border-radius: 12px; padding: 24px 26px; }
+        border-radius: 12px; padding: 20px 24px; }
 .title { color: #e6edf7; font-size: 20px; font-weight: bold; }
 .subtitle { color: #7e8ba3; font-size: 12px; }
 label { color: #c3cee3; }
+.credstatus { font-size: 17px; font-weight: bold; }
+.credstatus.cred-ok { color: #3fb950; }
+.credstatus.cred-none { color: #f85149; }
+/* Admin-lock banner: prominent RED, at the top of the card. */
+.lockbanner { color: #ff6b6b; font-size: 15px; font-weight: bold;
+              background: rgba(180,30,30,0.16); border: 1px solid #b3261e;
+              border-radius: 8px; padding: 11px 16px; margin-bottom: 4px; }
 entry { background: #101a2e; color: #e6edf7; border: 1px solid #28395c;
         border-radius: 6px; padding: 8px; }
 .connect { background: #2f6fed; color: #ffffff; font-weight: bold;
-           padding: 10px 18px; border-radius: 8px; }
+           font-size: 18px; padding: 16px 40px; border-radius: 10px; }
+.connect:hover { background: #2560d8; }
+.connect:disabled { background: #223052; color: #6b7a99; }
+/* Shut down = destructive action -> Windows-style dark red so it never gets
+   mistaken for Connect. */
+.danger { background: #c42b1c; color: #ffffff; font-weight: bold;
+          padding: 10px 18px; border-radius: 8px; }
+.danger:hover { background: #a81f12; }
 .wifi { background: #16223c; color: #cfe0ff; border-radius: 8px; padding: 6px 12px; }
+/* Speaker volume +/- buttons in the status bar. */
+.vol { background: #16223c; color: #cfe0ff; border-radius: 8px;
+       padding: 4px 12px; font-weight: bold; }
+.vol:hover { background: #22345c; }
+/* Volume / brightness horizontal sliders - themed for the dark card. */
+scale trough { background: #16223c; border-radius: 6px; min-height: 6px; }
+scale highlight, scale progress { background: #2f6fed; border-radius: 6px; }
+scale slider { background: #e6edf7; border: none; border-radius: 50%;
+               min-width: 16px; min-height: 16px; margin: -6px; }
 .statusbar { background: #0e1728; border-radius: 8px; padding: 8px 12px; }
 .dot-green { color: #34d399; font-size: 16px; }
+.dot-amber { color: #fbbf24; font-size: 16px; }
 .dot-red   { color: #fb7185; font-size: 16px; }
+.clock { color: #e6edf7; font-size: 26px; font-weight: bold; }
+.clockdate { color: #7e8ba3; font-size: 12px; }
+.verfoot { color: #5b6784; font-size: 11px; margin-top: 6px; }
+/* Dialogs (errors, prompts): force the dark, high-contrast theme so messages
+   are always readable. The default GTK theme renders a white box with dim grey
+   text that is unreadable on this kiosk. */
+dialog, messagedialog, .tcdialog { background-color: #0b1220; }
+dialog label, messagedialog label, .tcdialog label { color: #e6edf7; }
+dialog .dim-label, messagedialog .dim-label { color: #b9c4da; }
+.tcdlg-title { color: #ffffff; font-size: 18px; font-weight: bold; }
+.tcdlg-msg { color: #d7e0f2; font-size: 14px; }
+dialog button, messagedialog button, .tcdialog button {
+  background: #16223d; color: #e6edf7; border: 1px solid #28395c;
+  border-radius: 8px; padding: 8px 18px; margin: 4px; }
+dialog button:hover, messagedialog button:hover, .tcdialog button:hover { background: #22345c; }
+dialog button.suggested-action, .tcdlg-primary {
+  background: #2f6fed; color: #ffffff; border-color: #2f6fed; font-weight: bold; }
+dialog button.suggested-action:hover, .tcdlg-primary:hover { background: #2560d8; }
 """
+
+RDP_ERR_LOG = "/run/thinclient/rdp-errors.log"   # world-writable /run; pulled by GETLOGS
+
+
+def _net_state():
+    """NetworkManager connectivity: full | limited | portal | none | unknown."""
+    try:
+        r = subprocess.run(["nmcli", "networking", "connectivity", "check"],
+                           capture_output=True, text=True, timeout=5)
+        return (r.stdout or "").strip().lower()
+    except Exception:
+        return "unknown"
+
+
+def _friendly_rdp_error(rc, detail):
+    """Turn FreeRDP's technical failure into ONE plain-language line for a non-
+    technical operator. The full technical detail is logged separately (pullable
+    by an admin via GETLOGS) — the user never sees the jargon."""
+    d = (detail or "").lower()
+    if any(k in d for k in ("logon_failure", "0x20009", "authentication", "access is denied",
+                            "account", "credential", "password", "err_authentication", "0x2000e")):
+        return "The username or password looks incorrect.\nPlease check them and try again."
+    if any(k in d for k in ("dns", "name_not_found", "0x2000c", "could not resolve", "no such host")):
+        return "The server address couldn’t be found.\nPlease check the connection details with your admin."
+    if _net_state() == "none":
+        return "No internet connection.\nPlease check your Wi‑Fi or network cable, then try again."
+    return "Couldn’t reach the remote computer.\nIt may be turned off or busy — please try again in a moment."
+
+
+def _log_rdp_error(host, port, user, rc, detail):
+    """Append the FULL technical detail to a log an admin can pull (GETLOGS →
+    tc-... bundle). Best-effort; never blocks the operator."""
+    try:
+        os.makedirs("/run/thinclient", exist_ok=True)
+        with open(RDP_ERR_LOG, "a") as f:
+            f.write("\n===== %s  connect FAILED  %s:%s user=%s exit=%s =====\n%s\n"
+                    % (time.strftime("%Y-%m-%d %H:%M:%S"), host, port, user, rc, (detail or "").strip()))
+    except OSError:
+        pass
+
+
+def _tcp_ok(host, port, timeout=2.5):
+    import socket
+    try:
+        socket.create_connection((host, int(port)), timeout=timeout).close()
+        return True
+    except Exception:
+        return False
+
+
+def _internet_up(timeout=2.5):
+    """True if the internet is reachable. Probes robust anycast endpoints built for
+    huge query volumes (never the customer's RDP server, where repeated probes
+    could trip its firewall / spam its logs)."""
+    return _tcp_ok("1.1.1.1", 443, timeout) or _tcp_ok("8.8.8.8", 53, timeout)
+
+
+def _link_dead(host, port):
+    """The RDP link is effectively dead when the internet is unreachable AND the RDP
+    server itself can't be reached. Checking BOTH avoids a false alarm on a network
+    that blocks public probe hosts but where the RDP path is actually fine — and it
+    only touches the RDP server on the rare occasion the internet already looks
+    down, so healthy sessions never hammer it."""
+    if _internet_up():
+        return False
+    return not _tcp_ok(host, int(port or 3389))
+
 
 class Connect(Gtk.Window):
     def __init__(self):
-        super().__init__(title="Esparks IT Solutions — Remote Desktop")
+        super().__init__(title="Thin Client — Remote Desktop")
         self.rdp = rdp_bin()
         self.scr_w, self.scr_h = screen_size()
-        self.fullscreen()
+        # Center + MAXIMIZE (not fullscreen) BEFORE mapping so the window never
+        # flashes at the top-left corner for a frame. Deliberately maximized, NOT
+        # GTK-fullscreen: under this kiosk's openbox a fullscreen window sits in a
+        # stacking layer ABOVE the "keep-above" layer, which buried the always-on
+        # support-chat bubble behind the home screen. A maximized window fills the
+        # screen identically but stays in the normal layer, so the floating bubble
+        # (and any dialog) rides above it. (FreeRDP's /f is unaffected.)
+        self.set_position(Gtk.WindowPosition.CENTER_ALWAYS)
+        self.maximize()
         self.set_default_size(560, 460)
 
         prov = Gtk.CssProvider(); prov.load_from_data(CSS)
@@ -197,21 +570,48 @@ class Connect(Gtk.Window):
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.add(outer)
+        # Top bar: a right-aligned date + 12-hour clock in the device's configured
+        # timezone (the same one the lock screen shows). Fills the home screen; the
+        # remote Windows shows its own taskbar clock during the RDP session.
+        topbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        topbar.set_margin_top(14); topbar.set_margin_start(20); topbar.set_margin_end(24)
+        clockbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        clockbox.set_halign(Gtk.Align.END); clockbox.set_hexpand(True)
+        self.clock = Gtk.Label(); self.clock.get_style_context().add_class("clock"); self.clock.set_xalign(1)
+        self.clockdate = Gtk.Label(); self.clockdate.get_style_context().add_class("clockdate"); self.clockdate.set_xalign(1)
+        clockbox.pack_start(self.clock, False, False, 0)
+        clockbox.pack_start(self.clockdate, False, False, 0)
+        topbar.pack_start(clockbox, True, True, 0)
+        outer.pack_start(topbar, False, False, 0)
+        self._clock_tick()
+        GLib.timeout_add_seconds(1, self._clock_tick)
         # Center a fixed-width card.
         center = Gtk.Alignment(xalign=0.5, yalign=0.5, xscale=0, yscale=0)
         outer.pack_start(center, True, True, 0)
-        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        card.set_size_request(360, -1)   # standard login-card width
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=11)
         card.get_style_context().add_class("card")
         center.add(card)
 
-        title = Gtk.Label(label="Esparks IT Solutions"); title.get_style_context().add_class("title")
+        title = Gtk.Label(label="Thin Client"); title.get_style_context().add_class("title")
         title.set_xalign(0)
         sub = Gtk.Label(label="Connect to Remote Desktop  ·  Display %d×%d" % (self.scr_w, self.scr_h))
         sub.get_style_context().add_class("subtitle")
         sub.set_xalign(0)
         card.pack_start(title, False, False, 0)
         card.pack_start(sub, False, False, 0)
+
+        # Prominent RED banner at the TOP when the device is admin-locked (replaces
+        # the old inline hijack of the network label). Hidden unless locked.
+        self.lock_banner = Gtk.Label(); self.lock_banner.set_xalign(0); self.lock_banner.set_line_wrap(True)
+        self.lock_banner.get_style_context().add_class("lockbanner")
+        self.lock_banner.set_no_show_all(True)   # stays hidden until refresh_lan shows it
+        card.pack_start(self.lock_banner, False, False, 0)
+
+        # Compact single-column body: one narrow card, no wasted horizontal space.
+        # The pieces below are BUILT here but packed in a deliberate order at the end
+        # of the layout — credential status + the big Connect button on top, then the
+        # live status and the local controls beneath.
+        card.set_size_request(500, -1)
 
         # --- Network status bar (LAN dot + Wi-Fi button) ---
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -222,8 +622,40 @@ class Connect(Gtk.Window):
         wifi_btn.connect("clicked", self.on_wifi)
         bar.pack_start(self.dot, False, False, 0)
         bar.pack_start(self.lan_lbl, True, True, 0)
+        # Live internet indicator (speed + latency), color-coded like the manager.
+        # Value comes from the agent via /run/thinclient/net-speed.
+        self.net_lbl = Gtk.Label(label=""); self.net_lbl.set_use_markup(True)
         bar.pack_end(wifi_btn, False, False, 0)
-        card.pack_start(bar, False, False, 0)
+        bar.pack_end(self.net_lbl, False, False, 8)
+        self._net_bar = bar   # packed later, in the final single-column order
+
+        # --- Volume + brightness sliders, side by side on ONE compact row. Each is
+        # icon + [−] + slider + [+]; the [−]/[+] keep them usable even when narrow.
+        # Volume drives the local PipeWire sink (wpctl) that RDP audio plays through;
+        # brightness uses the hardware backlight if present, else an xrandr soft dim. ---
+        vrow, self.vol_scale = self._make_slider_row(
+            "audio-volume-high-symbolic", self._set_volume, self._get_volume())
+        brow, self.bri_scale = self._make_slider_row(
+            "display-brightness-symbolic", self._set_brightness, self._get_brightness())
+        sliders = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        sliders.pack_start(vrow, True, True, 0)
+        sliders.pack_start(brow, True, True, 0)
+        self._sliders = sliders   # packed later, in the final single-column order
+
+        # --- Device status (READ-ONLY): camera + microphone availability. The
+        # user can see they're enabled for monitoring but cannot turn them off. ---
+        dbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        dbar.get_style_context().add_class("statusbar")
+        self.cam_dot = Gtk.Label(label="●")
+        self.cam_lbl = Gtk.Label(label="Camera"); self.cam_lbl.set_xalign(0)
+        self.mic_dot = Gtk.Label(label="●")
+        self.mic_lbl = Gtk.Label(label="Microphone"); self.mic_lbl.set_xalign(0)
+        dbar.pack_start(self.cam_dot, False, False, 0)
+        dbar.pack_start(self.cam_lbl, False, False, 0)
+        dbar.pack_start(Gtk.Label(label="      "), False, False, 0)
+        dbar.pack_start(self.mic_dot, False, False, 0)
+        dbar.pack_start(self.mic_lbl, False, False, 0)
+        self._dbar = dbar   # packed later, in the final single-column order
 
         # --- Form fields ---
         grid = Gtk.Grid(row_spacing=8, column_spacing=10)
@@ -231,16 +663,43 @@ class Connect(Gtk.Window):
             lbl = Gtk.Label(label=text); lbl.set_xalign(0)
             grid.attach(lbl, 0, r, 1, 1); grid.attach(widget, 1, r, 1, 1)
             widget.set_hexpand(True)
-        self.e_server = Gtk.Entry(text=conf_get("SERVER_IP"))
-        self.e_port   = Gtk.Entry(text=conf_get("PORT", "3389")); self.e_port.set_width_chars(6)
-        self.e_user   = Gtk.Entry(text=conf_get("USERNAME"))
-        self.e_pass   = Gtk.Entry(text=conf_get("PASSWORD")); self.e_pass.set_visibility(False)
-        # Standard show/hide-password "eye" toggle on the password field.
+        # PRECEDENCE: a server-managed profile (pushed from the manager) wins over
+        # the local saved profile, which in turn wins over the admin config.
+        #  - managed mode: pre-fill the server IP + username; the managed password
+        #    is held in self._managed ONLY (never placed in the Entry, so it can't
+        #    be revealed or copied) and used at connect time if the operator leaves
+        #    the field blank. The operator may override for one session.
+        #  - local mode: the "enter once, remembered after" behaviour.
+        self._managed = managed_rdp()   # {host,user,pw} or None
+        m = self._managed
+        # The server IP + username are admin-set and hidden from the operator: the
+        # REAL values are kept here (and used to connect), while the fields only show
+        # a masked, read-only version (IP: last octet only; username: fully starred).
+        self._real_host = (m["host"] if m else (profile_get("SERVER_IP") or conf_get("SERVER_IP"))) or ""
+        self._real_user = (m["user"] if m else (profile_get("USERNAME") or conf_get("USERNAME"))) or ""
+        self.e_server = Gtk.Entry(text=(_mask_ip(self._real_host) if self._real_host else ""))
+        self.e_port   = Gtk.Entry(text=profile_get("PORT") or conf_get("PORT", "3389")); self.e_port.set_width_chars(6)
+        self.e_user   = Gtk.Entry(text=(_mask_user(self._real_user) if self._real_user else ""))
+        # With a value configured, lock the field (no edit, no focus) so the operator
+        # can neither read nor change it. Blank (first-time setup) stays editable.
+        if self._real_host:
+            self.e_server.set_editable(False); self.e_server.set_can_focus(False)
+        if self._real_user:
+            self.e_user.set_editable(False); self.e_user.set_can_focus(False)
+        # In managed mode the field stays EMPTY (the managed password is never put
+        # in a widget); a placeholder tells the operator they can just connect.
+        self.e_pass   = Gtk.Entry(text=("" if m else _deobfuscate(profile_get("PASSWORD_OBF"))))
+        self.e_pass.set_visibility(False)
+        if m:
+            self.e_pass.set_placeholder_text("•••••••• managed — leave blank to use, or type to override")
+        # Standard show/hide-password "eye" toggle on the password field. (It only
+        # ever reveals what's IN the field — never the managed password, which
+        # isn't there — so a managed credential can't be viewed.)
         self.e_pass.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, "view-reveal-symbolic")
         self.e_pass.set_icon_tooltip_text(Gtk.EntryIconPosition.SECONDARY, "Show / hide password")
         self.e_pass.set_icon_activatable(Gtk.EntryIconPosition.SECONDARY, True)
         self.e_pass.connect("icon-press", self._toggle_pw)
-        self.e_dom    = Gtk.Entry(text=conf_get("DOMAIN"))
+        self.e_dom    = Gtk.Entry(text=profile_get("DOMAIN") or conf_get("DOMAIN"))
         self.c_sec    = Gtk.ComboBoxText()
         for s in ("nla", "tls", "rdp"):
             self.c_sec.append_text(s)
@@ -264,29 +723,64 @@ class Connect(Gtk.Window):
             self.c_video.append_text(_lbl)
         _vg = (conf_get("GFX_CODEC", "auto") or "auto").lower()
         self.c_video.set_active(next((i for i, (_l, v) in enumerate(self.video_opts) if v == _vg), 0))
-        row(0, "Server / IP", self.e_server)
-        row(1, "Port", self.e_port)
-        row(2, "Username", self.e_user)
-        row(3, "Password", self.e_pass)
-        row(4, "Domain (optional)", self.e_dom)
-        row(5, "Security", self.c_sec)
-        row(6, "Display size", self.c_scale)
-        row(7, "Video", self.c_video)
-        card.pack_start(grid, False, False, 0)
+        # Credentials are ADMIN-MANAGED and never shown to the operator — there are
+        # NO input fields. Instead a status label shows whether the admin has added
+        # credentials, and Connect uses the managed profile. The widgets built above
+        # still exist (they hold the values on_connect reads: port/domain/security/
+        # display/video from config, and the masked host/user) — they're simply never
+        # displayed, so the operator can neither see nor change any of it.
+        self.cred_status = Gtk.Label(); self.cred_status.set_xalign(0)
+        self.cred_status.set_line_wrap(True)
+        self.cred_status.set_margin_top(2)
+        self.cred_status.get_style_context().add_class("credstatus")
+        # (packed near the top of the card in the final layout block below)
 
-        # --- Buttons ---
-        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        # --- Connect: the full-width hero button ---
         connect = Gtk.Button(label="Connect"); connect.get_style_context().add_class("connect")
         connect.connect("clicked", self.on_connect)
+        connect.set_hexpand(True); connect.set_halign(Gtk.Align.FILL)
+        self.connect_btn = connect   # refresh_lan disables it while admin-locked
+
+        # --- Shut down (bottom-left) + version footer (bottom-right) share one row ---
         shutdown = Gtk.Button(label="Shut down")
+        shutdown.set_image(Gtk.Image.new_from_icon_name("system-shutdown-symbolic", Gtk.IconSize.BUTTON))
+        shutdown.set_always_show_image(True)
+        shutdown.get_style_context().add_class("danger")   # dark red — destructive
         shutdown.connect("clicked", lambda *_: subprocess.call(["sudo", "-n", "systemctl", "poweroff"]))
-        btns.pack_end(connect, False, False, 0)
-        btns.pack_start(shutdown, False, False, 0)
-        card.pack_start(btns, False, False, 0)
+        # Version footer so a tech can read off which OS build the device is running.
+        _ver = "0.0.0"
+        try:
+            _ver = open("/opt/thinclient/VERSION").read().strip() or _ver
+        except OSError:
+            pass
+        verfoot = Gtk.Label(label="Thin Client  ·  v%s" % _ver)
+        verfoot.get_style_context().add_class("verfoot"); verfoot.set_xalign(1.0)
+        bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        bottom.pack_start(shutdown, False, False, 0)
+        bottom.pack_end(verfoot, False, False, 0)
+        # (Support chat is reached via the always-on floating bubble bottom-right,
+        # or Ctrl+Alt+Shift+C — no home-screen button needed.)
+
+        # === Final single-column order. Title / subtitle / lock-banner are already
+        # packed above; here come the credential status + big Connect FIRST, then the
+        # live network status, the local controls, and the shutdown/version footer. ===
+        card.pack_start(self.cred_status, False, False, 0)
+        card.pack_start(connect, False, False, 0)
+        card.pack_start(self._net_bar, False, False, 0)
+        card.pack_start(self._sliders, False, False, 0)
+        card.pack_start(self._dbar, False, False, 0)
+        card.pack_start(bottom, False, False, 0)
 
         self.e_pass.connect("activate", self.on_connect)  # Enter in password = connect
+        self._net_probing = False
         self.refresh_lan()
-        GLib.timeout_add_seconds(2, self.refresh_lan)      # live LAN dot
+        self._refresh_creds()                               # set the credential status label now
+        GLib.timeout_add_seconds(5, self._refresh_creds)    # ON-THE-FLY: re-read managed creds (no restart)
+        GLib.timeout_add_seconds(4, self.refresh_lan)       # live LAN dot (probe off-thread)
+        self._refresh_netspeed()
+        GLib.timeout_add_seconds(5, self._refresh_netspeed) # live internet speed/latency
+        self.refresh_devices()
+        GLib.timeout_add_seconds(30, self.refresh_devices)  # camera/mic (rare hotplug)
         # --- Deferrable software-update prompt ---
         self._upd_dialog = None
         try:
@@ -301,16 +795,114 @@ class Connect(Gtk.Window):
         GLib.timeout_add_seconds(300, self._check_update)         # re-offer while idle
         self.connect("destroy", Gtk.main_quit)
 
-    def refresh_lan(self):
-        st = net_status()
-        ctx = self.dot.get_style_context()
-        ctx.remove_class("dot-green"); ctx.remove_class("dot-red")
-        if st:
-            ctx.add_class("dot-green")
-            self.lan_lbl.set_text("Network connected (%s)" % ("LAN" if st == "lan" else "Wi-Fi"))
+    def _refresh_creds(self):
+        """Re-read the admin-managed RDP profile LIVE (so a manager credential change
+        applies on the fly — no restart) and update the status label + Connect state.
+        Green = the admin has added credentials; red = none yet."""
+        self._managed = managed_rdp()
+        m = self._managed
+        self._real_host = (m["host"] if m else (profile_get("SERVER_IP") or conf_get("SERVER_IP"))) or ""
+        self._real_user = (m["user"] if m else (profile_get("USERNAME") or conf_get("USERNAME"))) or ""
+        self._has_creds = bool(self._real_host and self._real_user)
+        ctx = self.cred_status.get_style_context()
+        ctx.remove_class("cred-ok"); ctx.remove_class("cred-none")
+        if self._has_creds:
+            ctx.add_class("cred-ok")
+            self.cred_status.set_text("●  Credentials configured — press Connect to start")
         else:
+            ctx.add_class("cred-none")
+            self.cred_status.set_text("●  No credentials yet — ask your administrator to add them")
+        if hasattr(self, "connect_btn"):
+            self.connect_btn.set_sensitive(license_block_reason() is None and self._has_creds)
+        return True   # keep the timer running
+
+    def refresh_lan(self):
+        # Admin lock: show a prominent RED banner at the TOP + block Connect. The
+        # network status below still reflects the real link.
+        locked = license_block_reason()
+        if hasattr(self, "connect_btn"):
+            # Connect needs BOTH: not admin-locked AND admin-added credentials present.
+            self.connect_btn.set_sensitive(locked is None and getattr(self, "_has_creds", False))
+        if locked:
+            self.lock_banner.set_text(locked); self.lock_banner.show()
+        else:
+            self.lock_banner.hide()
+        # Probe the network OFF the UI thread — nmcli can block for seconds on a
+        # slow stack and would otherwise freeze the whole home screen. Guarded so
+        # a slow probe can't pile up behind the 4s timer. (_apply_net owns the dot.)
+        if not self._net_probing:
+            self._net_probing = True
+            threading.Thread(target=self._net_probe, daemon=True).start()
+        return True  # keep the timer running
+
+    def _net_probe(self):
+        # Off the UI thread: is the link up, and is the INTERNET actually reachable?
+        # A link can be "connected" (cable in, Wi-Fi associated) yet have no working
+        # internet — dead switch, captive portal, ISP/router down, no DHCP route —
+        # in which case the device can't reach its server OR the manager.
+        kind = net_status()
+        online = _internet_up() if kind else False
+        GLib.idle_add(self._apply_net, kind, online)
+
+    def _apply_net(self, kind, online):
+        self._net_probing = False
+        ctx = self.dot.get_style_context()
+        for c in ("dot-green", "dot-amber", "dot-red"):
+            ctx.remove_class(c)
+        if not kind:
             ctx.add_class("dot-red")
             self.lan_lbl.set_text("No network — click Wi-Fi to connect")
+        elif online:
+            ctx.add_class("dot-green")
+            self.lan_lbl.set_text("Internet connected (%s)" % ("LAN" if kind == "lan" else "Wi-Fi"))
+        else:
+            # Link up but the internet isn't working — the honest, actionable state.
+            ctx.add_class("dot-amber")
+            self.lan_lbl.set_text("%s connected — but no internet. Check the cable/router."
+                                  % ("LAN" if kind == "lan" else "Wi-Fi"))
+        return False
+
+    def _refresh_netspeed(self):
+        """Show the device's internet speed + live latency to the RDP server,
+        color-coded with the SAME thresholds as the manager. The value is published
+        by the agent to /run/thinclient/net-speed, so the device and the manager
+        always show the same figure (both derive from one measurement)."""
+        try:
+            d = {}
+            for line in open("/run/thinclient/net-speed"):
+                if "=" in line:
+                    k, v = line.strip().split("=", 1); d[k] = v
+            mbps = int(d.get("MBPS", "0"))
+            lat = int(d.get("LATENCY_MS", "-1"))
+            loss = int(d.get("LOSS_PCT", "-1"))
+            ts = int(d.get("TS", "0"))
+            if time.time() - ts > 120:          # agent not updating -> hide
+                self.net_lbl.set_text(""); return True
+            color = "#3fb950" if mbps >= NET_GREEN else ("#d29922" if mbps >= NET_AMBER else "#f85149")
+            txt = "Internet: %d Mbps" % mbps
+            if loss and loss > 0:
+                txt += " · %d%% loss" % loss; color = "#f85149"
+            elif lat >= 0:
+                txt += " · %d ms" % lat
+            self.net_lbl.set_markup('<span foreground="%s">%s</span>' % (color, txt))
+        except Exception:
+            self.net_lbl.set_text("")
+        return True
+
+    def refresh_devices(self):
+        # Read-only status: is a camera / microphone present? Detected at the
+        # driver level. The user can see it's enabled but cannot disable capture —
+        # the administrator controls recording.
+        cam = bool(glob.glob("/dev/video*"))
+        mic = bool(glob.glob("/proc/asound/card*/pcm*c"))
+        for present, dot, lbl, on, off in (
+            (cam, self.cam_dot, self.cam_lbl, "Camera enabled", "No camera"),
+            (mic, self.mic_dot, self.mic_lbl, "Microphone enabled", "No microphone"),
+        ):
+            ctx = dot.get_style_context()
+            ctx.remove_class("dot-green"); ctx.remove_class("dot-red")
+            ctx.add_class("dot-green" if present else "dot-red")
+            lbl.set_text(on if present else off)
         return True  # keep the timer running
 
     def _toggle_pw(self, entry, pos, event=None):
@@ -321,9 +913,13 @@ class Connect(Gtk.Window):
             "view-conceal-symbolic" if vis else "view-reveal-symbolic")
 
     def on_wifi(self, *_):
-        # Delegate to the tested Wi-Fi scan/connect backend (separate window).
+        # Single instance: ignore repeat clicks while a picker window is already
+        # open, so clicking Wi-Fi several times doesn't stack windows. (The flock
+        # in thinclient-wifi is the backstop; this avoids even spawning a dupe.)
+        if getattr(self, "_wifi_proc", None) is not None and self._wifi_proc.poll() is None:
+            return
         try:
-            subprocess.Popen(["/opt/thinclient/bin/thinclient-wifi", "menu"])
+            self._wifi_proc = subprocess.Popen(["/opt/thinclient/bin/thinclient-wifi", "menu"])
         except Exception as e:
             self.msg(Gtk.MessageType.ERROR, "Wi-Fi", str(e))
 
@@ -368,6 +964,16 @@ class Connect(Gtk.Window):
         ver = pending_update_version()
         if not ver:
             return True                          # nothing pending
+        # Admin forced this update from the dashboard ("Force update now") -> apply
+        # SILENTLY: no "update available?" confirmation, no skip option. Just show
+        # the brief non-blocking "installing…" notice while the apply service swaps
+        # + restarts the session. (Marker persists until a version is actually
+        # pending, so it isn't consumed before the download finishes.)
+        if os.path.exists(FORCE_SILENT_FILE):
+            try: os.remove(FORCE_SILENT_FILE)
+            except OSError: pass
+            self._trigger_apply(ver)
+            return True
         action, skips = self._update_action(ver, natural)
         if action == "forced":
             self._show_update_forced(ver)
@@ -389,8 +995,10 @@ class Connect(Gtk.Window):
         d.add_button("Remind me later", Gtk.ResponseType.CANCEL)
         d.add_button("Update now", Gtk.ResponseType.OK).get_style_context().add_class("connect")
         self._upd_dialog = d
+        self._raise_dialog(d)
         resp = d.run()
         d.destroy()
+        self._restore_fs()
         self._upd_dialog = None
         if resp == Gtk.ResponseType.OK:
             self._trigger_apply(ver)
@@ -417,10 +1025,12 @@ class Connect(Gtk.Window):
         d.format_secondary_text(body(30))
         state["tid"] = GLib.timeout_add_seconds(1, tick)
         self._upd_dialog = d
+        self._raise_dialog(d)
         d.run()
         if state["tid"]:
             GLib.source_remove(state["tid"])
         d.destroy()
+        self._restore_fs()
         self._upd_dialog = None
         self._trigger_apply(ver)
 
@@ -439,7 +1049,36 @@ class Connect(Gtk.Window):
         d.format_secondary_text("Please wait — the screen will refresh automatically "
                                 "when the update is complete. Do not power off.")
         self._upd_dialog = d
-        d.show_all()   # non-blocking; the session restart tears it down
+        self._raise_dialog(d)   # non-blocking (show_all + raise above fullscreen);
+                       # a SUCCESSFUL apply restarts the session and tears this
+                       # window down (connect is killed before the failsafe below
+                       # fires). Left un-fullscreened on purpose — the failsafe
+                       # restores fullscreen if the apply doesn't complete.
+        # Failsafe: if the apply fails or is deferred (download error, sha
+        # mismatch, or a lingering RDP session), lightdm never restarts and this
+        # "please wait" would sit forever ("keeps updating, never closes"). After
+        # a grace period, dismiss it + re-enable the form; the update retries on
+        # its own later.
+        def _apply_failsafe():
+            if self._upd_dialog is not d:
+                return False                 # already torn down (success) or replaced
+            try: d.destroy()
+            except Exception: pass
+            # Keep _upd_dialog pointing at the notice while its modal loop runs, so
+            # the periodic _check_update (which early-returns when _upd_dialog is
+            # set) cannot STACK another update dialog underneath this one.
+            w = Gtk.MessageDialog(transient_for=self, modal=True,
+                                  message_type=Gtk.MessageType.WARNING,
+                                  buttons=Gtk.ButtonsType.OK, text="Update didn’t finish")
+            w.format_secondary_text("The update couldn’t be completed just now — it will "
+                                    "retry automatically later. You can keep working.")
+            self._upd_dialog = w
+            self._raise_dialog(w)
+            w.run(); w.destroy()
+            self._restore_fs()
+            self._upd_dialog = None
+            return False
+        GLib.timeout_add_seconds(180, _apply_failsafe)
 
     def scale_choice(self):
         i = self.c_scale.get_active()
@@ -455,16 +1094,34 @@ class Connect(Gtk.Window):
             argv.append("/d:%s" % dom)
         argv += ["/from-stdin:force", "/f", "/cert:ignore", "/sec:%s" % sec,
                  "/clipboard",
+                 # Don't grab the keyboard exclusively — normal typing still goes
+                 # to Windows, but the local WM's shortcuts (Super+L screen lock,
+                 # admin hotkey) fire even inside the fullscreen RDP session.
+                 "-grab-keyboard",
                  # Audio out (speakers) + audio in (microphone) via the local
                  # PulseAudio-compatible server (PipeWire), started by the session.
                  "/sound:sys:pulse", "/microphone:sys:pulse",
+                 # Survive transient network blips: FreeRDP transparently
+                 # re-establishes the session using the server's reconnect cookie
+                 # (the Windows session keeps running) instead of dropping the
+                 # operator to the login form. FINITE retries (not unlimited) so a
+                 # real outage eventually gives up and returns the user to the home
+                 # screen instead of trapping them in "reconnecting…". 15s connect
+                 # timeout so a truly-dead host fails promptly.
+                 "/auto-reconnect",
+                 "/auto-reconnect-max-retries:%s" % (conf_get("RDP_AUTORECONNECT_RETRIES", "10") or "10"),
+                 "/timeout:15000",
                  "/log-level:INFO"]
         # --- Video / GFX codec: H.264 pipeline for smooth, sharp motion video ---
         vid = self.video_choice()
-        if vid in ("auto", "avc444"):
-            argv += ["/gfx:AVC444", "/network:auto"]   # H.264 4:4:4 (mstsc default)
-        elif vid == "avc420":
-            argv += ["/gfx:AVC420", "/network:auto"]   # H.264 4:2:0 (lighter)
+        if vid == "avc444":
+            argv += ["/gfx:AVC444", "/network:auto"]   # H.264 4:4:4 (sharpest, heaviest to DECODE)
+        elif vid in ("auto", "avc420"):
+            # DEFAULT is now 4:2:0 — roughly HALF the client-side H.264 decode cost
+            # of 4:4:4, so FreeRDP is far less likely to be starved (and freeze) when
+            # the box is also encoding the monitor/record streams. Picking "High
+            # (4:4:4)" still forces AVC444 for anyone who wants maximum text sharpness.
+            argv += ["/gfx:AVC420", "/network:auto"]   # H.264 4:2:0 (default — lighter decode)
         # vid == "off": legacy bitmap path, no /gfx (maximum compatibility)
         # --- Display sizing (all flags verified against Debian FreeRDP 3.15) ---
         choice = self.scale_choice()
@@ -491,10 +1148,12 @@ class Connect(Gtk.Window):
         if blocked:
             self.msg(Gtk.MessageType.WARNING, "Device locked", blocked)
             return
-        host = self.e_server.get_text().strip()
+        host = self._real_host or self.e_server.get_text().strip()
         port = self.e_port.get_text().strip() or "3389"
-        user = self.e_user.get_text().strip()
-        pw   = self.e_pass.get_text()
+        user = self._real_user or self.e_user.get_text().strip()
+        # Blank password in managed mode -> use the managed one (which the operator
+        # can't see). If they typed something, that override wins for this session.
+        pw   = self.e_pass.get_text() or (self._managed["pw"] if self._managed else "")
         dom  = self.e_dom.get_text().strip()
         sec  = self.c_sec.get_active_text() or "nla"
         if not host:
@@ -505,48 +1164,328 @@ class Connect(Gtk.Window):
             return
 
         argv = self.rdp_argv(host, port, user, dom, sec)
-        out = tempfile.NamedTemporaryFile(prefix="rdp-", suffix=".log", delete=False,
-                                          dir=os.environ.get("TC_RUN_DIR", "/tmp"))
+        # Persist FreeRDP's own output where GETLOGS captures it (-> tc-rdp.log),
+        # rotating the previous session to rdp.prev.log — so a call-time freeze leaves
+        # its trail behind (the old random temp file was deleted on exit + never seen).
+        rdp_log = os.path.join(LOGDIR, "rdp.log")
+        try:
+            os.makedirs(LOGDIR, exist_ok=True)
+            if os.path.exists(rdp_log):
+                os.replace(rdp_log, os.path.join(LOGDIR, "rdp.prev.log"))
+            out = open(rdp_log, "wb")
+        except OSError:
+            rdp_log = ""
+            out = tempfile.NamedTemporaryFile(prefix="rdp-", suffix=".log", delete=False,
+                                              dir=os.environ.get("TC_RUN_DIR", "/tmp"))
         self.hide()
         while Gtk.events_pending():
             Gtk.main_iteration()
         import time
         t0 = time.time()
+        _rdp_signal(True)          # mark session live (activity: working hours)
+        # ONE FreeRDP session — no outer relaunch loop. In-session network blips are
+        # healed by FreeRDP's own /auto-reconnect (finite retries) WITHOUT exiting,
+        # so a brief drop no longer kicks an operator off a call. When FreeRDP DOES
+        # exit — the user disconnected/logged off, or a reconnect finally gave up —
+        # we return to the connect/home screen and do NOT pull them back in. (The
+        # earlier auto-relaunch loop reconnected on ANY non-zero exit, incl. a
+        # deliberate disconnect/logoff, so users could never leave the RDP session.)
+        self._link_lost = False
         try:
             proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=out, stderr=out)
+            # Watch the link in the background: a half-dead connection can leave
+            # FreeRDP "connected" but frozen (no clean TCP close, so its own
+            # auto-reconnect never fires). The monitor drops such a stalled session
+            # so the operator gets a clear "Connection lost" screen, not a freeze.
+            mon = threading.Thread(target=self._link_monitor, args=(proc, host, port), daemon=True)
+            mon.start()
             proc.communicate(input=(pw + "\n").encode(), timeout=None)
             rc = proc.returncode
         except Exception as e:
             rc = -1
             out.write(("launch error: %s\n" % e).encode())
+        finally:
+            _rdp_signal(False)     # session ended
         out.flush(); out.close()
         dur = time.time() - t0
+        # Remember the connection ONLY on a genuine success, so we never clobber a
+        # known-good saved profile with bad credentials. Require BOTH a clean
+        # FreeRDP exit (rc == 0 — non-zero covers connect-timeouts to a wrong host
+        # and NLA/TLS/RDP auth rejections) AND a real session duration (a fast
+        # NLA reject exits <8s). A failed attempt is NOT saved, and the fields keep
+        # what was typed so the operator can fix them; the password persists in the
+        # field across a disconnect (not cleared). In MANAGED mode we never save
+        # locally — the server profile is the source of truth and any operator
+        # override must revert on restart.
+        if rc == 0 and dur >= 8 and not self._managed:
+            save_profile(host, port, user, pw, dom)
         self.show_all()
         self.refresh_lan()
-        # Fast exit = failed; show FreeRDP's real output.
-        if dur < 8:
+        # Decide what the operator sees. Priority:
+        #  1) the link monitor dropped a STALLED session, OR a session that ran a
+        #     while then ended with the server now unreachable  -> "Connection lost"
+        #     (clearly a network/internet issue, not a stuck machine) + Reconnect.
+        #  2) a FAST exit (<8s) -> a plain-language connect error + Try again.
+        #  3) a clean disconnect with the network fine -> just the connect screen.
+        froze = _consume_freeze_mark()
+        # Freeze AUTO-recovery: the agent reset a hung FreeRDP. Reconnect on our own —
+        # no operator action — with a brief notice. Loop-guarded: a persistently
+        # freezing session falls back to the manual Reconnect screen (never spins).
+        if froze and self._froze_reconnect():
+            try:
+                if out.name != rdp_log:
+                    os.unlink(out.name)
+            except OSError:
+                pass
+            return
+        if froze or getattr(self, "_link_lost", False) or (dur >= 8 and _link_dead(host, port)):
+            self._conn_lost(host, port, froze=froze)
+        elif dur < 8:
             try:
                 detail = open(out.name).read()[-4000:]
             except OSError:
                 detail = "(no output captured)"
-            self.msg(Gtk.MessageType.ERROR, "Connection failed",
-                     "Could not connect to %s:%s as %s (exit %s).\n\n%s"
-                     % (host, port, user, rc, detail))
+            _log_rdp_error(host, port, user, rc, detail)
+            self.msg(Gtk.MessageType.ERROR, "Can’t connect right now",
+                     _friendly_rdp_error(rc, detail), retry=True)
         try:
-            os.unlink(out.name)
+            if out.name != rdp_log:   # keep the persistent tc-rdp.log for freeze diagnostics
+                os.unlink(out.name)
         except OSError:
             pass
         # Back at the connect screen (safe, no RDP running) — a good moment to
         # offer any pending update.
         self._check_update(natural=True)
 
-    def msg(self, kind, title, text):
+    def _link_monitor(self, proc, host, port):
+        """Runs while an RDP session is live. If the remote server stops being
+        reachable for a sustained window WHILE FreeRDP is still 'alive' (a stalled
+        half-dead link that FreeRDP's own /auto-reconnect never noticed), drop the
+        session so the operator gets a clear 'Connection lost' screen + Reconnect,
+        instead of staring at a frozen desktop."""
+        PROBE_EVERY = 5.0
+        NEED_FAILS = 4          # sustained loss (~25-35s) before dropping the session
+        fails = 0
+        try:
+            while proc.poll() is None:
+                time.sleep(PROBE_EVERY)
+                if proc.poll() is not None:
+                    break
+                if not _link_dead(host, port):
+                    fails = 0
+                    continue
+                fails += 1
+                if fails >= NEED_FAILS:
+                    self._link_lost = True
+                    _log_rdp_error(host, port, "", "stall",
+                                   "link monitor: internet + %s:%s unreachable while session alive -> dropping stalled session"
+                                   % (host, port))
+                    try: proc.terminate()
+                    except Exception: pass
+                    break
+        except Exception:
+            pass
+
+    def _froze_reconnect(self) -> bool:
+        """Freeze AUTO-recovery: the agent reset a hung FreeRDP. Reconnect on our own —
+        NO confirmation, NO button — after a brief on-screen notice so the operator
+        sees WHY. Loop-guarded: if it keeps freezing (>3 in 2 min) return False so the
+        caller shows the manual Reconnect screen instead of spinning on a broken box."""
+        import time as _time
+        now = _time.time()
+        self._froze_ts = [t for t in getattr(self, "_froze_ts", []) if now - t < 120] + [now]
+        if len(self._froze_ts) > 3:
+            return False
+        note = None
+        try:
+            note = Gtk.MessageDialog(transient_for=self, modal=False,
+                                     message_type=Gtk.MessageType.INFO,
+                                     buttons=Gtk.ButtonsType.NONE,
+                                     text="Remote session froze — reconnecting…")
+            note.set_keep_above(True)
+            note.show_all()
+            while Gtk.events_pending():        # paint it right away
+                Gtk.main_iteration()
+        except Exception:
+            note = None
+        def _go():
+            if note is not None:
+                try: note.destroy()
+                except Exception: pass
+            self.on_connect()                   # relaunch automatically
+            return False
+        GLib.timeout_add(800, _go)              # quick — ~0.8s notice, then reconnect
+        return True
+
+    def _conn_lost(self, host, port, froze=False):
+        """A clear, reassuring 'Connection lost' screen with a Reconnect button —
+        so the operator knows the machine ISN'T stuck, it's the network. When the
+        agent reset a FROZEN remote desktop, say exactly that instead — the machine
+        is fine, the remote session had hung, and their server-side work is safe."""
+        if froze:
+            self.msg(Gtk.MessageType.WARNING, "Session reset",
+                     "The remote desktop stopped responding, so it was reset for you.\n\n"
+                     "This computer is working fine — the remote session had frozen. Your work "
+                     "on the server is safe and still there.\n\n"
+                     "Press Reconnect to pick up where you left off.",
+                     retry=True, retry_label="Reconnect")
+            return
+        if _net_state() == "none":
+            text = ("This device lost its internet connection.\n\n"
+                    "This is a network problem — NOT a problem with this computer, and your "
+                    "remote session is safe. It will come back as soon as you reconnect.\n\n"
+                    "Check your Wi‑Fi or network cable, then press Reconnect.")
+        else:
+            text = ("The connection to the remote computer dropped.\n\n"
+                    "This is usually an internet or network issue — NOT a problem with this "
+                    "computer, and your remote session is safe. It resumes when you reconnect.\n\n"
+                    "Press Reconnect to continue.")
+        self.msg(Gtk.MessageType.WARNING, "Connection lost", text, retry=True, retry_label="Reconnect")
+
+    def _raise_dialog(self, d):
+        """Make a modal dialog actually reachable. The connect window is GTK-
+        fullscreen, and under this kiosk's openbox the fullscreen stacking layer
+        outranks the "above" layer — so a plain transient dialog renders BEHIND
+        the fullscreen form and its buttons can't be clicked (the modal grab then
+        freezes the visible form: "update window disabled until restart"). Drop
+        the parent out of fullscreen while the dialog is up and pin the dialog
+        above, so it maps on top and takes clicks. Pair with _restore_fs()."""
+        try:
+            d.set_transient_for(self)
+            d.set_modal(True)
+            d.set_keep_above(True)
+            self.unfullscreen()        # leave openbox's fullscreen layer
+            d.show_all()
+            d.present()                # focus + raise onto the top of the stack
+        except Exception:
+            pass
+
+    def _restore_fs(self):
+        try:
+            self.maximize()   # re-fill the screen (kiosk uses maximize, not fullscreen)
+        except Exception:
+            pass
+
+    def _clock_tick(self):
+        # Re-resolve the zone only every ~15s (realpath + tzset are wasted work run
+        # 60x/min for a minutes-only clock); still catches the boot-time zone fix
+        # and a rare mid-session change quickly enough. strftime runs every tick.
+        self._clk_n = getattr(self, "_clk_n", 0) + 1
+        if os.environ.get("TZ") is None or self._clk_n % 15 == 1:
+            z = _current_zone()
+            if z and os.environ.get("TZ") != z:
+                os.environ["TZ"] = z
+                try: time.tzset()
+                except Exception: pass
+        # 12-hour clock ("2:32 PM"); lstrip drops the leading zero.
+        self.clock.set_text(time.strftime("%I:%M %p").lstrip("0"))
+        self.clockdate.set_text(time.strftime("%A, %d %B · %Z"))
+        return True
+
+    def _make_slider_row(self, icon_name, on_change, init_value):
+        """Build a control row: [icon] [−] [==== horizontal slider ====] [+].
+        Dragging the slider or clicking −/+ calls on_change(value 0..100); the
+        buttons move the slider by 5 (so slider + buttons stay in sync — the slider
+        is the single source of truth). Returns (row, scale)."""
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row.get_style_context().add_class("statusbar")
+        icon = Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.BUTTON)
+        dn = Gtk.Button(label="−"); dn.get_style_context().add_class("vol"); dn.set_tooltip_text("Decrease")
+        up = Gtk.Button(label="+"); up.get_style_context().add_class("vol"); up.set_tooltip_text("Increase")
+        scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 5)
+        scale.set_draw_value(False); scale.set_hexpand(True)
+        scale.set_value(init_value)                 # set BEFORE connect -> no spurious fire
+        scale.connect("value-changed", lambda s: on_change(s.get_value()))
+        dn.connect("clicked", lambda *_: scale.set_value(max(0, scale.get_value() - 5)))
+        up.connect("clicked", lambda *_: scale.set_value(min(100, scale.get_value() + 5)))
+        row.pack_start(icon, False, False, 0)
+        row.pack_start(dn, False, False, 0)
+        row.pack_start(scale, True, True, 0)
+        row.pack_start(up, False, False, 0)
+        return row, scale
+
+    def _set_volume(self, v):
+        """Set the default PipeWire sink to v% (0..100). Unmutes first so raising
+        from a muted state produces sound. Best-effort (no-op if wpctl not ready)."""
+        try:
+            subprocess.call(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "0"])
+            subprocess.call(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "%.2f" % (v / 100.0)])
+        except Exception:
+            pass
+
+    def _get_volume(self):
+        """Current sink volume as 0..100 (default 50 if unavailable)."""
+        try:
+            out = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"],
+                                 capture_output=True, timeout=3).stdout.decode("utf-8", "replace")
+            m = re.search(r"([0-9]+\.[0-9]+)", out)   # "Volume: 0.65 [MUTED]"
+            if m:
+                return max(0, min(100, round(float(m.group(1)) * 100)))
+        except Exception:
+            pass
+        return 50
+
+    def _set_brightness(self, v):
+        """Set screen brightness to v% (clamped 5..100). Prefer a real hardware
+        backlight (laptop/AIO panel, writable by the video group via udev); fall
+        back to a software dim via xrandr so an external monitor still responds."""
+        v = max(5, min(100, int(v)))
+        for bl in glob.glob("/sys/class/backlight/*"):
+            try:
+                mx = int(open(os.path.join(bl, "max_brightness")).read().strip())
+                with open(os.path.join(bl, "brightness"), "w") as f:
+                    f.write(str(max(1, int(mx * v / 100.0))))
+                return                              # hardware backlight set — done
+            except Exception:
+                pass
+        factor = max(0.2, min(1.0, v / 100.0))      # xrandr can't exceed the panel max
+        try:
+            out = subprocess.run(["xrandr", "--query"], capture_output=True, timeout=3).stdout.decode("utf-8", "replace")
+            for ln in out.splitlines():
+                if " connected" in ln:
+                    subprocess.call(["xrandr", "--output", ln.split()[0], "--brightness", "%.2f" % factor])
+        except Exception:
+            pass
+
+    def _get_brightness(self):
+        """Current brightness as 0..100. Reads a hardware backlight if present;
+        otherwise 100 (xrandr software brightness resets to full each X start)."""
+        for bl in glob.glob("/sys/class/backlight/*"):
+            try:
+                cur = int(open(os.path.join(bl, "brightness")).read().strip())
+                mx = int(open(os.path.join(bl, "max_brightness")).read().strip())
+                if mx > 0:
+                    return max(5, min(100, round(cur * 100.0 / mx)))
+            except Exception:
+                pass
+        return 100
+
+    def msg(self, kind, title, text, retry=False, retry_label="Try again"):
+        buttons = Gtk.ButtonsType.NONE if retry else Gtk.ButtonsType.OK
         d = Gtk.MessageDialog(transient_for=self, modal=True,
-                              message_type=kind, buttons=Gtk.ButtonsType.OK, text=title)
+                              message_type=kind, buttons=buttons, text=title)
         d.format_secondary_text(text)
-        d.run(); d.destroy()
+        if retry:
+            d.add_button("Close", Gtk.ResponseType.CLOSE)
+            ok = d.add_button(retry_label, Gtk.ResponseType.OK)
+            ok.get_style_context().add_class("suggested-action")   # blue primary
+            d.set_default_response(Gtk.ResponseType.OK)
+        self._raise_dialog(d)
+        resp = d.run(); d.destroy()
+        self._restore_fs()
+        if retry and resp == Gtk.ResponseType.OK:
+            GLib.idle_add(self.on_connect)   # re-attempt after the dialog closes
 
 if __name__ == "__main__":
     win = Connect()
+    # Lock the screen BEFORE revealing the connect form (login-before-desktop).
+    # The window is created but stays hidden until the user unlocks.
+    _lock_on_startup()
     win.show_all()
+    # Re-assert maximize after the window is mapped — the initial maximize() in
+    # __init__ can be dropped if the WM wasn't managing yet; without this the form
+    # can appear as a small top-left box. Belt-and-suspenders with the WM keepalive
+    # in thinclient-xsession. (Maximize, not fullscreen — see Connect.__init__.)
+    win.maximize()
+    GLib.timeout_add(400, lambda: (win.maximize(), False)[1])
     Gtk.main()

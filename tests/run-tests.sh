@@ -26,6 +26,26 @@ for suite in test-config-parsing test-config-cli test-rdp-args test-watchdog tes
   if bash "$HERE/${suite}.sh"; then :; else fail_total=$((fail_total+1)); fi
 done
 
+
+# --- python unit suites ------------------------------------------------------
+# Activity-state recovery: the agent used to lose an RDP_DISCONNECT across every
+# reboot, which corrupted working-hours reporting fleet-wide.
+banner "test-activity-state"
+if python3 "$HERE/test-activity-state.py"; then :; else fail_total=$((fail_total+1)); fi
+
+banner "test-camera-format"
+if python3 "$HERE/test-camera-format.py"; then :; else fail_total=$((fail_total+1)); fi
+
+echo "== camera USB drop / recovery =="
+if python3 "$HERE/test-camera-recovery.py"; then :; else fail_total=$((fail_total+1)); fi
+
+banner "test-lock-chat"
+if python3 "$HERE/test-lock-chat.py"; then :; else fail_total=$((fail_total+1)); fi
+
+# --- static guards added after live failures --------------------------------
+# A non-ASCII character in a GTK CSS blob that gets .encode("ascii") kills the GUI
+# app at import — that is how the chat panel vanished from a live device.
+if bash "$HERE/check-gui-ascii.sh"; then :; else fail_total=$((fail_total+1)); fi
 banner "summary"
 if (( fail_total == 0 )); then
   printf '%sALL TEST SUITES PASSED%s\n' "$green" "$off"; exit 0

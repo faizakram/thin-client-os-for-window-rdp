@@ -116,10 +116,26 @@ tc_is_valid_port() {
   [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 ))
 }
 
-# tc_have_network — return 0 if the box can leave its subnet (has a default
-# route), else consult NetworkManager's own connectivity verdict. Used by the
-# network gate to decide whether to show the WiFi picker.
+# tc_have_network — return 0 if the machine has a usable network connection.
+#
+# "Usable" means an active link with an IP — NOT necessarily internet access.
+# A thin client often lives on a LAN whose RDP server is local: that network has
+# no default route and no internet, but it is absolutely "connected". Requiring a
+# default route (or NetworkManager's internet connectivity check) made the gate
+# report a working LAN as offline, so the WiFi picker reopened forever and a
+# successful WiFi join was reported as "connection failed". We now treat any of
+# these as online, matching the connect window's net_status():
+#   1. a NetworkManager device actually in the "connected" state, or
+#   2. a default route (can leave the subnet), or
+#   3. NetworkManager's connectivity verdict is full/limited/portal, or
+#   4. any real interface holds a global-scope IPv4 address (link up + IP).
 tc_have_network() {
+  if command -v nmcli >/dev/null 2>&1; then
+    if nmcli -t -f TYPE,STATE device status 2>/dev/null \
+         | grep -qE '^(ethernet|wifi):connected$'; then
+      return 0
+    fi
+  fi
   if ip route show default 2>/dev/null | grep -q .; then
     return 0
   fi
@@ -127,6 +143,9 @@ tc_have_network() {
     case "$(nmcli -t -f CONNECTIVITY general status 2>/dev/null)" in
       full|limited|portal) return 0 ;;
     esac
+  fi
+  if ip -4 -o addr show scope global 2>/dev/null | grep -q 'inet '; then
+    return 0
   fi
   return 1
 }

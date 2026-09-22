@@ -1,0 +1,11 @@
+# ThinClient: keep USB Wi-Fi dongles powered. The rtl88xxau family (TP-Link Archer
+# T2U etc.) hits a kernel "Runtime PM usage count underflow" that re-enumerates the
+# adapter — Wi-Fi drops ~30s and the RDP session dies. Disable USB autosuspend for
+# Wi-Fi dongle vendors and kill 802.11 power-save when a wlan interface appears.
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="2357", TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="0e8d", TEST=="power/control", ATTR{power/control}="on"
+ACTION=="add|change", SUBSYSTEM=="usb", ATTR{idVendor}=="148f", TEST=="power/control", ATTR{power/control}="on"
+# 802.11 power-save is handled by NetworkManager (wifi.powersave=2) + the agent's
+# direct iwconfig call on the renamed interface — a udev RUN on the early wlan0
+# name errors (exit 250), so it's intentionally omitted here.

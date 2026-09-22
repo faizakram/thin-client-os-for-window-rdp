@@ -4,7 +4,7 @@
 #  Triggered by thinclient-update.timer. No-op unless UPDATE_ENABLED=true.
 # =============================================================================
 [Unit]
-Description=Esparks ThinClient update check
+Description=Thin Client update check
 Documentation=file:/opt/thinclient/docs/UPDATES.md
 Wants=network-online.target
 After=network-online.target NetworkManager-wait-online.service lightdm.service

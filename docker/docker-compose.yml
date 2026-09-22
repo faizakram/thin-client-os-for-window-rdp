@@ -36,6 +36,14 @@ services:
       - TC_BUILD_DIR=/build/live-build
       - TC_MIRROR=${TC_MIRROR:-http://deb.debian.org/debian/}
       - TC_VERSION=${TC_VERSION:-1.0.0}
+      # Fleet auto-enrolment baked into the ISO (optional; injected at build time,
+      # never committed). Set TC_TENANT_TOKEN to make every install self-register.
+      - TC_TENANT_TOKEN=${TC_TENANT_TOKEN:-}
+      # Names the output ISO after the tenant, so the wrong image can't be flashed by mistake.
+      - TC_TENANT_NAME=${TC_TENANT_NAME:-}
+      - TC_CONTROL_URL=${TC_CONTROL_URL:-}
+      - TC_LICENSE_ENFORCE=${TC_LICENSE_ENFORCE:-}
+      - TC_DEBUG_SSH=${TC_DEBUG_SSH:-0}
     command: ["bash", "-lc", "bash ./build.sh ${BUILD_ARGS:-}"]
 
   # --- Lint + logic tests (no privileges, fast) ------------------------------

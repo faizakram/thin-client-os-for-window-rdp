@@ -23,15 +23,33 @@ export TC_LOGFILE="network"
 sudo_nmcli() { sudo -n nmcli "$@"; }
 
 _scan_rows() {
+  sudo_nmcli radio wifi on >/dev/null 2>&1 || true    # unblock a soft-off radio (some USB dongles)
   sudo_nmcli device wifi rescan >/dev/null 2>&1 || true
   # Put the free-text SSID LAST so a colon inside an SSID can't shift the other
-  # fields. Dedupe by SSID keeping the strongest signal; drop hidden SSIDs.
-  # Emits yad rows: SSID, SIGNAL%, SECURITY (3 lines per network).
+  # fields. Dedupe by SSID keeping the strongest signal AND remembering whether
+  # any of its APs is the one we're connected to (IN-USE '*'). The CONNECTED
+  # network is pinned to the TOP and flagged so the user can see it at a glance.
+  # Emits 4 yad lines per network: SSID, "SIGNAL bars %", SECURITY, STATUS.
   nmcli -t -f IN-USE,SIGNAL,SECURITY,SSID device wifi list 2>/dev/null \
-    | awk -F: '{ sig=$2+0; sec=$3; ssid=$4; for(i=5;i<=NF;i++) ssid=ssid":"$i;
-                 if(ssid!="") printf "%d\t%s\t%s\n", sig, ssid, (sec==""?"open":sec) }' \
-    | sort -k1,1 -nr \
-    | awk -F'\t' '!seen[$2]++ { print $2; print $1"%"; print $3 }'
+    | awk -F: '
+        { inuse=($1=="*"); sig=$2+0; sec=$3; ssid=$4;
+          for(i=5;i<=NF;i++) ssid=ssid":"$i;
+          if(ssid=="") next;
+          if(!(ssid in bsig) || sig>bsig[ssid]) { bsig[ssid]=sig; bsec[ssid]=(sec==""?"Open":sec) }
+          if(inuse) conn[ssid]=1 }
+        END {
+          for(s in bsig) {
+            p=bsig[s]; n=int((p+12)/25); if(n<1)n=1; if(n>4)n=4;
+            bar=""; for(i=0;i<4;i++) bar=bar (i<n ? "█" : "░");
+            printf "%d\t%d\t%s %d%%\t%s\t%s\n", (conn[s]?1:0), p, bar, p, bsec[s], s } }' \
+    | sort -t "$(printf '\t')" -k1,1nr -k2,2nr \
+    | awk -F"$(printf '\t')" '{ print $5; print $3; print $4; print ($1=="1" ? "● Connected" : "") }'
+}
+
+# The SSID we are currently associated with (empty if not on WiFi), for the header.
+_connected_ssid() {
+  nmcli -t -f IN-USE,SSID device wifi list 2>/dev/null \
+    | awk -F: '$1=="*"{ s=$2; for(i=3;i<=NF;i++) s=s":"$i; print s; exit }'
 }
 
 _is_secured() {
@@ -41,9 +59,27 @@ _is_secured() {
                               if(name==s){ if(sec!="") print "yes"; exit } }'
 }
 
+# True if ANY WiFi adapter is present — built-in OR a USB dongle. NetworkManager
+# only lists a wifi device once its driver has loaded, so this also tells us
+# whether the USB dongle's driver+firmware came up. sysfs fallback catches a
+# wireless interface that NM left unmanaged.
+_wifi_device_present() {
+  nmcli -t -f TYPE device status 2>/dev/null | grep -qx wifi && return 0
+  ls -d /sys/class/net/*/phy80211 >/dev/null 2>&1 && return 0
+  ls -d /sys/class/net/*/wireless >/dev/null 2>&1 && return 0
+  return 1
+}
+
 picker() {
   command -v yad   >/dev/null 2>&1 || { log_error "yad missing; cannot show WiFi picker"; return 3; }
   command -v nmcli >/dev/null 2>&1 || { log_error "nmcli missing; cannot manage WiFi"; return 3; }
+
+  # Single instance: repeat clicks on the connect window's Wi-Fi button must NOT
+  # stack multiple picker windows. Hold an exclusive lock for this picker's life;
+  # a duplicate launch finds it held and exits quietly (fd 8 releases on exit).
+  mkdir -p "${TC_RUN_DIR:-/run/thinclient}" 2>/dev/null || true
+  exec 8>"${TC_RUN_DIR:-/run/thinclient}/.wifi-picker.lock" 2>/dev/null || exec 8>/tmp/.tc-wifi-picker.lock
+  flock -n 8 || { log_info "WiFi picker already open; ignoring duplicate launch"; return 0; }
 
   # Dark root + no leftover splash, so nothing but the picker is visible.
   command -v xsetroot >/dev/null 2>&1 && xsetroot -solid "#0b1220" 2>/dev/null || true
@@ -51,7 +87,26 @@ picker() {
 
   log_info "WiFi picker opened (offline)"
 
+  local last_iter=0 fast=0
   while :; do
+    # Runaway guard: a healthy iteration BLOCKS inside yad waiting for the user
+    # (many seconds). If iterations keep completing in ~1s, yad is not staying open
+    # — a display error, or the window is being auto-dismissed by the environment —
+    # and the loop would spin: the window flickering open/closed while nmcli rescans
+    # every second. Detect that and bail instead of hammering.
+    if (( last_iter > 0 && SECONDS - last_iter < 2 )); then
+      fast=$((fast + 1))
+      if (( fast >= 4 )); then
+        log_warn "WiFi picker closing: dialog not staying open (fast-return x${fast})"
+        [[ "${TC_WIFI_MODE:-}" == "menu" ]] && return 0   # menu: just close
+        sleep 10; fast=0                                   # boot gate needs a network — back off, retry
+        last_iter=0; continue
+      fi
+    else
+      fast=0
+    fi
+    last_iter=$SECONDS
+
     # In the boot GATE (picker) mode we close as soon as a network appears
     # (e.g. Ethernet plugged in). In MENU mode (opened from the connect window)
     # we stay open even when online, so the user can switch/add Wi-Fi anytime.
@@ -61,24 +116,53 @@ picker() {
 
     local rows; rows="$(_scan_rows)"
     if [[ -z "$rows" ]]; then
-      yad --info --center --width=480 --title="No WiFi found" \
-          --window-icon="network-wireless" --image="network-wireless" \
-          --text="No WiFi networks found.\n\nPlug in an Ethernet cable, or click Rescan." \
-          --button="Rescan:0" --timeout=30 2>/dev/null || true
+      if _wifi_device_present; then
+        # A WiFi adapter is up, just no networks in range.
+        yad --info --center --width=480 --title="No WiFi found" \
+            --window-icon="network-wireless" --image="network-wireless" \
+            --text="No WiFi networks found.\n\nMove closer to the router, plug in an Ethernet cable, or click Rescan." \
+            --button="Close:1" --button="Rescan:0" --timeout=30 2>/dev/null
+      else
+        # No WiFi adapter at all — this machine has no built-in WiFi and no USB
+        # dongle is being detected. Guide the user to (re)insert the USB WiFi.
+        yad --warning --center --width=520 --title="No WiFi adapter detected" \
+            --window-icon="network-wireless" --image="network-error" \
+            --text="No WiFi adapter was found on this machine.\n\nIf you are using a <b>USB WiFi dongle</b>, plug it in firmly (try a different USB port), wait about 10 seconds, then click <b>Rescan</b>.\n\nOtherwise, connect an Ethernet cable." \
+            --button="Close:1" --button="Rescan:0" --timeout=60 2>/dev/null
+      fi
+      local nrc=$?
+      [[ $nrc -ne 0 && "${TC_WIFI_MODE:-}" == "menu" ]] && return 0   # menu: allow closing
       continue
     fi
 
-    local ssid rc
-    ssid="$(printf '%s\n' "$rows" | yad --list --center --width=480 --height=470 \
-        --title="Select WiFi Network" --window-icon="network-wireless" \
-        --text="<b>No network connection</b>\nChoose a WiFi network to continue (or plug in Ethernet)." \
-        --column="Network" --column="Signal" --column="Security" \
+    local ssid rc cur hdr
+    cur="$(_connected_ssid)"
+    if [[ -n "$cur" ]]; then
+      hdr="<b>Connected to ${cur}</b>\nPick another network to switch, or close."
+    else
+      hdr="<b>No network connection</b>\nChoose a WiFi network to continue (or plug in Ethernet)."
+    fi
+    # In MENU mode (user opened it from the connect screen) offer a Close button so
+    # they can always dismiss the window — kiosk windows have no titlebar X. Exit
+    # code 1 falls into the "rc != 0 -> menu returns 0 (close)" branch below. The
+    # boot GATE deliberately omits Close: the device has no network yet and must not
+    # be left with the picker dismissed and no way back.
+    local closebtn=()
+    [[ "${TC_WIFI_MODE:-}" == "menu" ]] && closebtn=(--button="Close:1")
+    ssid="$(printf '%s\n' "$rows" | yad --list --center --width=520 --height=470 \
+        --title="Wi-Fi Networks" --window-icon="network-wireless" \
+        --text="$hdr" \
+        --column="Network" --column="Signal" --column="Security" --column="Status" \
         --print-column=1 --separator='|' \
-        --button="Rescan:2" --button="Connect:0" 2>/dev/null)"
+        "${closebtn[@]}" --button="Rescan:2" --button="Connect:0" 2>>"${TC_LOG_DIR}/network.log")"
     rc=$?
     [[ $rc -eq 2 ]] && continue                          # Rescan
+    if [[ $rc -ne 0 ]]; then                             # window closed / cancelled
+      [[ "${TC_WIFI_MODE:-}" == "menu" ]] && return 0    # menu: close -> back to workspace
+      sleep 1; continue                                  # boot gate: stay up (needs network)
+    fi
     ssid="${ssid%%|*}"                                   # first column only
-    [[ $rc -ne 0 || -z "$ssid" ]] && { sleep 1; continue; }
+    [[ -z "$ssid" ]] && { sleep 1; continue; }           # Connect pressed with nothing picked
 
     local psk=""
     if [[ "$(_is_secured "$ssid")" == "yes" ]]; then
@@ -91,6 +175,10 @@ picker() {
 
     # Attempt the connection with a pulsating "Connecting…" indicator.
     log_info "Attempting WiFi connection to '${ssid}'"
+    # A previous failed attempt can leave a saved profile holding the OLD (wrong)
+    # password; nmcli would reuse it and keep failing even with the correct one.
+    # Drop any stale profile for this SSID so a fresh one is built each time.
+    sudo_nmcli connection delete id "$ssid" >/dev/null 2>&1 || true
     ( if [[ -n "$psk" ]]; then
         sudo_nmcli device wifi connect "$ssid" password "$psk"
       else

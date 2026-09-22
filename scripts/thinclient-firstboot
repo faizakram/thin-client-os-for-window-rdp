@@ -56,6 +56,64 @@ if [[ ! -f "$TC_ETC/build-info" ]]; then
   } >"$TC_ETC/build-info"
 fi
 
+# --- Clone guard: give every physical machine its own identity ----------------
+# A disk imaged onto new hardware (Clonezilla-cloned from a golden unit) would
+# otherwise carry the golden's /etc/machine-id -> identical hwid on the manager,
+# which folds all clones into ONE device AND makes every clone's poll fail with
+# 403 "enrollment bound to another machine" (the enroll_code/secret it copied are
+# pinned to the golden's hwid). We fingerprint the STABLE hardware (DMI board /
+# product ids + ONBOARD NIC MACs); if it changed since we last recorded it, this
+# disk has moved to a new box -> regenerate machine-id and drop the copied
+# per-device enrolment so the agent self-registers THIS unit afresh (needs the
+# baked TENANT_TOKEN). The very first boot only RECORDS the fingerprint (never
+# regenerates), so an existing, legitimately-unique device is never disturbed.
+LICENSE_CONF="${TC_ETC}/license.conf"
+HWFP_FILE="/var/lib/thinclient/.hwfp"
+FP_ALGO="v1"                 # bump when _hw_fingerprint changes -> re-baseline, never regen
+mkdir -p /var/lib/thinclient 2>/dev/null || true
+_hw_fingerprint() {
+  # Only STABLE, onboard identifiers: DMI board/product ids + ONBOARD (PCI) NIC
+  # MACs. Deliberately EXCLUDES WiFi (MAC may be randomized) AND USB NICs
+  # (ethernet dongles / docks come and go, and would falsely look like a clone).
+  {
+    for f in product_uuid board_serial product_serial; do
+      v="$(cat "/sys/class/dmi/id/$f" 2>/dev/null)"
+      [[ -n "$v" ]] && printf 'dmi:%s=%s\n' "$f" "$v"
+    done
+    for n in /sys/class/net/*; do
+      [[ -e "$n/device" ]]  || continue    # physical NICs only (skip lo/virtual)
+      [[ -e "$n/wireless" ]] && continue    # skip WiFi (MAC may be randomized)
+      case "$(readlink -f "$n/device" 2>/dev/null)" in
+        */usb*) continue ;;                  # skip USB NICs (dongles/docks come & go)
+      esac
+      a="$(cat "$n/address" 2>/dev/null)"
+      [[ -n "$a" ]] && printf 'mac:%s\n' "$a"
+    done
+  } | sort | sha256sum | cut -c1-32
+}
+cur_fp="$(_hw_fingerprint)"
+stored="$(cat "$HWFP_FILE" 2>/dev/null || true)"
+old_algo="${stored%%:*}"; old_fp="${stored#*:}"
+# Only a SAME-algorithm hash change means the disk moved to new hardware. A first
+# record (empty) or an algorithm bump just re-baselines below without regenerating.
+if [[ "$old_algo" == "$FP_ALGO" && -n "$cur_fp" && -n "$old_fp" && "$cur_fp" != "$old_fp" ]]; then
+  log_info "Hardware fingerprint changed (disk cloned onto a new machine) — regenerating machine-id"
+  : >/etc/machine-id
+  rm -f /var/lib/dbus/machine-id 2>/dev/null || true
+  systemd-machine-id-setup >/dev/null 2>&1 || true
+  ln -sf /etc/machine-id /var/lib/dbus/machine-id 2>/dev/null || true
+  # Drop the copied enrolment so the agent re-registers THIS box via the tenant
+  # token (only if a token is present — otherwise leave it, nothing to re-enrol with).
+  if [[ -f "$LICENSE_CONF" ]] && grep -q '^TENANT_TOKEN=..*' "$LICENSE_CONF"; then
+    sed -i -e 's/^ENROLL_CODE=.*/ENROLL_CODE=/' \
+           -e 's/^DEVICE_SECRET=.*/DEVICE_SECRET=/' "$LICENSE_CONF"
+    log_info "Cleared copied ENROLL_CODE/DEVICE_SECRET — agent will self-register this unit"
+  else
+    log_info "No TENANT_TOKEN present — enrolment left as-is (bake a token so clones auto-register)"
+  fi
+fi
+printf '%s:%s' "$FP_ALGO" "$cur_fp" >"$HWFP_FILE" 2>/dev/null || true
+
 # --- Baked WiFi (optional) ----------------------------------------------------
 # If WIFI_SSID is set, (re)generate a NetworkManager keyfile so the machine
 # auto-joins that network. Regenerated each boot so editing the config takes
@@ -79,6 +137,19 @@ if [[ -n "$wifi_ssid" ]]; then
   log_info "Baked WiFi connection configured for SSID '${wifi_ssid}'"
 else
   rm -f "$WIFI_KEYFILE" 2>/dev/null || true
+fi
+
+# --- Headset auto-default (USB) ----------------------------------------------
+# Install a udev rule that, whenever a USB sound card appears, runs
+# thinclient-audio-default to make a connected headset the default sink+source.
+# Written here (not baked) so it ships via OTA. Idempotent.
+AUDIO_RULE="/etc/udev/rules.d/89-thinclient-audio.rules"
+NEW_RULE='SUBSYSTEM=="sound", ACTION=="add", KERNEL=="controlC[0-9]*", RUN+="/usr/bin/systemd-run --no-block --collect /opt/thinclient/bin/thinclient-audio-default"'
+if [[ "$(cat "$AUDIO_RULE" 2>/dev/null)" != "$NEW_RULE" ]]; then
+  printf '%s\n' "$NEW_RULE" >"$AUDIO_RULE" 2>/dev/null || true
+  chmod 0644 "$AUDIO_RULE" 2>/dev/null || true
+  udevadm control --reload-rules 2>/dev/null || true
+  log_info "Installed USB-headset auto-default udev rule."
 fi
 
 log_info "First-boot preparation complete."

@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  ThinClient OS — device activation from USB (Esparks IT Solutions)
+#  Installed to: /opt/thinclient/bin/thinclient-provision
+#  Run by:       thinclient-provision.service (on boot) + udev (on USB insert)
+#
+#  Looks for `thinclient-activate.conf` on any plugged-in USB stick, imports the
+#  device's ENROLL_CODE / DEVICE_SECRET / CONTROL_URL into
+#  /etc/thinclient/license.conf, turns enforcement on, and restarts the agent.
+#  No shell, no typing — the locked kiosk activates itself from the file.
+# =============================================================================
+set -uo pipefail
+
+LICENSE_CONF=/etc/thinclient/license.conf
+FILE_NAME=thinclient-activate.conf
+STATE_DIR=/var/lib/thinclient
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+
+exec 9>"${STATE_DIR}/.provision.lock" 2>/dev/null || true
+flock -n 9 || exit 0     # single instance (boot + udev may race)
+
+log() { logger -t thinclient-provision "$*" 2>/dev/null || true; echo "provision: $*" >&2; }
+
+set_key() { # <key> <value> — replace or append in license.conf
+  [ -n "$2" ] || return 0
+  if grep -q "^$1=" "$LICENSE_CONF" 2>/dev/null; then
+    sed -i "s#^$1=.*#$1=$2#" "$LICENSE_CONF"
+  else
+    echo "$1=$2" >> "$LICENSE_CONF"
+  fi
+}
+
+apply() { # <path to activation file>
+  local src="$1" code secret ttoken url enforce
+  code="$(sed -n 's/^ENROLL_CODE=//p'   "$src" | head -1 | tr -d '\r"'"'"' ')"
+  secret="$(sed -n 's/^DEVICE_SECRET=//p' "$src" | head -1 | tr -d '\r"'"'"' ')"
+  ttoken="$(sed -n 's/^TENANT_TOKEN=//p' "$src" | head -1 | tr -d '\r"'"'"' ')"
+  url="$(sed -n 's/^CONTROL_URL=//p'     "$src" | head -1 | tr -d '\r"'"'"' ')"
+  enforce="$(sed -n 's/^LICENSE_ENFORCE=//p' "$src" | head -1 | tr -d '\r"'"'"' ')"
+  # accept EITHER a tenant token (auto-enrol, one file for the whole fleet) OR a
+  # per-device enroll_code+secret.
+  if [ -z "$ttoken" ] && { [ -z "$code" ] || [ -z "$secret" ]; }; then
+    log "activation file has neither TENANT_TOKEN nor ENROLL_CODE/DEVICE_SECRET — ignoring $src"; return 1
+  fi
+  touch "$LICENSE_CONF" 2>/dev/null || true
+  set_key ENROLL_CODE     "$code"
+  set_key DEVICE_SECRET   "$secret"
+  set_key TENANT_TOKEN    "$ttoken"
+  [ -n "$url" ] && set_key CONTROL_URL "$url"
+  set_key LICENSE_ENFORCE "${enforce:-true}"
+  chmod 0644 "$LICENSE_CONF" 2>/dev/null || true
+  log "activated from ${src} (${ttoken:+tenant token}${code:+enroll_code=$code})"
+  systemctl restart thinclient-agent.service 2>/dev/null || true
+  return 0
+}
+
+# 1) already-mounted media (auto-mount / live medium / manual mounts)
+for base in /media /run/media /mnt /run/live/medium; do
+  [ -d "$base" ] || continue
+  f="$(find "$base" -maxdepth 4 -name "$FILE_NAME" -type f 2>/dev/null | head -1)"
+  [ -n "$f" ] && { apply "$f" && exit 0; }
+done
+
+# 2) scan removable partitions and mount them read-only ourselves
+while read -r dev typ rm; do
+  [ "$typ" = "part" ] && [ "$rm" = "1" ] || continue
+  mnt="$(mktemp -d)"
+  if mount -o ro "$dev" "$mnt" 2>/dev/null; then
+    if [ -f "$mnt/$FILE_NAME" ]; then
+      apply "$mnt/$FILE_NAME"; rc=$?
+      umount "$mnt" 2>/dev/null; rmdir "$mnt" 2>/dev/null
+      [ "$rc" = 0 ] && exit 0
+      continue
+    fi
+    umount "$mnt" 2>/dev/null
+  fi
+  rmdir "$mnt" 2>/dev/null
+done < <(lsblk -rpno NAME,TYPE,RM 2>/dev/null)
+
+exit 0

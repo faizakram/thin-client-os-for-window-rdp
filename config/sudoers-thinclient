@@ -10,6 +10,10 @@
 #  Validate before install with:  visudo -cf config/sudoers-thinclient
 # =============================================================================
 
+# Verify the admin password (reads the candidate on stdin). Must run as root so
+# it can read the 0600 root:root admin.conf hash — the gate for all of the below.
+thinclient ALL=(root) NOPASSWD: /opt/thinclient/bin/thinclient-adminctl check
+
 # Restart / stop / start the kiosk session (invoked by the admin GUI).
 thinclient ALL=(root) NOPASSWD: /opt/thinclient/bin/thinclient-adminctl start-session
 thinclient ALL=(root) NOPASSWD: /opt/thinclient/bin/thinclient-adminctl stop-session
@@ -26,6 +30,9 @@ thinclient ALL=(root) NOPASSWD: /usr/bin/systemctl --no-block start thinclient-u
 # Package updates from Admin Mode.
 thinclient ALL=(root) NOPASSWD: /usr/bin/apt-get update
 thinclient ALL=(root) NOPASSWD: /usr/bin/apt-get -y upgrade
+
+# Install-to-disk from Admin Mode (interactive; erases a chosen disk).
+thinclient ALL=(root) NOPASSWD: /opt/thinclient/bin/thinclient-install, /opt/thinclient/bin/thinclient-install *
 
 # Network configuration from Admin Mode (NetworkManager CLI/TUI).
 thinclient ALL=(root) NOPASSWD: /usr/bin/nmcli *

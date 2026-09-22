@@ -1,15 +1,15 @@
 #!/bin/sh
 # =============================================================================
-#  Esparks IT Solutions — boot-menu rebranding (runs in the live-build BINARY
+#  Thin Client — boot-menu rebranding (runs in the live-build BINARY
 #  stage, where ./binary/ holds the assembled ISO tree before packing).
 #
 #  Replaces the default "Debian GNU/Linux" / "Live system" GRUB entries with
 #  the company name, and shortens the menu timeout so it auto-boots.
 # =============================================================================
 set -e
-echo "I: [branding] rebranding boot menu to Esparks IT Solutions"
+echo "I: [branding] rebranding boot menu to Thin Client"
 
-BRAND="Esparks IT Solutions"
+BRAND="Thin Client"
 
 rebrand_file() {
   f="$1"

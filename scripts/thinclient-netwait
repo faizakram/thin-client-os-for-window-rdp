@@ -35,14 +35,39 @@ while (( i < grace )); do
   i=$((i + 1))
 done
 
-# Sustained outage: hand over to the WiFi picker until we have a route. The
-# picker also returns immediately if Ethernet is plugged in mid-way.
-log_warn "Still offline after ${grace}s; launching WiFi picker"
+# True if any WIRED interface has carrier (an Ethernet cable is physically plugged
+# and the link is up) — even before DHCP/route completes.
+_eth_link() {
+  local c ifc
+  for c in /sys/class/net/*/carrier; do
+    [[ -e "$c" ]] || continue
+    ifc="${c%/carrier}"; ifc="${ifc##*/}"
+    case "$ifc" in wl*|lo) continue ;; esac              # skip wifi + loopback
+    [[ -e "/sys/class/net/$ifc/wireless" ]] && continue  # skip wireless
+    [[ "$(cat "$c" 2>/dev/null)" == "1" ]] && return 0
+  done
+  return 1
+}
+
+# Sustained outage. If an Ethernet cable is plugged (link up), just WAIT for DHCP/
+# route — never pop the WiFi picker ("no adapter / plug in a dongle") on a wired
+# box; that message is wrong and confusing when the cable is in and simply slow to
+# come up. Only launch the picker when there is genuinely NO wired link.
+log_warn "Still offline after ${grace}s"
+eth_wait="$(conf_get TC_ETH_WAIT 60)"; [[ "$eth_wait" =~ ^[0-9]+$ ]] || eth_wait=60
+waited=0
 while ! tc_have_network; do
+  if _eth_link; then
+    log_info "Ethernet link up, no route yet — waiting for DHCP (${waited}s)"
+    sleep 2; waited=$((waited + 2))
+    (( waited >= eth_wait )) && { log_warn "Ethernet up but no route after ${waited}s; proceeding"; break; }
+    continue
+  fi
+  log_warn "No wired link; launching WiFi picker"
   /opt/thinclient/bin/thinclient-wifi picker || true
   tc_have_network && break
   sleep 2
 done
 
-log_info "Network is up; proceeding to RDP"
+log_info "Proceeding to RDP"
 exit 0

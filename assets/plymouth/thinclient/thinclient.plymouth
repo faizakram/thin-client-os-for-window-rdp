@@ -1,6 +1,6 @@
 [Plymouth Theme]
-Name=Esparks IT Solutions
-Description=Esparks IT Solutions thin-client boot splash — dark, silent, appliance-style
+Name=Thin Client
+Description=Thin Client thin-client boot splash — dark, silent, appliance-style
 ModuleName=script
 
 [script]

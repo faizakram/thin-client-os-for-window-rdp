@@ -25,16 +25,19 @@ X_SERVICE="lightdm.service"
 interval="$(conf_get WATCHDOG_INTERVAL 5)"
 [[ "$interval" =~ ^[0-9]+$ ]] && (( interval >= 1 )) || interval=5
 
-# Consider the session dead if the heartbeat is older than this. Generous
-# enough to never false-positive on a slow reconnect, tight enough to recover
-# a truly wedged session within a few seconds.
-stale_threshold=$(( interval * 3 ))
-(( stale_threshold < 15 )) && stale_threshold=15
-
 # After a forced restart, wait for the session to come back before judging again.
 restart_grace=20
 
-log_info "Watchdog started: interval=${interval}s stale_threshold=${stale_threshold}s"
+# Hysteresis: only tear down a session after N CONSECUTIVE unhealthy ticks. A
+# single pgrep miss under heavy CPU load — exactly the RDP-freeze scenario, where
+# ffmpeg/x264 briefly starve the box — must NOT be read as "session dead" and
+# kill a live RDP call. At the 5s interval, 3 ticks ≈ 15s of sustained failure
+# before we act. Must be initialised before the loop (set -u would crash on an
+# undefined var, and systemd would then restart the watchdog forever).
+unhealthy_max=3
+unhealthy_streak=0
+
+log_info "Watchdog started: interval=${interval}s (process-based health check)"
 
 service_active() { systemctl is-active --quiet "$X_SERVICE" 2>/dev/null; }
 
@@ -48,12 +51,33 @@ while :; do
     continue
   fi
 
+  # VT-aware recovery: if a login getty ever grabs the graphical VT (tty7), X can
+  # no longer own the screen and the user is stranded on a terminal — even though
+  # the process-based health test below would still read "healthy" (Xorg may be
+  # running off-screen on another VT). Kill the getty, re-mask it, and restart the
+  # session so the desktop reclaims the VT. This is the definitive cure for the
+  # "lock -> esparksit login: on tty7" symptom.
+  # Match the real login process (agetty) on tty7 — NOT the bare token 'getty',
+  # which would also match a transient 'systemctl mask getty@tty7.service' that
+  # our own recovery/harden paths run, causing a spurious restart.
+  if pgrep -f 'agetty.*tty7' >/dev/null 2>&1; then
+    log_warn "Login getty on the graphical VT (tty7); killing it + restarting ${X_SERVICE}."
+    systemctl mask getty@tty7.service autovt@tty7.service 2>/dev/null || true
+    pkill -9 -f 'agetty.*tty7' 2>/dev/null || true
+    systemctl restart "$X_SERVICE" 2>/dev/null || true
+    sleep "$restart_grace"
+    continue
+  fi
+
   # Health is process-based: the session is fine as long as the connection
   # window (or an active RDP session) is running. It is NOT based on a heartbeat,
   # because the connection form blocks on user input (typing) and can't beat —
   # a heartbeat check would falsely restart the session while the user types.
   session_alive=0
+  # The screen lock (thinclient-lock) counts as a live session too — otherwise a
+  # user sitting at the lock (e.g. the boot lock) looks "dead" and we'd restart X.
   if pgrep -f 'thinclient-connect' >/dev/null 2>&1 \
+     || pgrep -f 'thinclient-lock' >/dev/null 2>&1 \
      || pgrep -x xfreerdp3 >/dev/null 2>&1 || pgrep -x xfreerdp >/dev/null 2>&1; then
     session_alive=1
   fi
@@ -61,12 +85,20 @@ while :; do
   # (LightDM often launches the server as 'X') — a strict 'pgrep -x Xorg' would
   # falsely report the session dead and restart LightDM in a loop.
   x_alive=0
-  pgrep -f '[/ ]Xorg' >/dev/null 2>&1 && x_alive=1
-  pgrep -f '[/ ]X ' >/dev/null 2>&1 && x_alive=1
-  pgrep -x X >/dev/null 2>&1 && x_alive=1
+  if pgrep -f '[/ ]Xorg' >/dev/null 2>&1 \
+     || pgrep -f '[/ ]X ' >/dev/null 2>&1 \
+     || pgrep -x X >/dev/null 2>&1; then       # short-circuit: stop at the first match
+    x_alive=1
+  fi
 
   if (( session_alive == 0 )) || (( x_alive == 0 )); then
-    log_warn "Unhealthy session: session_alive=${session_alive} x_alive=${x_alive} state=$(tc_get_state). Restarting ${X_SERVICE}."
+    unhealthy_streak=$(( unhealthy_streak + 1 ))
+    if (( unhealthy_streak < unhealthy_max )); then
+      log_warn "Session looks unhealthy (session_alive=${session_alive} x_alive=${x_alive}) — tick ${unhealthy_streak}/${unhealthy_max}; deferring (likely a transient pgrep miss under load)."
+      continue
+    fi
+    log_warn "Unhealthy session for ${unhealthy_streak} ticks: session_alive=${session_alive} x_alive=${x_alive} state=$(tc_get_state). Restarting ${X_SERVICE}."
+    unhealthy_streak=0
     pkill -TERM -f 'xfreerdp' 2>/dev/null || true
     systemctl restart "$X_SERVICE" 2>/dev/null || log_error "Failed to restart ${X_SERVICE}"
     log_info "Restart issued; holding ${restart_grace}s for recovery."
@@ -74,6 +106,9 @@ while :; do
   else
     # NOTE: do not reference undefined vars here — 'set -u' would crash the
     # watchdog on every healthy tick (systemd would then restart it forever).
-    log_debug "Healthy: session_alive=1 x_alive=1 state=$(tc_get_state)"
+    unhealthy_streak=0
+    # Guard the state read: without this, $(tc_get_state) forks a `cat` every
+    # healthy tick (5s) even though log_debug is a no-op unless TC_DEBUG=1.
+    [[ "${TC_DEBUG:-0}" == "1" ]] && log_debug "Healthy: session_alive=1 x_alive=1 state=$(tc_get_state)"
   fi
 done

@@ -53,6 +53,9 @@ systemctl enable NetworkManager-wait-online.service 2>/dev/null || true
 # Management agent (licence enforcement + remote commands + screen stream). Idles
 # quietly until the device is enrolled in /etc/thinclient/license.conf.
 systemctl enable thinclient-agent.service 2>/dev/null || true
+# Device activation from a USB stick (imports thinclient-activate.conf on boot;
+# udev also triggers it on hot-plug).
+systemctl enable thinclient-provision.service 2>/dev/null || true
 
 # Convert /opt/thinclient (a real dir) into /opt/thinclient-releases/<ver> plus a
 # symlink, so the updater can swap releases with an atomic `mv -T`. Every path
@@ -86,8 +89,8 @@ EOF
 mkdir -p /usr/share/xsessions
 cat >/usr/share/xsessions/thinclient.desktop <<'EOF'
 [Desktop Entry]
-Name=Esparks Thin Client
-Comment=Esparks IT Solutions RDP appliance
+Name=Thin Client
+Comment=Thin Client RDP appliance
 Exec=/opt/thinclient/bin/thinclient-xsession
 Type=Application
 DesktopNames=ThinClient
@@ -104,18 +107,45 @@ systemctl set-default graphical.target
 # ---------------------------------------------------------------------------
 # 4. No console login prompts anywhere (mask every getty).
 # ---------------------------------------------------------------------------
-for i in 1 2 3 4 5 6; do
+for i in 1 2 3 4 5 6 7 8; do
   systemctl mask "getty@tty${i}.service" || true
+  systemctl mask "autovt@tty${i}.service" || true
 done
 systemctl mask serial-getty@ttyS0.service || true
 systemctl mask console-getty.service || true
 systemctl mask getty-static.service || true
+# HARD-VERIFY the graphical-VT masks actually took. A SILENT mask failure on
+# tty7 is exactly what stranded 1.0.15 devices on "esparksit login:" after X
+# released VT7 (logind's ReserveVT=7 then span up autovt@tty7 there). A mask is a
+# symlink to /dev/null; check the filesystem directly (robust in a chroot where a
+# running systemd isn't present). Fail the BUILD rather than ship an ISO that can
+# fall through to a console login.
+for u in getty@tty7.service autovt@tty7.service; do
+  tgt="$(readlink -f "/etc/systemd/system/$u" 2>/dev/null || true)"
+  [ "$tgt" = "/dev/null" ] || { echo "FATAL: $u is not masked (symlink -> '$tgt', expected /dev/null) — refusing to build a console-reachable kiosk" >&2; exit 1; }
+done
+# The graphical session runs on VT7. If X ever dies (e.g. a GPU/driver crash) a
+# kiosk must NEVER fall through to a login prompt there — masking getty/autovt on
+# tty7 (above) prevents that, and this drop-in makes lightdm always restart so the
+# desktop comes straight back instead of a console.
+mkdir -p /etc/systemd/system/lightdm.service.d
+cat >/etc/systemd/system/lightdm.service.d/10-thinclient-restart.conf <<'EOF'
+[Unit]
+StartLimitIntervalSec=0
+[Service]
+Restart=always
+RestartSec=1
+EOF
 # Prevent logind from spawning gettys on VT switch and cap the VTs.
+# CRITICAL: ReserveVT must NOT be 7. VT7 is where X/lightdm runs; a ReserveVT=7
+# tells logind to keep a login getty on X's OWN VT, so the instant X releases it
+# logind pounces with "esparksit login:" there (the 1.0.15 bug). Point the reserve
+# at VT6 (masked, and X never uses it) so logind never eyes the graphical VT.
 mkdir -p /etc/systemd/logind.conf.d
 cat >/etc/systemd/logind.conf.d/10-thinclient.conf <<'EOF'
 [Login]
 NAutoVTs=1
-ReserveVT=7
+ReserveVT=6
 KillUserProcesses=no
 HandlePowerKey=poweroff
 HandleLidSwitch=ignore
@@ -173,9 +203,9 @@ cat >/etc/sysctl.d/99-thinclient.conf <<'EOF'
 kernel.sysrq = 0
 kernel.dmesg_restrict = 1
 EOF
-# Brand the console banner (Esparks IT Solutions) instead of the Debian default.
+# Brand the console banner (Thin Client) instead of the Debian default.
 cat >/etc/issue <<'EOF'
-Esparks IT Solutions Private Limited  \n \l
+Thin Client  \n \l
 
 EOF
 cp -f /etc/issue /etc/issue.net 2>/dev/null || true
@@ -210,7 +240,7 @@ fi
 update-initramfs -u || true
 
 # ---------------------------------------------------------------------------
-# 11. Branding (Esparks IT Solutions) + hostname + locale + timezone.
+# 11. Branding (Thin Client) + hostname + locale + timezone.
 # ---------------------------------------------------------------------------
 echo "esparksit" >/etc/hostname
 cat >/etc/hosts <<'EOF'
@@ -219,8 +249,8 @@ cat >/etc/hosts <<'EOF'
 EOF
 # Replace the Debian display name on any surface that shows it (keep ID=debian
 # so apt and tooling keep working).
-sed -i 's/^PRETTY_NAME=.*/PRETTY_NAME="Esparks IT Solutions"/' /etc/os-release 2>/dev/null || true
-sed -i 's/^NAME=.*/NAME="Esparks IT Solutions"/' /etc/os-release 2>/dev/null || true
+sed -i 's/^PRETTY_NAME=.*/PRETTY_NAME="Thin Client"/' /etc/os-release 2>/dev/null || true
+sed -i 's/^NAME=.*/NAME="Thin Client"/' /etc/os-release 2>/dev/null || true
 sed -i 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen 2>/dev/null || true
 locale-gen 2>/dev/null || true
 ln -sf /usr/share/zoneinfo/UTC /etc/localtime || true
@@ -261,8 +291,18 @@ while [ "$i" -lt 115 ]; do
   pgrep -x X >/dev/null 2>&1 && x_up=1
   if [ "$x_up" = 1 ] && \
      { pgrep -f 'thinclient-connect' >/dev/null 2>&1 || \
+       pgrep -f 'thinclient-lock' >/dev/null 2>&1 || \
        pgrep -x xfreerdp3 >/dev/null 2>&1 || pgrep -x xfreerdp >/dev/null 2>&1; }; then
     exit 0
+  fi
+  # SELF-HEAL (not the give-up path): if a login getty has grabbed the graphical
+  # VT (tty7), THAT is why the desktop can't paint. Re-mask + kill it and kick
+  # lightdm so the session reclaims the screen. Only if this never succeeds do we
+  # fall through to the permanent diagnostic below.
+  if pgrep -f 'agetty.*tty7' >/dev/null 2>&1; then
+    systemctl mask getty@tty7.service autovt@tty7.service 2>/dev/null || true
+    pkill -9 -f 'agetty.*tty7' 2>/dev/null || true
+    systemctl restart lightdm 2>/dev/null || true
   fi
   sleep 3; i=$((i + 3))
 done
@@ -273,7 +313,7 @@ sleep 2
 chvt 1 2>/dev/null || true
 {
   echo "==================================================================="
-  echo " Esparks IT Solutions - DIAGNOSTIC: the display session failed to start"
+  echo " Thin Client - DIAGNOSTIC: the display session failed to start"
   echo " >>> PHOTOGRAPH THIS SCREEN and send it to support. <<<"
   echo " Host: $(hostname)   $(date)"
   echo "==================================================================="
@@ -299,7 +339,7 @@ RESC
 chmod 0755 /usr/local/sbin/thinclient-rescue
 cat >/etc/systemd/system/thinclient-rescue.service <<'EOF'
 [Unit]
-Description=Esparks thin-client rescue diagnostic
+Description=Thin client rescue diagnostic
 After=lightdm.service
 [Service]
 Type=simple
@@ -336,8 +376,8 @@ fi
 # ---------------------------------------------------------------------------
 mkdir -p /etc/thinclient
 {
-  echo "product=Esparks IT Solutions — Thin Client"
-  echo "vendor=Esparks IT Solutions Private Limited"
+  echo "product=Thin Client — Thin Client"
+  echo "vendor=Thin Client"
   echo "base=Debian $(cat /etc/debian_version 2>/dev/null || echo 13)"
   echo "built_by=live-build"
 } >/etc/thinclient/build-info

@@ -48,13 +48,24 @@ render_openbox_config() {
 }
 render_openbox_config
 
-# --- Window manager (provides the admin hotkey + proper fullscreen focus) ----
+# --- Window manager (forces every window fullscreen; provides the admin hotkey)
+# A missing/dead WM is exactly what makes windows appear as small top-left boxes
+# (the connect form, the lock) or self-centered popups (yad) instead of proper
+# fullscreen. So: start Openbox, WAIT until it is actually the active WM before
+# mapping any window, and KEEP IT ALIVE for the whole session — a crash (flaky
+# GPU drivers can trigger one) would otherwise un-manage every window.
 if command -v openbox >/dev/null 2>&1; then
-  openbox --config-file "$HOME/.config/openbox/rc.xml" &
-  TC_WM_PID=$!
+  _start_wm() { openbox --config-file "$HOME/.config/openbox/rc.xml" >/dev/null 2>&1 & TC_WM_PID=$!; }
+  _start_wm
   log_info "Started Openbox (pid ${TC_WM_PID})"
-  # Give the WM a beat to own the root window before FreeRDP maps its window.
-  sleep 0.5
+  for _i in $(seq 1 60); do            # up to ~6s for the WM to own the root window
+    xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q '0x' && break
+    kill -0 "$TC_WM_PID" 2>/dev/null || _start_wm    # restart if it died while coming up
+    sleep 0.1
+  done
+  # Keepalive: if Openbox ever exits, bring it right back so windows stay managed.
+  ( while sleep 3; do pgrep -x openbox >/dev/null 2>&1 || _start_wm; done ) &
+  log_info "Openbox active (WM ready)"
 else
   log_warn "Openbox not installed; running WM-less."
 fi
@@ -67,6 +78,11 @@ if command -v pipewire >/dev/null 2>&1; then
   systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber.service 2>/dev/null \
     || { pipewire >/dev/null 2>&1 & pipewire-pulse >/dev/null 2>&1 & wireplumber >/dev/null 2>&1 & }
   log_info "Audio (PipeWire) started"
+  # If a USB headset is already plugged in at boot, make it the default sink+mic
+  # (udev handles later hot-plugs). Backgrounded so it never delays the session.
+  if [[ -x /opt/thinclient/bin/thinclient-audio-default ]]; then
+    ( sleep 4; /opt/thinclient/bin/thinclient-audio-default ) &
+  fi
 fi
 
 # --- Display: force each panel's native mode + size the launcher for HiDPI ----
@@ -85,6 +101,64 @@ if command -v xrandr >/dev/null 2>&1; then
   elif (( scr_w >= 2560 )); then export GDK_DPI_SCALE=1.4
   fi
   log_info "Display: width=${scr_w:-?} GDK_SCALE=${GDK_SCALE:-1} GDK_DPI_SCALE=${GDK_DPI_SCALE:-1}"
+fi
+
+# --- Auto-lock after N idle minutes. xautolock was dropped from Debian trixie,
+# so poll xprintidle (X idle time, ms) and fire the locker past the threshold.
+# NOTE: the LOCK-ON-STARTUP (password before the desktop) is now done inside
+# thinclient-connect, NOT here — running it here (before connect launches) made
+# the watchdog/rescue see "no session" during the lock and restart X / drop to
+# the diagnostic terminal. Doing it from connect keeps the session process alive.
+if [[ -x /opt/thinclient/bin/thinclient-lock ]]; then
+  idle_min="$(sed -n 's/^LOCK_IDLE_MIN=//p' /etc/thinclient/server.conf 2>/dev/null | head -1)"
+  [[ "$idle_min" =~ ^[0-9]+$ ]] && (( idle_min > 0 )) || idle_min=5
+  if command -v xprintidle >/dev/null 2>&1; then
+    ( idle_ms=$(( idle_min * 60 * 1000 ))
+      was_locked=0
+      while sleep 30; do
+        # An ACTIVE RDP session is active work — never idle-lock the operator out
+        # mid-call. FreeRDP runs with -grab-keyboard OFF, so xprintidle climbs
+        # while an agent talks without typing; without this guard the screen locks
+        # mid-call and they must re-enter the PIN. thinclient-connect maintains
+        # /run/thinclient/rdp-connected for the life of the FreeRDP child; while
+        # connected the session's own server-side policy governs locking. Reset the
+        # idle baseline so a fresh period starts the moment the session ends.
+        if [[ -e /run/thinclient/rdp-connected ]]; then
+          was_locked=0; continue
+        fi
+        # Gate on the actual lock PROCESS (not a signal file, which could go stale
+        # if a locker is SIGKILLed and permanently wedge auto-lock). While ANY lock
+        # is up — the boot login-lock from thinclient-connect, a Super+L, or a prior
+        # idle lock — never stack a second one.
+        if pgrep -f 'thinclient-lock' >/dev/null 2>&1; then
+          was_locked=1; continue
+        fi
+        # The tick right after a lock cleared: start a FRESH idle period instead of
+        # re-locking immediately. This deterministically prevents a second lock from
+        # appearing right after the boot lock is unlocked (the reported double-lock),
+        # independent of how xprintidle reports idle time across the unlock.
+        if (( was_locked )); then was_locked=0; continue; fi
+        i="$(xprintidle 2>/dev/null)"; [[ "$i" =~ ^[0-9]+$ ]] || continue
+        (( i >= idle_ms )) && /opt/thinclient/bin/thinclient-lock
+      done ) &
+    log_info "Auto-lock armed (${idle_min} min idle, xprintidle poll)"
+  fi
+fi
+
+# --- Support-chat launcher: the always-on-top bottom-right bubble ------------
+# Floats over everything (incl. the RDP session) so the operator can reach the
+# admin chat any time. Backgrounded + single-instance; started after the WM.
+if [[ -x /opt/thinclient/bin/thinclient-chat ]]; then
+  ( sleep 6; /opt/thinclient/bin/thinclient-chat ) &
+  log_info "Chat launcher started"
+fi
+
+# --- Internet-speed badge: always-on-top top-right indicator ----------------
+# Shows the device's internet speed + live latency to the RDP server (same value
+# the manager shows), floating over the connect screen and the RDP session.
+if [[ -x /opt/thinclient/bin/thinclient-netbadge ]]; then
+  ( sleep 7; /opt/thinclient/bin/thinclient-netbadge ) &
+  log_info "Net badge started"
 fi
 
 # --- Hand off to the RDP connection window (form -> connect -> repeat) --------
