@@ -2649,7 +2649,32 @@ def _mic_downgrade():
           % (win // 60, _MIC_FAILS), file=sys.stderr)
 
 
-def _cam_downgrade():
+# Errors that mean the USB endpoint has wedged, NOT that ffmpeg was asked for a format
+# the camera dislikes. STREAMON returning EPROTO with nothing else holding the device is
+# the signature: the node is enumerated and free, but the stream will not start.
+#
+# The distinction matters because the two need opposite treatment. A format problem is
+# fixed by trying another format; a wedged endpoint is not fixed by ANY format, so
+# rotating through four of them burns ~90 seconds and then drops the camera for minutes —
+# which is what an operator sees as "the camera stopped working again".
+_CAM_USB_FAULT = (
+    "vidioc_streamon",          # the stream would not start
+    "protocol error",           # EPROTO — the classic wedged-endpoint signature
+    "input/output error",       # EIO
+    "no such device",           # ENODEV: it vanished mid-open
+)
+
+
+def _cam_usb_fault(err: str) -> str:
+    """The USB-level phrase in an ffmpeg error, or "" if this looks like a format issue."""
+    low = (err or "").lower()
+    for k in _CAM_USB_FAULT:
+        if k in low:
+            return k
+    return ""
+
+
+def _cam_downgrade(err: str = ""):
     """A camera recording died almost immediately. The webcam is a single-owner v4l2
     device whose decode + PiP overlay (and, on a software-encode fallback, the extra CPU)
     can wedge or crash the WHOLE capture — and when the recorder restarts it races the
@@ -2692,6 +2717,7 @@ def _cam_downgrade():
     # logs — by then the recorder has long since released the camera and the file is
     # empty, which is exactly how this fault stayed unexplained through several
     # releases. Captured here it names the holder while the failure is live.
+    held = ""
     try:
         r = subprocess.run(["sh", "-c", "fuser -v /dev/video* 2>&1 | head -12"],
                            capture_output=True, text=True, timeout=8)
@@ -2699,6 +2725,35 @@ def _cam_downgrade():
         print("agent: camera holders at failure: %s" % (held or "(none)"), file=sys.stderr)
     except Exception:
         pass
+    # "(none)" is the important case: a USB fault with nobody holding the device is
+    # resettable, whereas the same error while another process owns the camera means
+    # waiting for that process, not power-cycling underneath it.
+    held = held.strip()
+
+    # A wedged USB endpoint is not a format problem — replug it instead.
+    #
+    # Without this the ladder below rotated through every capture format against a
+    # camera that could not stream in ANY of them, then dropped it for minutes, then
+    # repeated. The recovery an operator performs by hand is unplugging and replugging
+    # the SAME port, which means the port is fine and the device firmware has hung — and
+    # a hung device answers a bus-level reset. _camera_usb_reset carries its own backoff,
+    # attempt cap, and refuses to act when the camera is also the microphone in use.
+    fault = _cam_usb_fault(err)
+    if fault and not held:
+        print("agent: camera USB fault (%s) with no other holder - replugging in software"
+              % fault, file=sys.stderr)
+        if not _CAM_HEALTH.get("reported"):
+            _CAM_HEALTH["reported"] = True
+            _cam_event("CAMERA_LOST", node=cam_dev, reason=fault)
+        method = _camera_usb_reset(cam_dev)
+        if method:
+            _CAM_HEALTH["tried"] = method
+            _CAM_HEALTH["tried_at"] = time.time()
+            # Do NOT advance the format rotation: the format was never the problem, and
+            # spending a variant on it means the real format is retried later and less
+            # often. The next recording attempt retries the same one against a camera
+            # that has just been reset.
+            return
 
     # Try a different capture format before writing the camera off. Only once every
     # variant has failed does the backoff window open, so a camera that simply
@@ -2937,6 +2992,11 @@ def _rec_start(base: str, creds: dict, cfg: dict):
             # ALWAYS report why ffmpeg stopped — exit code + its own stderr. This used to
             # be logged only for deaths inside 20s, which meant a session that ran for an
             # hour and then exited told us NOTHING, and the recording silently split.
+            # Bound before the branch. `died_fast` implies `not alive` today, so the
+            # assignment below always happens before err is read — but that is a coupling
+            # between two conditions, not a guarantee, and the failure mode is a
+            # NameError that takes out the recorder tick.
+            err = ""
             if not alive:
                 err = _tail_text(_REC_SESSION.get("errpath", ""))
                 print("agent: recording ffmpeg exited rc=%s after %ds%s"
@@ -2951,7 +3011,9 @@ def _rec_start(base: str, creds: dict, cfg: dict):
                 # (decode + PiP overlay, heavier still under software encode) is the usual
                 # culprit + is single-owner, so keeping it retries the same crash forever.
                 if _REC_SESSION.get("camera"):
-                    _cam_downgrade()
+                    # ffmpeg's own stderr, so the handler can tell a wedged USB endpoint
+                    # from a format the camera dislikes — they need opposite treatment.
+                    _cam_downgrade(err)
                 _REC_FAILS += 1
                 _REC_RETRY_AT = time.time() + min(10 * _REC_FAILS, 120)   # back off the churn
             else:

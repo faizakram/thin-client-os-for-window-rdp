@@ -246,4 +246,49 @@ _young = _sess(); _young["started_run"] = time.time()
 check("a just-started run is given its grace period",
       m._rec_session_stalled(_young) is False)
 
+# --- a wedged USB endpoint is not a format problem -------------------------------
+#
+# STREAMON returning EPROTO with nothing else holding the camera means the node is
+# enumerated and free but the stream will not start — the device firmware has hung.
+# No capture format fixes that. The agent used to rotate through all four anyway,
+# burning ~90 seconds before dropping the camera for minutes, then repeating; that is
+# what an operator experiences as "the camera stopped working again". Seen on
+# Faiz-testing-0009, 24 Sep, immediately after an agent restart.
+check("STREAMON failure is recognised as a USB fault",
+      m._cam_usb_fault("ioctl(VIDIOC_STREAMON): Protocol error") == "vidioc_streamon")
+check("a bare protocol error is too",
+      m._cam_usb_fault("Error opening input: Protocol error") == "protocol error")
+check("so is an I/O error", m._cam_usb_fault("Input/output error") == "input/output error")
+check("so is the device disappearing", m._cam_usb_fault("No such device") == "no such device")
+check("a format complaint is NOT a USB fault",
+      m._cam_usb_fault("Unknown V4L2 pixel format equivalent") == "")
+check("...nor is a busy device", m._cam_usb_fault("Device or resource busy") == "")
+check("empty stderr is not a USB fault", m._cam_usb_fault("") == "")
+
+# The reset must be attempted, and the format rotation must NOT be spent on it.
+_reset_calls = []
+_real_reset = m._camera_usb_reset
+m._camera_usb_reset = lambda node: (_reset_calls.append(node), "usbreset")[1]
+_real_probe = m._cam_probe_format
+m._cam_probe_format = lambda dev: "mjpeg"
+m._camera_device = lambda: "/dev/video0"
+m.subprocess.run = lambda *a, **k: type("R", (), {"stdout": "", "returncode": 0})()
+m._CAM_HEALTH.clear()
+before = m._CAM_ATTEMPT
+m._cam_downgrade("ioctl(VIDIOC_STREAMON): Protocol error")
+check("a USB fault triggers the software replug", _reset_calls == ["/dev/video0"])
+check("...and does NOT spend a format-rotation attempt", m._CAM_ATTEMPT == before)
+check("...and reports the camera lost so it is measurable",
+      any(e.get("kind") == "CAMERA_LOST" for e in m._ACT_QUEUE))
+
+# A plain format failure still rotates, exactly as before.
+_reset_calls.clear()
+before = m._CAM_ATTEMPT
+m._cam_downgrade("Unknown V4L2 pixel format equivalent")
+check("a format failure does not replug the camera", _reset_calls == [])
+check("...and DOES advance the format rotation", m._CAM_ATTEMPT == before + 1)
+
+m._camera_usb_reset = _real_reset
+m._cam_probe_format = _real_probe
+
 print("\n  %d checks passed" % ok)
