@@ -2281,10 +2281,20 @@ def _cam_probe_format(cam_dev: str) -> str:
                            capture_output=True, text=True, timeout=10)
         out = (r.stdout or "").upper()
         if r.returncode != 0 or not out.strip():
-            # Device busy / no v4l2-ctl. Use the historical default for NOW but do NOT
-            # remember it — the next call retries, and one call will catch the camera
-            # free. Caching a failure is what pinned the wrong format permanently.
-            return "mjpeg"
+            # Could not read the camera's formats — almost always because ffmpeg already
+            # holds it while a recording restarts.
+            #
+            # This used to guess "mjpeg". On a camera that only offers YUYV that guess
+            # does NOT fail: ffmpeg opens the device and then spins at ~99% CPU emitting
+            # nothing at all, with an empty stderr. Sia ran 57 minutes that way on 23 Sep
+            # and produced a 176-byte recording — no screen either, because one ffmpeg
+            # serves both outputs.
+            #
+            # So pin nothing and let ffmpeg negotiate. The size stays pinned, which is
+            # what actually protects USB2 bandwidth; the format was only ever an
+            # optimisation. Still NOT cached — the next call retries and one will catch
+            # the camera free.
+            return ""
         if "MJPG" in out or "MJPEG" in out:
             fmt = "mjpeg"
         elif "YUYV" in out:
@@ -2295,7 +2305,9 @@ def _cam_probe_format(cam_dev: str) -> str:
             print("agent: %s offers neither MJPEG nor YUYV - letting ffmpeg choose"
                   % cam_dev, file=sys.stderr)
     except Exception:
-        return "mjpeg"          # transient: retry next time rather than remembering
+        # Same reasoning as above: an unreadable camera is a reason to stop guessing,
+        # not a reason to guess the format that wedges ffmpeg silently.
+        return ""               # transient: retry next time rather than remembering
     _CAM_FMT[ident] = fmt
     try:
         os.makedirs(os.path.dirname(disk), exist_ok=True)
@@ -2320,6 +2332,12 @@ def _cam_variants(cam_dev: str) -> list:
     if forced:
         return [(forced, size)]
     probed = _cam_probe_format(cam_dev)
+    if not probed:
+        # The probe could not read the camera, so there is nothing to prefer. Try
+        # unpinned first (ffmpeg negotiates), then each format explicitly. Listing
+        # ("", size) twice — which is what pairing it with a single "other" produced —
+        # wastes a rotation slot repeating an attempt that has already failed.
+        return [("", size), ("mjpeg", size), ("yuyv422", size), ("", "")]
     other = "yuyv422" if probed == "mjpeg" else "mjpeg"
     return [(probed, size), (other, size), ("", size), ("", "")]
 
@@ -2735,18 +2753,30 @@ def _rec_session_stalled(sess: dict) -> bool:
     # _REC_MAX_RUNS, sealed the file and started another, which is why recordings
     # arrived as a string of ~8-minute fragments. Check both layouts and take the
     # freshest, so older flat sessions still work.
+    # Judge EVERY enabled source, and take the STALEST — not the freshest.
+    #
+    # Taking the freshest meant one healthy stream masked a dead one. On 23 Sep Joey's
+    # screen stopped producing segments at 17:02 while his camera ran on until 17:53:
+    # the camera's fresh mtime kept saying "not stalled" and the machine recorded no
+    # screen at all for fifty minutes. A recording is only healthy when every source it
+    # claims to capture is still moving.
     outdir = sess.get("outdir", "")
-    newest = None
-    for rel in (("screen", "index.m3u8"), ("camera", "index.m3u8"), ("index.m3u8",)):
+    want = ["screen"] if not sess.get("camera") else ["screen", "camera"]
+    stalest = None
+    for src in want:
         try:
-            m = os.stat(os.path.join(outdir, *rel)).st_mtime
+            m = os.stat(os.path.join(outdir, src, "index.m3u8")).st_mtime
         except OSError:
-            continue
-        if newest is None or m > newest:
-            newest = m
-    if newest is None:
+            # Older flat layout (one stream, no per-source directory).
+            try:
+                m = os.stat(os.path.join(outdir, "index.m3u8")).st_mtime
+            except OSError:
+                return True               # this source has never produced an index
+        if stalest is None or m < stalest:
+            stalest = m
+    if stalest is None:
         return True                       # genuinely never produced an index
-    return (time.time() - newest) > _REC_STALL_SECS
+    return (time.time() - stalest) > _REC_STALL_SECS
 
 
 def _rec_resume(sess: dict, cfg: dict) -> bool:

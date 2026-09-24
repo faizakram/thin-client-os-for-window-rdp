@@ -132,8 +132,20 @@ if [[ -n "$CTRL_URL" && -n "$TEN_TOKEN" ]]; then
     MGR_HOST="${CTRL_URL#*://}"; MGR_HOST="${MGR_HOST%%/*}"; MGR_HOST="${MGR_HOST%%:*}"
     log "Waiting for the manager (${MGR_HOST}) to be reachable"
     NET_OK=0
-    for _i in $(seq 1 12); do            # up to ~90s
-      if curl -s -o /dev/null --max-time 8 "${CTRL_URL}/login" 2>/dev/null; then NET_OK=1; break; fi
+    NET_TRIES=12
+    for _i in $(seq 1 "$NET_TRIES"); do
+      # `timeout` as well as --max-time: curl's own timeouts are enforced inside its
+      # transfer loop, so a blocking name lookup can outlive --max-time entirely. An
+      # operator then sees one frozen line for minutes with no way to tell whether
+      # the installer is working or dead. The outer bound makes that impossible.
+      if timeout 12 curl -s -o /dev/null --max-time 8 --connect-timeout 5 \
+           "${CTRL_URL}/login" 2>/dev/null; then
+        NET_OK=1; break
+      fi
+      # Say something on EVERY attempt. Silence is what made this look like a hang —
+      # the check could run nearly three minutes without printing a character, and
+      # that is precisely when somebody power-cycles a machine mid-install.
+      printf '    attempt %d of %d — no reply from %s yet\n' "$_i" "$NET_TRIES" "$MGR_HOST"
       sleep 6
     done
     if [[ "$NET_OK" -eq 0 ]]; then
@@ -154,11 +166,44 @@ if [[ -n "$CTRL_URL" && -n "$TEN_TOKEN" ]]; then
         echo "    port 443: BLOCKED or unreachable  <- check the cable, VLAN or firewall"
       fi
       echo
-      echo "  Approval needs the manager, so nothing has been changed — ${DISK} is untouched."
-      echo "  Fix the network and run 'sudo thinclient-install' again."
+      echo "  ${DISK} has NOT been touched yet."
       echo
-      exit 1
+      # A dead end here is worse than it looks: the machine is already on someone's
+      # desk, and refusing to install leaves them with nothing while the network is
+      # investigated. Installing is safe to allow, because it grants nothing — an
+      # unregistered machine still has to ASK to join and still has to be approved
+      # before it receives any credentials. So offer the choice instead of deciding.
+      echo "  You can still install now. The machine will ask to join the fleet the"
+      echo "  first time it has a working network, and you approve it then — exactly"
+      echo "  as you would today. Nothing is granted without that approval."
+      echo
+      # Read from the console if there is one, otherwise from stdin. Binding only to
+      # /dev/tty means that wherever it is absent the question cannot be answered at
+      # all and the operator is refused whatever they wanted.
+      _off=""
+      if [[ -r /dev/tty ]]; then
+        read -r -p "  Install anyway, and join the fleet later? [y/N] " _off < /dev/tty || _off=""
+      else
+        read -r -p "  Install anyway, and join the fleet later? [y/N] " _off || _off=""
+      fi
+      case "$_off" in
+        [yY]|[yY][eE][sS])
+          warn "Installing without contacting the manager — this machine must be approved later"
+          rm -f "$ENROLL_CREDS"; ENROLL_CREDS=""
+          NET_OK=2   # continue, but skip the approval step entirely
+          ;;
+        *)
+          echo
+          echo "  Nothing has been changed — ${DISK} is untouched."
+          echo "  Fix the network and run 'sudo thinclient-install' again."
+          echo
+          exit 1
+          ;;
+      esac
     fi
+    if [[ "$NET_OK" -eq 2 ]]; then
+      log "Skipping the approval step — this machine will register when it first gets a network"
+    else
     ok "Manager reachable"
     log "Checking whether this machine needs approval before installing"
     ENROLL_CREDS="$(mktemp)"
@@ -186,6 +231,7 @@ if [[ -n "$CTRL_URL" && -n "$TEN_TOKEN" ]]; then
          exit 1
          ;;
     esac
+    fi   # end: manager was reachable (NET_OK -ne 2)
   else
     log "WARNING: thinclient-enroll not found — skipping the approval step"
   fi
@@ -196,9 +242,96 @@ fi
 # --------------------------------------------------------------------------- #
 # 2. Partition + format.
 # --------------------------------------------------------------------------- #
+# Release the target disk before touching it.
+#
+# `umount -R "$TARGET_MNT"` only ever released the installer's OWN mount point, never the
+# disk being installed to — so an install onto a machine that already had an operating
+# system died on:
+#
+#     wipefs: error: /dev/sda: probing initialization failed: Device or resource busy
+#
+# which tells the person standing at the machine nothing at all. A live boot routinely
+# holds the target disk: the desktop auto-mounts its partitions, a swap partition is
+# activated, or an LVM group / RAID array on it is assembled during boot. Each of those
+# keeps the whole block device open, and each needs a different command to let go.
+release_disk() {
+  local disk="$1"
+
+  # Swap first. A swap partition holds the device open and umount will not touch it, so
+  # doing this second would leave the disk busy after everything else had been released.
+  # Overridable ONLY so the release order can be exercised off a real Linux box. It
+  # defaults to the real file and nothing in the installer ever sets it.
+  if [[ -r "${TC_SWAPS_FILE:-/proc/swaps}" ]]; then
+    local sdev
+    while read -r sdev _; do
+      [[ "$sdev" == "$disk"* ]] && { swapoff "$sdev" 2>/dev/null || true; }
+    done < <(tail -n +2 "${TC_SWAPS_FILE:-/proc/swaps}")
+  fi
+
+  # Unmount every mounted partition of this disk, deepest path first so a nested mount
+  # (/mnt/x and /mnt/x/boot) comes off in the right order.
+  local mp
+  while read -r mp; do
+    [[ -n "$mp" && "$mp" != "[SWAP]" ]] && { umount -R "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null || true; }
+  done < <(lsblk -nrpo MOUNTPOINT "$disk" 2>/dev/null | grep -v '^$' | sort -r)
+
+  # An LVM group or RAID array built on this disk keeps it open through device-mapper,
+  # and no amount of unmounting releases it — the mapping itself has to go.
+  if command -v vgchange >/dev/null 2>&1; then vgchange -an >/dev/null 2>&1 || true; fi
+  if command -v mdadm >/dev/null 2>&1; then mdadm --stop --scan >/dev/null 2>&1 || true; fi
+  if command -v dmsetup >/dev/null 2>&1; then
+    local h
+    for h in /sys/block/"$(basename "$disk")"/holders/*; do
+      [[ -e "$h" ]] && dmsetup remove "$(basename "$h")" >/dev/null 2>&1 || true
+    done
+  fi
+
+  udevadm settle 2>/dev/null || true
+}
+
+# Is anything still holding it? Checked explicitly so the failure can NAME the holder
+# rather than surfacing a wipefs error nobody can act on.
+disk_holders() {
+  local disk="$1" out=""
+  local mounts; mounts="$(lsblk -nrpo NAME,MOUNTPOINT "$disk" 2>/dev/null | awk 'NF>1 {printf "    %s is mounted at %s\n", $1, $2}')"
+  [[ -n "$mounts" ]] && out+="$mounts"
+  local sw; sw="$(awk -v d="$disk" 'NR>1 && index($1,d)==1 {printf "    %s is in use as swap\n", $1}' "${TC_SWAPS_FILE:-/proc/swaps}" 2>/dev/null)"
+  [[ -n "$sw" ]] && out+="$sw"
+  local hd
+  for hd in /sys/block/"$(basename "$disk")"/holders/*; do
+    [[ -e "$hd" ]] && out+="    held by $(basename "$hd") (RAID or LVM)\n"
+  done
+  printf '%b' "$out"
+}
+
 log "Partitioning ${DISK} (EFI=${EFI_PART}, root=${ROOT_PART})"
 umount -R "$TARGET_MNT" 2>/dev/null || true
-wipefs -a "$DISK"
+log "Releasing ${DISK} (unmounting partitions, swap off, RAID/LVM down)"
+release_disk "$DISK"
+
+if ! wipefs -a "$DISK" 2>/dev/null; then
+  # Second attempt: a udev rule or a desktop automounter can re-take a disk the moment
+  # it is released, so one retry after settling turns a race into a non-event.
+  sleep 2; release_disk "$DISK"
+  if ! wipefs -a "$DISK"; then
+    echo
+    echo "  Cannot write to ${DISK} — something on this machine is still using it."
+    echo
+    local_holders="$(disk_holders "$DISK")"
+    if [[ -n "$local_holders" ]]; then
+      echo "  Still in use by:"
+      printf '%s' "$local_holders"
+    else
+      echo "  Nothing obvious is holding it, which usually means the disk is failing"
+      echo "  or is read-only (a hardware write-protect jumper, or a dying SSD)."
+    fi
+    echo
+    echo "  ${DISK} has NOT been changed. Shut down, remove any other drive you do not"
+    echo "  want touched, and run 'sudo thinclient-install' again."
+    echo
+    exit 1
+  fi
+fi
 sgdisk --zap-all "$DISK"
 sgdisk -n1:0:+512M -t1:ef00 -c1:"EFI" "$DISK"
 sgdisk -n2:0:0     -t2:8300 -c2:"THINCLIENT_ROOT" "$DISK"

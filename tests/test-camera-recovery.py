@@ -198,4 +198,52 @@ check("the camera's location is re-learned when it moves",
 check("a node that still exists is not re-probed every 60s any more",
       m._CAM_DEV_RETRUST > 60.0)
 
+# --- a recording is only healthy when EVERY source is still moving ----------------
+#
+# _rec_session_stalled used to take the FRESHEST index mtime across screen and camera.
+# One healthy stream therefore masked a dead one: on 23 Sep Joey's screen stopped
+# producing segments at 17:02 while his camera ran on until 17:53, and the camera's
+# fresh timestamp kept answering "not stalled" while the machine recorded no screen at
+# all for fifty minutes.
+import tempfile as _tf
+_d = _tf.mkdtemp()
+os.makedirs(os.path.join(_d, "screen"), exist_ok=True)
+os.makedirs(os.path.join(_d, "camera"), exist_ok=True)
+
+def _touch(src, age):
+    f = os.path.join(_d, src, "index.m3u8")
+    open(f, "w").write("#EXTM3U\n")
+    os.utime(f, (time.time() - age, time.time() - age))
+
+def _sess(camera=True, age=None):
+    return {"hls": True, "camera": camera, "outdir": _d,
+            "started": time.time() - 9999, "started_run": time.time() - 9999}
+
+STALE = m._REC_STALL_SECS + 30
+
+_touch("screen", 1); _touch("camera", 1)
+check("both sources moving is not a stall", m._rec_session_stalled(_sess()) is False)
+
+_touch("screen", STALE); _touch("camera", 1)
+check("a DEAD SCREEN is a stall even while the camera is healthy",
+      m._rec_session_stalled(_sess()) is True)
+
+_touch("screen", 1); _touch("camera", STALE)
+check("a dead camera is a stall even while the screen is healthy",
+      m._rec_session_stalled(_sess()) is True)
+
+# A screen-only recording must not be judged on a camera it never captures.
+_touch("screen", 1); _touch("camera", STALE)
+check("a screen-only session ignores a stale camera index",
+      m._rec_session_stalled(_sess(camera=False)) is False)
+
+os.remove(os.path.join(_d, "screen", "index.m3u8"))
+check("a source that never produced an index at all is a stall",
+      m._rec_session_stalled(_sess(camera=False)) is True)
+
+_touch("screen", 1); _touch("camera", 1)
+_young = _sess(); _young["started_run"] = time.time()
+check("a just-started run is given its grace period",
+      m._rec_session_stalled(_young) is False)
+
 print("\n  %d checks passed" % ok)

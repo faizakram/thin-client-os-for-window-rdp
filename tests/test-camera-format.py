@@ -175,4 +175,43 @@ check("a cached node that has vanished is re-probed, not trusted",
 
 m.os.path.exists, m.glob.glob = real_exists, real_glob
 
+# --- a camera whose formats could not be read ------------------------------------
+#
+# The probe fails with "Device or resource busy" whenever ffmpeg already holds the
+# camera, which is every time a recording restarts. It used to answer "mjpeg" anyway.
+# On a YUYV-only camera that guess does not FAIL — ffmpeg opens the device and then
+# spins at ~99% CPU producing nothing, with an empty stderr, so no failure is ever
+# detected and no format rotation happens. Sia ran 57 minutes like that on 23 Sep and
+# produced a 176-byte recording, screen included: one ffmpeg serves both outputs.
+m.conf_get = lambda k, d="": d
+m._CAM_FMT.clear()
+# And the PERSISTED format too. Earlier cases left "CAMERA-C yuyv422" on disk, and that
+# file is deliberately authoritative — it exists so a probe that cannot run (because the
+# recorder is holding the camera) still gets the right answer. This case is specifically
+# a camera nothing has ever managed to read.
+try: os.remove(m.CAM_FORMAT_STATE)
+except OSError: pass
+
+class _Fail:
+    returncode = 1
+    stdout = ""
+_real_run = m.subprocess.run
+m.subprocess.run = lambda *a, **k: _Fail()
+m.os.path.exists = lambda p: False          # skip the sysfs shortcut, force the v4l2-ctl path
+# REAL_PROBE, not m._cam_probe_format: the ladder tests above replaced that name with a
+# stub and never put it back, so calling it here would test the stub.
+check("an unreadable camera pins NO format rather than guessing one",
+      REAL_PROBE("/dev/video0") == "")
+check("...and the guess is not remembered", "mjpeg" not in m._CAM_FMT.values())
+m.subprocess.run = _real_run
+m.os.path.exists = real_exists
+
+m._cam_probe_format = lambda dev: ""
+v = m._cam_variants("/dev/video0")
+check("unpinned is tried first when the format is unknown", v[0] == ("", "640x480"))
+check("then MJPEG explicitly", v[1] == ("mjpeg", "640x480"))
+check("then YUYV explicitly — not a repeat of attempt one", v[2] == ("yuyv422", "640x480"))
+check("and finally nothing pinned at all", v[3] == ("", ""))
+check("every rotation slot is a DIFFERENT attempt", len({tuple(x) for x in v}) == len(v))
+
 print("\n  %d passed" % ok)

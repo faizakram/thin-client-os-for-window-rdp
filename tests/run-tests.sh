@@ -21,7 +21,7 @@ else
 fi
 
 # --- Unit suites -------------------------------------------------------------
-for suite in test-config-parsing test-config-cli test-rdp-args test-watchdog test-admin-auth; do
+for suite in test-config-parsing test-config-cli test-rdp-args test-watchdog test-admin-auth test-installer-reachability test-installer-disk-release test-iso-naming; do
   banner "$suite"
   if bash "$HERE/${suite}.sh"; then :; else fail_total=$((fail_total+1)); fi
 done

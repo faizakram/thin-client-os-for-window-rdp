@@ -311,6 +311,14 @@ build() {
   [[ -n "$produced" ]] || die "Build finished but no ISO was produced. See build/build.log."
 
   install -d "${PROJECT_ROOT}/iso"
+  # Unlink first, then copy. `cp -f` opens the existing file and truncates it, so it
+  # writes THROUGH to the same inode — and every previously named tenant ISO is a hard
+  # link to that inode. Copying in place therefore silently rewrote every past image:
+  # thinclient-1.0.122-quantum.iso ended up containing a completely different build
+  # while still carrying 1.0.122 in its name. A bootable image whose filename lies
+  # about its contents is the exact failure the per-tenant naming exists to prevent.
+  # Removing the link first gives each build a fresh inode and leaves history intact.
+  rm -f "$OUTPUT_ISO"
   cp -f "$produced" "$OUTPUT_ISO"
   ( cd "${PROJECT_ROOT}/iso" && sha256sum "$(basename "$OUTPUT_ISO")" >"$(basename "$OUTPUT_ISO").sha256" )
 
