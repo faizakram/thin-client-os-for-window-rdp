@@ -1657,8 +1657,82 @@ def _merge_screen() -> bool:
     return bool(_STREAM_ACTIVE)
 
 
+def _lock_owner_alive(pid: int) -> bool:
+    """Is `pid` a LIVE thinclient-lock? Checked against /proc rather than a bare
+    signal-0, because PIDs are recycled: /run is tmpfs and survives an X restart, so
+    a stale flag can easily outlive its writer long enough for the number to be
+    handed to something else entirely, and "some process exists" would then keep the
+    device locked forever on a coincidence."""
+    if pid <= 0:
+        return False
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            return b"thinclient-lock" in f.read()
+    except OSError:
+        return False          # no such process, or it exited while we looked
+
+
+_LOCKER_SCAN = [0.0, False]    # (checked_at, result) — see _locker_running
+
+
+def _locker_running() -> bool:
+    """Fallback liveness check: is ANY screen locker up? Used only when the signal
+    file carries no usable PID — a flag written by a pre-1.0.156 locker, or caught
+    mid-write. Deliberately not the primary check: it cannot tell one locker from
+    another, and it costs a process spawn.
+
+    Cached for 2s because the recording overlay asks once a SECOND; without the cache
+    a legacy flag plus a genuinely-locked screen would fork pgrep 60 times a minute
+    for the whole lock."""
+    now = time.time()
+    if now - _LOCKER_SCAN[0] < 2.0:
+        return _LOCKER_SCAN[1]
+    try:
+        alive = subprocess.run(["pgrep", "-f", "thinclient-lock"],
+                               capture_output=True, timeout=5).returncode == 0
+    except Exception:
+        alive = True          # can't tell -> assume locked; never expose a live desktop
+    _LOCKER_SCAN[0], _LOCKER_SCAN[1] = now, alive
+    return alive
+
+
+def _screen_locked() -> bool:
+    """The OPERATOR's screen lock (Super+L, the idle lock, the boot lock), read from
+    /run/thinclient/locked — and verified against the process that wrote it.
+
+    Trusting the file alone was the bug. thinclient-lock removes it in a `finally`,
+    which a SIGKILL, an X/GTK abort or (before 1.0.156) any SIGTERM skips entirely;
+    /run is tmpfs, so the orphaned flag then said "locked" until the next reboot. The
+    device carried on working normally underneath while the agent stamped
+    "SCREEN LOCKED" onto the live view and the recordings, logged a LOCK that never
+    got its UNLOCK — booking the rest of the operator's shift as away-from-desk — and
+    left the RDP freeze watchdog parked. thinclient-xsession's auto-lock loop already
+    learned this lesson and gates on the process; this is the other half.
+
+    Self-healing: an orphaned flag is DELETED here, so the LOCK/UNLOCK edge detector
+    closes the dangling lock on the very next poll without anyone rebooting the box.
+    """
+    try:
+        with open(SIG_LOCK) as f:
+            raw = f.read().strip()
+    except OSError:
+        return False                      # no flag at all -> not locked
+    try:
+        alive = _lock_owner_alive(int(raw.split()[0]))
+    except (ValueError, IndexError):
+        alive = _locker_running()         # legacy/empty flag -> fall back to a scan
+    if alive:
+        return True
+    try:
+        os.remove(SIG_LOCK)
+        print("agent: cleared a stale screen-lock flag (its locker is gone)", file=sys.stderr)
+    except OSError:
+        pass
+    return False
+
+
 def _is_locked() -> bool:
-    return os.path.exists(ADMIN_LOCK) or os.path.exists(SIG_LOCK)
+    return os.path.exists(ADMIN_LOCK) or _screen_locked()
 
 
 def _fmt_hms(sec: int) -> str:
@@ -4779,6 +4853,12 @@ def cmd_poll() -> int:
         cam_stream=_rec_owns_camera(),
         rdp_active=_rdp_active(),                                        # operator in a live RDP session?
         admin_locked=os.path.exists(ADMIN_LOCK),                         # device's actual lock state
+        # The OPERATOR's own screen lock, reported separately — it is what puts the
+        # "SCREEN LOCKED" banner on the live view and the recordings, and it is NOT
+        # the admin lock. When a stale flag wedged this on (see _screen_locked), the
+        # console had no way to see it: the device looked normal in every field it
+        # reported while an admin stared at a lock banner over a working desktop.
+        screen_locked=_screen_locked(),
         net_kbps=_net_kbps(),                                            # real download speed test
         **({"net_up_kbps": _up_kbps} if _up_kbps >= 0 else {}),          # measured UPLOAD speed (kbps)
         net_latency_ms=_lat_ms,                                          # live TCP latency to RDP server

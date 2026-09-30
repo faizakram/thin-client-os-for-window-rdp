@@ -25,6 +25,16 @@ DEFAULT_PW = "0000"
 _ITER = 120000
 # Shared runtime signal the agent reads to know the screen is locked (feeds the
 # activity view + the recording lock overlay/markers).
+#
+# It carries THIS PROCESS'S PID, and that is the whole point. An empty flag file
+# outlives whatever wrote it: systemd SIGTERMs the X session (a watchdog restart,
+# an OTA apply, LightDM cycling), Python's default SIGTERM disposition kills us
+# outright, the `finally` below never runs — and /run is tmpfs, so the flag then
+# sits there claiming "locked" until the next REBOOT. Downstream that is not
+# cosmetic: the agent burns "SCREEN LOCKED" into every live frame and recording,
+# reports a LOCK with no matching UNLOCK (the operator's whole shift books as
+# away-from-desk), and parks the RDP freeze watchdog. With the PID in the file a
+# reader can ask the one question that settles it — is that process still alive?
 LOCK_SIGNAL = "/run/thinclient/locked"
 # When the manager locks a device the agent writes this file. While it exists the
 # operator CANNOT unlock — only the manager (or the agent's auto-expiry window)
@@ -200,11 +210,47 @@ def _lock_signal(on):
     try:
         if on:
             os.makedirs("/run/thinclient", exist_ok=True)
-            open(LOCK_SIGNAL, "w").close()
+            # Written atomically: the agent polls this file every couple of seconds,
+            # and a reader that caught it mid-write would see an empty file and fall
+            # back to the (slower, less precise) process scan.
+            tmp = LOCK_SIGNAL + ".tmp"
+            with open(tmp, "w") as f:
+                f.write("%d\n" % os.getpid())
+            os.replace(tmp, LOCK_SIGNAL)
         elif os.path.exists(LOCK_SIGNAL):
             os.remove(LOCK_SIGNAL)
     except OSError:
         pass
+
+
+def _install_exit_signals():
+    """Make a polite shutdown actually run our cleanup.
+
+    Python's default SIGTERM/SIGHUP disposition terminates the interpreter without
+    unwinding, so `finally` is skipped and the lock signal is orphaned. Every routine
+    teardown of the graphical session sends exactly those signals: `systemctl restart
+    lightdm` from the watchdog, an OTA apply, a logout, a VT switch away. Translating
+    them into a normal exit costs nothing and removes the common half of the
+    stale-flag problem at the source. A SIGKILL or a hard X/GTK abort still cannot be
+    caught here — that residue is what the reader-side liveness check exists for.
+    """
+    import signal as _sig
+
+    def _bye(signum, _frame):
+        _lock_signal(False)
+        # Re-raise with the default handler so the exit status still reports the
+        # signal; the process is going away either way.
+        try:
+            _sig.signal(signum, _sig.SIG_DFL)
+            os.kill(os.getpid(), signum)
+        except Exception:
+            os._exit(0)
+
+    for s in ("SIGTERM", "SIGHUP", "SIGINT"):
+        try:
+            _sig.signal(getattr(_sig, s), _bye)
+        except (ValueError, OSError, AttributeError):
+            pass
 
 
 def _current_zone():
@@ -748,6 +794,7 @@ def main():
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except Exception:
         return 0
+    _install_exit_signals()
     _lock_signal(True)
     try:
         run_lock_gui()
