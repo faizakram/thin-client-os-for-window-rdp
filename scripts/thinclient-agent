@@ -4860,6 +4860,8 @@ def cmd_poll() -> int:
     # the window instead of stranding them until it can reach the manager again.
     if os.path.exists(ADMIN_LOCK) and _admin_lock_expired():
         set_admin_lock(False); _ADMIN_LOCK_EXPIRED_IGNORE = True
+    # A wrong-password lockout holds even if this poll never reaches the manager.
+    _hold_local_lockout()
     resp = _curl_json("%s/api/agent/poll" % base, dict(
         creds, version=_current_version(),
         camera=os.path.exists(_camera_device()),  # is a camera attached?
@@ -4918,7 +4920,15 @@ def cmd_poll() -> int:
     locked_flag = bool(resp.get("locked"))
     lock_kind = resp.get("lock_kind") or "admin"
     lock_msg = resp.get("lock_message") or ""
-    if not locked_flag:
+    # A wrong-password lockout outranks the manager's lock flag — this is the trap the
+    # security plan warns about. The manager's "not locked" used to be copied on every
+    # poll, so a lockout the DEVICE raised would have been undone within seconds, before
+    # the manager had even heard of it. It is released only when the manager has
+    # acknowledged THIS lockout (lockout_ack == its locked_at) and then says unlocked:
+    # i.e. an administrator pressed Unlock after seeing it.
+    if _reconcile_lockout(locked_flag, resp.get("lockout_ack")):
+        pass                                   # still locked out — leave the lock alone
+    elif not locked_flag:
         set_admin_lock(False); _ADMIN_LOCK_EXPIRED_IGNORE = False
     elif lock_kind == "schedule":
         # A WORKING-HOURS lock is re-derived by the manager on every poll and clears
@@ -4956,6 +4966,15 @@ def cmd_poll() -> int:
         print("agent: adopted rotated device secret", file=sys.stderr)
     # Admin reset the screen-lock password: hand it to the locker, which hashes
     # + stores it for the kiosk user (server never keeps the plaintext).
+    lock_hash = resp.get("set_lock_hash")
+    if lock_hash:
+        # The manager hashed it: the password itself was never stored or sent.
+        try:
+            subprocess.run(["/opt/thinclient/bin/thinclient-lock", "set-hash", lock_hash,
+                            conf_get("SESSION_USER", "thinclient")], capture_output=True, timeout=15)
+            print("agent: screen-lock password reset by admin (hash)", file=sys.stderr)
+        except Exception as e:
+            print("agent: lock password reset failed: %s" % e, file=sys.stderr)
     lock_pw = resp.get("set_lock_password")
     if lock_pw:
         try:
@@ -5188,8 +5207,102 @@ def _hardware_facts():
     return {"hardware": dict(_HW_FACTS)} if _HW_FACTS else {}
 
 
+# --- Lock-screen lockout (security plan A4) ---------------------------------------
+# The lock screen (running as the kiosk user) records wrong passwords in its home.
+# The 3rd one locks it out; the agent turns that into an administrator lock and tells
+# the manager. Only an administrator's Unlock lifts it.
+def _kiosk_home():
+    try:
+        import pwd
+        return pwd.getpwnam(conf_get("SESSION_USER", "thinclient")).pw_dir
+    except Exception:
+        return "/home/thinclient"
+
+
+def _lock_state_path():
+    return os.path.join(_kiosk_home(), ".thinclient-lock-state.json")
+
+
+def _read_json(path):
+    try:
+        with open(path) as f:
+            v = json.load(f)
+        return v if isinstance(v, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _local_lockout():
+    """The lockout the lock screen recorded, or None."""
+    st = _read_json(_lock_state_path())
+    return st if st.get("locked_at") else None
+
+
+def _clear_local_lockout():
+    """An administrator lifted it: fresh tries. Written back owned by the kiosk user,
+    because it is the lock screen's file."""
+    path = _lock_state_path()
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"fails": 0}, f)
+        os.chmod(tmp, 0o600)
+        try:
+            import pwd
+            u = pwd.getpwnam(conf_get("SESSION_USER", "thinclient"))
+            os.chown(tmp, u.pw_uid, u.pw_gid)
+        except Exception:
+            pass
+        os.replace(tmp, path)
+        print("agent: lockout lifted by an administrator", file=sys.stderr)
+    except OSError as e:
+        print("agent: could not clear lockout: %s" % e, file=sys.stderr)
+
+
+def _hold_local_lockout():
+    """Keep a recorded lockout locked whatever else happens — offline, between polls,
+    or before the manager has heard about it. Permanent, never timed: a timed lock
+    auto-releases after its hours, which would hand a guesser three fresh tries a day."""
+    if _local_lockout():
+        set_admin_lock(True, "permanent", 24, "")
+        _drop_rdp_session("wrong-password lockout")
+        return True
+    return False
+
+
+def _reconcile_lockout(manager_locked, lockout_ack):
+    """True while a wrong-password lockout is in force, so the poll must NOT apply the
+    manager's lock flag. Released only when the manager has acknowledged THIS lockout
+    (its ack equals our locked_at) AND says unlocked — an administrator pressed Unlock
+    after seeing it. Before the acknowledgement, a "not locked" means only that the
+    manager has not heard yet, and is ignored."""
+    lockout = _local_lockout()
+    if lockout is None:
+        return False
+    try:
+        acked = int(float(lockout_ack or 0)) == int(float(lockout["locked_at"]))
+    except (TypeError, ValueError):
+        acked = False
+    if acked and not manager_locked:
+        _clear_local_lockout()
+        return False
+    _hold_local_lockout()
+    return True
+
+
 def _lockout_report():
-    return {}   # filled in by the lock-screen policy (security plan A4)
+    home = _kiosk_home()
+    m = _read_json(os.path.join(home, ".thinclient-lock.meta.json"))
+    rep = {"lock_password": {
+        "set_at": int(m["set_at"]) if m.get("set_at") else None,
+        "is_default": not os.path.exists(os.path.join(home, ".thinclient-lock")),
+        "must_change": bool(m.get("must_change")),
+        "weak": bool(m.get("weak")),
+    }}
+    lo = _local_lockout()
+    if lo:
+        rep["lockout"] = {"locked_at": int(lo["locked_at"]), "fails": int(lo.get("fails", 0))}
+    return rep
 
 
 # Debug access that must never exist on a fleet device. The debug user and its password

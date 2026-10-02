@@ -12,6 +12,7 @@
 #  Usage:
 #     thinclient-lock                      # lock the screen (GUI)
 #     thinclient-lock set-password PW [USER]   # set/reset a user's lock password
+#     thinclient-lock set-hash SALT:HASH [USER] # admin reset, hash only (preferred)
 # =============================================================================
 import fcntl
 import hashlib
@@ -300,14 +301,221 @@ def verify(pw):
         return False
 
 
-def set_password(pw, path=None):
+# ---------------------------------------------------------------------------------
+# Password policy + lockout (security plan A4). The rules live in the shared
+# thinclient-secpolicy module; with no policy received they reproduce exactly what this
+# lock screen always did — any non-empty password, unlimited tries, no expiry.
+# ---------------------------------------------------------------------------------
+LOCK_STATE = os.path.expanduser("~/.thinclient-lock-state.json")
+LOCKOUT_TITLE = "Locked after too many wrong passwords"
+LOCKOUT_SUB = ("Your administrator has been notified and can unlock this device. "
+               "You can message them below.")
+_SECPOL = None
+
+
+def secpolicy():
+    """The shared policy module, or None. None means "behave as before"."""
+    global _SECPOL
+    if _SECPOL is None:
+        _SECPOL = False
+        try:
+            import importlib.machinery, importlib.util
+            here = os.path.dirname(os.path.abspath(__file__))
+            for path in (os.path.join(here, "thinclient-secpolicy"),
+                         "/opt/thinclient/bin/thinclient-secpolicy"):
+                if os.path.exists(path):
+                    spec = importlib.util.spec_from_loader(
+                        "tc_secpolicy", importlib.machinery.SourceFileLoader("tc_secpolicy", path))
+                    mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+                    _SECPOL = mod
+                    break
+        except Exception:
+            pass
+    return _SECPOL or None
+
+
+def _policy():
+    sp = secpolicy()
+    return sp.load() if sp else None
+
+
+def _json_load(path):
+    try:
+        with open(path) as f:
+            v = json.load(f)
+        return v if isinstance(v, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _json_save(path, data):
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def _meta_path(target=None):
+    return (target or LOCK_FILE) + ".meta.json"
+
+
+def meta():
+    """When the password was set, recent hashes, and flags. `is_default` is not
+    stored: no lock file means the factory password is still in force."""
+    m = _json_load(_meta_path())
+    m["is_default"] = not os.path.exists(LOCK_FILE)
+    return m
+
+
+def set_password(pw, path=None, must_change=False):
+    """Store a new password (salted PBKDF2, as always) and record it in the sidecar:
+    when it was set (by the manager-vouched clock, so winding the device clock back
+    cannot postpone expiry), the previous hash for the no-reuse rule, and whether it
+    must be changed at the next unlock (an administrator's reset)."""
     target = path or LOCK_FILE
+    prev = None
+    try:
+        with open(target) as f:
+            prev = f.read().strip() or None
+    except OSError:
+        pass
     salt = os.urandom(8).hex()
     tmp = target + ".tmp"
     with open(tmp, "w") as f:
         f.write("%s:%s\n" % (salt, _hash(pw, salt)))
     os.chmod(tmp, 0o600)
     os.replace(tmp, target)
+    _record_new_password(target, prev, must_change)
+
+
+def _record_new_password(target, prev, must_change):
+    sp = secpolicy()
+    m = _json_load(_meta_path(target))
+    hist = list(m.get("history") or [])
+    if prev:
+        hist.insert(0, prev)
+    m["history"] = hist[:24]
+    m["set_at"] = sp.trusted_now() if sp else time.time()
+    m["must_change"] = bool(must_change)
+    m["weak"] = False
+    _json_save(_meta_path(target), m)
+
+
+def lock_state():
+    return _json_load(LOCK_STATE)
+
+
+def lockout_active():
+    """A lockout stands until the MANAGER clears it — not until the next correct
+    password. Reboots do not clear it either: the state is on disk."""
+    return bool(lock_state().get("locked_at"))
+
+
+def _note_failure():
+    """Count one wrong password. Returns (locked_now, attempts_left or None)."""
+    pol = _policy()
+    sp = secpolicy()
+    if not (pol and sp):
+        return False, None
+    st, locked = sp.lockout_after_failure(lock_state(), pol)
+    try:
+        _json_save(LOCK_STATE, st)
+    except OSError:
+        pass
+    left = None
+    if pol["lockout"]["enabled"] and not locked:
+        left = max(0, pol["lockout"]["attempts"] - st["fails"])
+    return locked, left
+
+
+def _clear_failures():
+    """A correct password resets the count — but never a lockout (manager only)."""
+    st = lock_state()
+    if st.get("fails") and not st.get("locked_at"):
+        try:
+            _json_save(LOCK_STATE, {"fails": 0})
+        except OSError:
+            pass
+
+
+def _wrong_message(left):
+    if left is None:
+        return "Incorrect password"
+    if left == 1:
+        return "Incorrect password — 1 attempt left before this device locks"
+    return "Incorrect password — %d attempts left" % left
+
+
+def attempt_unlock(pw):
+    """One unlock attempt at the lock screen. Returns one of:
+        ("locked", None)          the device is locked out (now or already)
+        ("wrong", message)        wrong password, not (yet) locked out
+        ("ok", None)              let them in
+        ("remind", days_left)     correct; offer to change before it expires
+        ("change", reason)        correct, but a new password is required first
+    With no policy this is exactly the old behaviour: ok or "Incorrect password"."""
+    if lockout_active():
+        return ("locked", None)
+    if not verify(pw):
+        locked, left = _note_failure()
+        return ("locked", None) if locked else ("wrong", _wrong_message(left))
+    _clear_failures()
+    pol, sp = _policy(), secpolicy()
+    if not (pol and sp) or not pol["password"]["enabled"]:
+        return ("ok", None)
+    m = meta()
+    if not m.get("set_at") and not m["is_default"]:
+        # A password from before the policy: start its clock now, rather than
+        # expiring the whole fleet the day a policy is switched on.
+        m["set_at"] = sp.trusted_now()
+    # The current password was just typed, so its STRENGTH can be judged now — the
+    # only moment that is possible (only its hash is stored).
+    if sp.check_password(pw, pol):
+        m["weak"] = True
+    try:
+        _json_save(_meta_path(), {k: v for k, v in m.items() if k != "is_default"})
+    except OSError:
+        pass
+    status, detail = sp.password_status(m, pol)
+    if status in ("must_change", "expired"):
+        return ("change", detail if status == "must_change" else "Your password has expired — please choose a new one")
+    if status == "remind":
+        return ("remind", detail)
+    return ("ok", None)
+
+
+def attempt_current(pw):
+    """The "current password" step of Change password. It counts towards the lockout
+    exactly like an unlock attempt — otherwise the change form is an unlimited way to
+    guess. Returns ("ok"|"wrong"|"locked", message)."""
+    if lockout_active():
+        return ("locked", None)
+    if verify(pw):
+        _clear_failures()
+        return ("ok", None)
+    locked, left = _note_failure()
+    return ("locked", None) if locked else ("wrong", _wrong_message(left).replace(
+        "Incorrect password", "Current password is wrong"))
+
+
+def validate_new(pw):
+    """Why `pw` cannot be the new password, or None. No policy: only "not empty"."""
+    if not pw:
+        return "Password can't be empty"
+    pol, sp = _policy(), secpolicy()
+    if not (pol and sp):
+        return None
+    err = sp.check_password(pw, pol)
+    if err:
+        return err
+    if pol["password"]["enabled"] and pol["password"]["history"] > 0:
+        cur = _load()
+        recent = ([("%s:%s" % cur)] if cur else []) + list(meta().get("history") or [])
+        if sp.reused(pw, recent[:pol["password"]["history"] + 1], _hash):
+            return "Choose a password you haven't used recently"
+    return None
 
 
 CSS = b"""
@@ -354,9 +562,12 @@ def run_lock_gui():
     class LockScreen(Gtk.Window):
         def __init__(self):
             super().__init__(type=Gtk.WindowType.TOPLEVEL)
-            self.mode = "unlock"        # unlock | cur | new | confirm | adminwait
+            # unlock | cur | new | confirm | remind | lockedout | adminwait
+            self.mode = "unlock"
             self._new_pw = None
             self._was_admin = False     # did this lock session ever see an admin lock?
+            self._was_lockout = False   # ...and was that lock a wrong-password lockout?
+            self._forced = False        # a new password is REQUIRED before unlocking
 
             prov = Gtk.CssProvider(); prov.load_from_data(CSS)
             Gtk.StyleContext.add_provider_for_screen(
@@ -649,14 +860,23 @@ def run_lock_gui():
             self.datelbl.set_text(time.strftime("%A, %d %B · %Z"))
             # Admin lock: the operator cannot unlock — reflect it live, and auto-
             # dismiss the lock once the manager (or the auto-expiry) clears it.
+            lockout = lockout_active()
+            if lockout:
+                self._was_lockout = True
             if _admin_locked():
                 self._was_admin = True
                 if self.mode != "adminwait":
                     self.mode = "adminwait"
-                    self.title_lbl.set_text(
-                        "Outside your working hours" if _admin_lock_is_schedule()
-                        else "Locked by your administrator")
-                    self.sub_lbl.set_text(_admin_lock_sub())
+                    if lockout:
+                        # The agent turned a wrong-password lockout into an admin lock;
+                        # say WHY it is locked, not "outside your working hours".
+                        self.title_lbl.set_text(LOCKOUT_TITLE)
+                        self.sub_lbl.set_text(LOCKOUT_SUB)
+                    else:
+                        self.title_lbl.set_text(
+                            "Outside your working hours" if _admin_lock_is_schedule()
+                            else "Locked by your administrator")
+                        self.sub_lbl.set_text(_admin_lock_sub())
                     self.err.set_text("")
                     # no-show-all as well as hide: the window's show_all() runs AFTER
                     # __init__, so on a device that was already admin-locked a plain
@@ -684,6 +904,13 @@ def run_lock_gui():
                     except OSError:
                         pass
                     self._render_msgs()
+            elif lockout:
+                # Locked out, and the agent has not (yet) raised the admin lock — it is
+                # offline, or between polls. The lock screen holds the line on its own.
+                if self.mode != "lockedout":
+                    self._show_lockout()
+            elif self._was_lockout:
+                self._restore_unlock()  # lockout lifted by the manager → password again
             elif self._was_admin:
                 self._ungrab_quit()   # admin unlocked (or lock auto-expired) → release
             return True
@@ -712,24 +939,36 @@ def run_lock_gui():
 
         def _submit(self, *a):
             pw = self.entry.get_text()
-            if self.mode == "adminwait" or _admin_locked():
+            if self.mode in ("adminwait", "lockedout") or _admin_locked():
                 self._flash("You can’t unlock right now — locked by your administrator. Please wait.")
                 return
+            if self.mode == "remind":
+                self._ungrab_quit()                  # "Continue" — change it another time
+                return
             if self.mode == "unlock":
-                if verify(pw):
+                result, detail = attempt_unlock(pw)
+                if result == "locked":
+                    self._show_lockout()
+                elif result == "wrong":
+                    self._flash(detail)
+                elif result == "change":
+                    self._begin_new(detail, forced=True)
+                elif result == "remind":
+                    self._show_remind(detail)
+                else:
                     self._ungrab_quit()
-                else:
-                    self._flash("Incorrect password")
             elif self.mode == "cur":
-                if verify(pw):
-                    self.mode = "new"; self._new_pw = None
-                    self.sub_lbl.set_text("Enter a NEW password"); self.err.set_text("")
-                    self.entry.set_text(""); self.entry.grab_focus()
+                result, detail = attempt_current(pw)
+                if result == "locked":
+                    self._show_lockout()
+                elif result == "wrong":
+                    self._flash(detail)
                 else:
-                    self._flash("Current password is wrong")
+                    self._begin_new("Enter a NEW password", forced=False)
             elif self.mode == "new":
-                if not pw:
-                    self._flash("Password can't be empty"); return
+                why = validate_new(pw)
+                if why:
+                    self._flash(why); return
                 self._new_pw = pw; self.mode = "confirm"
                 self.sub_lbl.set_text("Re-enter the new password")
                 self.entry.set_text(""); self.entry.grab_focus()
@@ -744,7 +983,60 @@ def run_lock_gui():
                     self.mode = "new"; self._new_pw = None
                     self.sub_lbl.set_text("Didn’t match — enter a NEW password"); self.entry.set_text("")
 
+        def _begin_new(self, reason, forced):
+            """Ask for a new password. FORCED (expired, factory default, too weak, or an
+            administrator's reset): there is no way back to the desktop until it is set."""
+            self._forced = forced
+            self.mode = "new"; self._new_pw = None
+            self.title_lbl.set_text("Set a new password" if forced else "Change lock password")
+            self.sub_lbl.set_text(reason)
+            self.err.set_text(""); self.entry.set_text("")
+            self.btn.set_label("Next"); self.change_link.hide()
+            self.entry.grab_focus()
+
+        def _show_remind(self, days):
+            self.mode = "remind"
+            self.title_lbl.set_text("Your password expires in %d day%s" % (days, "" if days == 1 else "s"))
+            self.sub_lbl.set_text("Change it now, or continue and change it later.")
+            self.err.set_text(""); self.entry.set_text("")
+            self.entry.hide()
+            self.btn.set_label("Continue")
+            self.change_link.set_label("Change it now"); self.change_link.show()
+
+        def _show_lockout(self):
+            """Too many wrong passwords. Nothing typed here can unlock it any more —
+            the agent turns this into an administrator lock and tells the manager. The
+            one thing left is the way to reach the administrator."""
+            self.mode = "lockedout"; self._was_lockout = True
+            self.title_lbl.set_text(LOCKOUT_TITLE)
+            self.sub_lbl.set_text(LOCKOUT_SUB)
+            self.err.set_text("")
+            for w in (self.entry, self.btn, self.change_link):
+                w.set_no_show_all(True); w.hide()
+            self.msg_link.set_no_show_all(False)
+            self.msg_link.show_all()
+
+        def _restore_unlock(self):
+            """The administrator lifted a LOCKOUT. Back to the password prompt with a fresh
+            set of tries — never straight in. Whoever made the wrong guesses should not be
+            handed the desktop because someone asked nicely in the chat; if the operator
+            really forgot it, the administrator resets it as well."""
+            self.mode = "unlock"; self._was_lockout = False; self._was_admin = False
+            self._forced = False
+            self.title_lbl.set_text("Screen locked")
+            self.sub_lbl.set_text("Unlocked by your administrator — enter your password")
+            self.err.set_text("")
+            self.btn.set_label("Unlock"); self.change_link.set_label("Change password")
+            for w in (self.entry, self.btn, self.change_link):
+                w.set_no_show_all(False); w.show()
+            self.msg_link.hide(); self.msg_box.hide(); self._msg_open = False
+            self.entry.set_text(""); self.entry.grab_focus()
+
         def _start_change(self, *a):
+            if self.mode == "remind":
+                self.entry.show()
+                self._begin_new("Enter a NEW password", forced=False)
+                return
             self.mode = "cur"
             self.title_lbl.set_text("Change lock password")
             self.sub_lbl.set_text("Enter your CURRENT password")
@@ -761,23 +1053,81 @@ def run_lock_gui():
     Gtk.main()
 
 
-def _cli_set_password(argv):
+def _cli_target(user):
+    """Point LOCK_FILE / LOCK_STATE at `user`'s home (the agent runs as root)."""
     import pwd
-    global LOCK_FILE
-    pw = argv[2]
+    global LOCK_FILE, LOCK_STATE
+    rec = pwd.getpwnam(user)
+    LOCK_FILE = os.path.join(rec.pw_dir, ".thinclient-lock")
+    LOCK_STATE = os.path.join(rec.pw_dir, ".thinclient-lock-state.json")
+    return rec
+
+
+def _cli_finish(rec):
+    """Hand every file back to the kiosk user, and clear the wrong-guess count — an
+    administrator just set the password. A LOCKOUT is deliberately left alone: lifting
+    it is a separate decision (Unlock on the device page)."""
+    for f in (LOCK_FILE, _meta_path()):
+        try:
+            os.chown(f, rec.pw_uid, rec.pw_gid)
+        except Exception:
+            pass
+    st = lock_state()
+    if st.get("fails") and not st.get("locked_at"):
+        try:
+            _json_save(LOCK_STATE, {"fails": 0}); os.chown(LOCK_STATE, rec.pw_uid, rec.pw_gid)
+        except Exception:
+            pass
+
+
+def _cli_set_password(argv):
+    """Older managers send the new password itself. Still accepted; the operator must
+    change it at their next unlock, because someone else has seen it."""
+    import sys
     user = argv[3] if len(argv) > 3 else (os.environ.get("SUDO_USER") or "thinclient")
     try:
-        rec = pwd.getpwnam(user)
+        rec = _cli_target(user)
     except KeyError:
-        import sys
         print("no such user: %s" % user, file=sys.stderr)
         return 2
-    LOCK_FILE = os.path.join(rec.pw_dir, ".thinclient-lock")
-    set_password(pw)
+    set_password(argv[2], must_change=True)
+    _cli_finish(rec)
+    return 0
+
+
+def _cli_set_hash(argv):
+    """thinclient-lock set-hash SALT:HASH [USER] — an administrator's reset, delivered
+    as the salted hash only. The manager computes it with the same PBKDF2 parameters, so
+    the plain password is never stored or transmitted; the admin is shown it once."""
+    import sys
+    rec_text = (argv[2] or "").strip().lower()
     try:
-        os.chown(LOCK_FILE, rec.pw_uid, rec.pw_gid)
-    except Exception:
+        salt, h = rec_text.split(":", 1)
+        bytes.fromhex(salt); bytes.fromhex(h)
+        if len(salt) != 16 or len(h) != 64:
+            raise ValueError
+    except ValueError:
+        print("set-hash: expected 16-hex-salt:64-hex-hash", file=sys.stderr)
+        return 2
+    user = argv[3] if len(argv) > 3 else "thinclient"
+    try:
+        rec = _cli_target(user)
+    except KeyError:
+        print("no such user: %s" % user, file=sys.stderr)
+        return 2
+    prev = None
+    try:
+        with open(LOCK_FILE) as f:
+            prev = f.read().strip() or None
+    except OSError:
         pass
+    tmp = LOCK_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("%s:%s\n" % (salt, h))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, LOCK_FILE)
+    _record_new_password(LOCK_FILE, prev, must_change=True)
+    _cli_finish(rec)
     return 0
 
 
@@ -787,6 +1137,8 @@ def main():
     # the agent to apply a tenant admin's remote reset of a forgotten PIN.
     if len(sys.argv) >= 3 and sys.argv[1] == "set-password":
         return _cli_set_password(sys.argv)
+    if len(sys.argv) >= 3 and sys.argv[1] == "set-hash":
+        return _cli_set_hash(sys.argv)
 
     # single instance: a second Super+L press must not stack lockers
     try:

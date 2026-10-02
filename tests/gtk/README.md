@@ -41,3 +41,13 @@ pane first; `TC_LOCK_SRC=/path/to/thinclient-lock` renders an older build for co
              DISPLAY=:99 SHOT=/out/lock.png python3 /t/screenshot-lock.py'
 
 Looking at the picture is what settled the 1.0.146 regression in seconds.
+
+## Lockout and password policy (security plan A4)
+
+    docker run --rm -v "$PWD:/src:ro" -v "$PWD/tests/gtk:/t:ro" tc-gtk-test \
+      sh -c 'Xvfb :99 -screen 0 1280x800x24 >/dev/null 2>&1 & sleep 2; \
+             for s in lockout change remind; do DISPLAY=:99 python3 /t/lock-lockout.py $s || exit 1; done'
+
+`lockout` = three wrong passwords, the admin lock arriving, an administrator lifting it
+(back to a password prompt with fresh tries — never straight in). `change` = the factory
+password under a policy. `remind` = a password about to expire.
