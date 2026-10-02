@@ -96,6 +96,7 @@ def pending_update_version():
 LICENSE_CONF = os.environ.get("TC_LICENSE_CONF", "/etc/thinclient/license.conf")
 LICENSE_STATE = os.environ.get("TC_LICENSE_STATE", "/var/lib/thinclient/license/state")
 LICENSE_ADMIN_LOCK = os.environ.get("TC_LICENSE_ADMIN_LOCK", "/var/lib/thinclient/license/admin-lock")
+WIPED_MARK = os.environ.get("TC_WIPED_MARK", "/var/lib/thinclient/wiped")
 
 def _admin_lock_message():
     """User-facing admin-lock message, aware of the lock's mode + remaining time
@@ -128,6 +129,9 @@ def license_block_reason():
     None. An explicit admin LOCK is a management action and ALWAYS blocks — it is
     independent of billing. The licence-EXPIRY kill-switch only applies when
     LICENSE_ENFORCE is switched on (so an unlicensed appliance never self-locks)."""
+    if os.path.exists(WIPED_MARK):
+        # Remotely wiped (lost or stolen): no credentials left, nothing to connect with.
+        return "⛔ This device has been reset for security reasons. Contact your administrator."
     if os.path.exists(LICENSE_ADMIN_LOCK):
         return _admin_lock_message()
     enforce = (_read_kv(LICENSE_CONF).get("LICENSE_ENFORCE", "false") or "false").lower()

@@ -1395,6 +1395,12 @@ def execute(ctype: str) -> str:
             return "ok"
         if ctype == "UNLOCK":
             set_admin_lock(False); return "ok"
+        if ctype == "WIPE":
+            # NOT done here: the acknowledgement that follows needs the very device
+            # secret the wipe destroys. Flag it; the poll loop wipes AFTER acking, so the
+            # manager learns the wipe was received.
+            _PENDING_WIPE[0] = True
+            return "ok"
         # Streaming + recording are driven by the poll flags, not commands; accept
         # these as no-ops so any stragglers ACK "ok" instead of logging FAILED.
         if ctype in ("STREAM_START", "STREAM_STOP", "RECORD_START", "RECORD_STOP"):
@@ -5004,6 +5010,9 @@ def cmd_poll() -> int:
         result = execute(c.get("type", ""))
         ack = dict(creds, command_id=c.get("id"), result=result)
         _curl_json("%s/api/agent/ack" % base, ack)
+    if _PENDING_WIPE[0]:
+        wipe_device()
+        return 0                     # nothing after this has credentials to work with
     # Activity: report RDP/lock/idle transitions for the day-wise activity view.
     _report_activity(base, dict(creds))
     # Recording/monitoring config: null to stop, else {screen, camera, mic, notice}
@@ -5112,6 +5121,71 @@ def _security_report():
         except Exception as e:
             print("agent: security report part failed: %s" % e, file=sys.stderr)
     return rep
+
+
+# --- Remote wipe (security plan A5) ------------------------------------------------
+# For a device reported lost or stolen. Phase A disks are not encrypted, so this
+# deletes what matters; on an encrypted (Phase B) disk it destroys the key instead.
+# Only reaches a device that comes online — the encryption, not this, is the real
+# protection — but a thief who plugs it in to see what it is gets nothing.
+_PENDING_WIPE = [False]
+WIPED_MARK = "/var/lib/thinclient/wiped"
+WIPE_MESSAGE = "This device has been reset for security reasons. Contact your administrator."
+TC_LOG_DIR = os.environ.get("TC_LOG_DIR", "/var/log/thinclient")
+
+
+def _wipe_paths():
+    home = _kiosk_home()
+    return [
+        REC_DIR,                                   # recordings awaiting upload
+        CHAT_DIR,                                  # admin chat history
+        MANAGED_RDP, LEGACY_MANAGED_RDP,           # Windows credentials (RAM + any old disk copy)
+        CERT_SEEN,
+        os.path.join(home, ".thinclient-rdp"),     # operator-saved connection
+        os.path.join(home, ".thinclient-lock"),    # lock password hash + its history
+        os.path.join(home, ".thinclient-lock.meta.json"),
+        os.path.join(home, ".thinclient-lock-state.json"),
+        TC_LOG_DIR,                                # logs name the server and the users
+    ] + glob.glob(os.path.join(RUN_DIR, "rdp-profile-pw-*"))
+
+
+def wipe_device():
+    """Erase this device's secrets and data, deregister it, and lock it for good.
+
+    Order matters: the session and recorders stop first so nothing is rewritten
+    mid-wipe; the credentials go next so that whatever happens afterwards, the device
+    can no longer talk to the manager or to the Windows server."""
+    _PENDING_WIPE[0] = False
+    print("agent: REMOTE WIPE — erasing device secrets and data", file=sys.stderr)
+    _drop_rdp_session("remote wipe")
+    for name in ("ffmpeg",):
+        try:
+            subprocess.run(["pkill", "-x", name], capture_output=True, timeout=10)
+        except Exception:
+            pass
+    # Deregister. TENANT_TOKEN too: with it left, the agent would quietly re-enrol the
+    # stolen machine into the fleet at its next start.
+    for key in ("DEVICE_SECRET", "ENROLL_CODE", "TENANT_TOKEN", "INSTALL_KEY"):
+        _set_conf_key(key, "")
+    for path in _wipe_paths():
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path, ignore_errors=True)
+            elif os.path.lexists(path):
+                os.remove(path)
+        except OSError as e:
+            print("agent: wipe could not remove %s: %s" % (path, e), file=sys.stderr)
+    # Permanently locked, with a message, until the device is reinstalled. It has no
+    # credentials left, so no manager can unlock it — which is the point.
+    # No message on the lock itself: both screens read a non-empty message as working-
+    # hours text. They check WIPED_MARK first and say what actually happened.
+    set_admin_lock(True, "permanent", 24, "")
+    try:
+        with open(WIPED_MARK, "w") as f:
+            f.write("%d\n" % int(time.time()))
+    except OSError:
+        pass
+    print("agent: remote wipe complete", file=sys.stderr)
 
 
 # --- Hardware & security facts (security plan A1) ---------------------------------

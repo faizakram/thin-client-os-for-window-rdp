@@ -307,6 +307,7 @@ def verify(pw):
 # lock screen always did — any non-empty password, unlimited tries, no expiry.
 # ---------------------------------------------------------------------------------
 LOCK_STATE = os.path.expanduser("~/.thinclient-lock-state.json")
+WIPED_MARK = os.environ.get("TC_WIPED_MARK", "/var/lib/thinclient/wiped")
 LOCKOUT_TITLE = "Locked after too many wrong passwords"
 LOCKOUT_SUB = ("Your administrator has been notified and can unlock this device. "
                "You can message them below.")
@@ -867,7 +868,10 @@ def run_lock_gui():
                 self._was_admin = True
                 if self.mode != "adminwait":
                     self.mode = "adminwait"
-                    if lockout:
+                    if os.path.exists(WIPED_MARK):
+                        self.title_lbl.set_text("This device has been reset")
+                        self.sub_lbl.set_text("It was reset for security reasons. Contact your administrator.")
+                    elif lockout:
                         # The agent turned a wrong-password lockout into an admin lock;
                         # say WHY it is locked, not "outside your working hours".
                         self.title_lbl.set_text(LOCKOUT_TITLE)
