@@ -40,7 +40,7 @@ Two codes travel in **opposite directions**, and they defend different things:
 
 ```
       MACHINE BEING INSTALLED              MANAGER                     APPROVER
-      (live ISO, operator present)   (manager.esparksit.com)   (tenant admin / super admin)
+      (live ISO, operator present)   (your manager URL)        (tenant admin / super admin)
                  │                            │                            │
    1  request ── │ ─ tenant token + hwid ───► │                            │
                  │                            │                            │

@@ -30,7 +30,7 @@ OUTPUT_ISO="${PROJECT_ROOT}/iso/thinclient.iso"
 VERSION="${TC_VERSION:-1.0.0}"
 
 BOOTAPPEND="boot=live components \
-live-config.username=thinclient live-config.hostname=esparksit live-config.noautologin \
+live-config.username=thinclient live-config.hostname=thinclient live-config.noautologin \
 quiet splash loglevel=0 vt.global_cursor_default=0 \
 rd.systemd.show_status=false systemd.show_status=false udev.log_level=0 \
 usbcore.autosuspend=-1"
@@ -233,6 +233,12 @@ populate() {
   # USB, no manual step. Injected here at build time; NEVER committed to git.
   local LCONF="${BUILD_DIR}/config/includes.chroot/etc/thinclient/license.conf"
   local kv k v
+  # The manager URL is not in the (public) source. It comes from the environment, or
+  # from the untracked config/build.local.env (KEY=value lines), which is where the
+  # usual values live on the build machine.
+  if [[ -z "${TC_CONTROL_URL:-}" && -f "${PROJECT_ROOT}/config/build.local.env" ]]; then
+    TC_CONTROL_URL="$(sed -n 's/^TC_CONTROL_URL=//p' "${PROJECT_ROOT}/config/build.local.env" | tail -1)"
+  fi
   for kv in "CONTROL_URL=${TC_CONTROL_URL:-}" "TENANT_TOKEN=${TC_TENANT_TOKEN:-}" "LICENSE_ENFORCE=${TC_LICENSE_ENFORCE:-}"; do
     k="${kv%%=*}"; v="${kv#*=}"
     [[ -n "$v" ]] || continue
@@ -240,6 +246,11 @@ populate() {
   done
   if [[ -n "${TC_TENANT_TOKEN:-}" ]]; then
     ok "Baked fleet auto-enrol token into license.conf — installs self-register"
+  fi
+  # An image with no manager URL installs devices that can never enrol, update or be
+  # managed — and nothing about it looks wrong until it is on a desk. Refuse to build.
+  if ! grep -q '^CONTROL_URL=..*' "$LCONF"; then
+    die "No manager URL: set TC_CONTROL_URL, or put TC_CONTROL_URL=https://... in config/build.local.env"
   fi
 
   # udev rule: activate the device from a USB stick on insert (no shell needed)

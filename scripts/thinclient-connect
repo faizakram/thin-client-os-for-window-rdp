@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =============================================================================
-#  ThinClient OS — Remote Desktop connection window (Esparks IT Solutions)
+#  ThinClient OS — Remote Desktop connection window
 #  Installed to: /opt/thinclient/bin/thinclient-connect
 #
 #  The kiosk's front door. A clean, standard-looking GTK window:

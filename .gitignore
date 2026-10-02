@@ -22,3 +22,6 @@ tmp/*
 # Python bytecode — build output, never source.
 __pycache__/
 *.pyc
+
+# Build-machine settings (manager URL etc.) — never in the public source
+config/build.local.env

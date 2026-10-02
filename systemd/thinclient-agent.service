@@ -1,5 +1,5 @@
 # =============================================================================
-#  ThinClient OS — management agent (Esparks IT Solutions)
+#  ThinClient OS — management agent
 #  Installed to: /etc/systemd/system/thinclient-agent.service
 #
 #  Long-running daemon: rotates + enforces the device licence, polls the control

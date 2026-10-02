@@ -115,7 +115,7 @@ systemctl mask serial-getty@ttyS0.service || true
 systemctl mask console-getty.service || true
 systemctl mask getty-static.service || true
 # HARD-VERIFY the graphical-VT masks actually took. A SILENT mask failure on
-# tty7 is exactly what stranded 1.0.15 devices on "esparksit login:" after X
+# tty7 is exactly what stranded 1.0.15 devices on a "<hostname> login:" prompt after X
 # released VT7 (logind's ReserveVT=7 then span up autovt@tty7 there). A mask is a
 # symlink to /dev/null; check the filesystem directly (robust in a chroot where a
 # running systemd isn't present). Fail the BUILD rather than ship an ISO that can
@@ -139,7 +139,7 @@ EOF
 # Prevent logind from spawning gettys on VT switch and cap the VTs.
 # CRITICAL: ReserveVT must NOT be 7. VT7 is where X/lightdm runs; a ReserveVT=7
 # tells logind to keep a login getty on X's OWN VT, so the instant X releases it
-# logind pounces with "esparksit login:" there (the 1.0.15 bug). Point the reserve
+# logind pounces with a login prompt there (the 1.0.15 bug). Point the reserve
 # at VT6 (masked, and X never uses it) so logind never eyes the graphical VT.
 mkdir -p /etc/systemd/logind.conf.d
 cat >/etc/systemd/logind.conf.d/10-thinclient.conf <<'EOF'
@@ -250,9 +250,9 @@ update-initramfs -u || true
 # ---------------------------------------------------------------------------
 # 11. Branding (Thin Client) + hostname + locale + timezone.
 # ---------------------------------------------------------------------------
-echo "esparksit" >/etc/hostname
+echo "thinclient" >/etc/hostname
 cat >/etc/hosts <<'EOF'
-127.0.0.1   localhost esparksit
+127.0.0.1   localhost thinclient
 ::1         localhost ip6-localhost ip6-loopback
 EOF
 # Replace the Debian display name on any surface that shows it (keep ID=debian

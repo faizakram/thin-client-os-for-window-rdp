@@ -56,7 +56,7 @@ while :; do
   # the process-based health test below would still read "healthy" (Xorg may be
   # running off-screen on another VT). Kill the getty, re-mask it, and restart the
   # session so the desktop reclaims the VT. This is the definitive cure for the
-  # "lock -> esparksit login: on tty7" symptom.
+  # "lock -> <hostname> login: on tty7" symptom.
   # Match the real login process (agetty) on tty7 — NOT the bare token 'getty',
   # which would also match a transient 'systemctl mask getty@tty7.service' that
   # our own recovery/harden paths run, causing a spurious restart.

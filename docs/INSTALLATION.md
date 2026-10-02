@@ -20,7 +20,7 @@ internal disk, first-time setup, and rolling out a fleet.
 | The image | `thinclient.iso` (v1.0.22) — provided separately |
 | USB stick | **8 GB or larger** (its contents will be erased) |
 | Target machine | x86-64 PC/mini-PC, boots from USB, wired or Wi-Fi network |
-| Network | Reachable path to your RDP server and to `manager.esparksit.com` |
+| Network | Reachable path to your RDP server and to your ThinClient Manager |
 
 **Verify the image first** (optional but recommended):
 
@@ -80,7 +80,7 @@ BIOS and retry.
 This copies the OS onto the machine's disk so settings persist across reboots.
 
 1. From the running (USB) session, open the diagnostic console:
-   **`Ctrl` + `Alt` + `F2`** → log in `esparks` / `esparks`.
+   **`Ctrl` + `Alt` + `F2`** → log in with the one-time debug password printed when the debug image was built (debug images only).
 2. Run the installer:
    ```bash
    sudo thinclient-install
@@ -112,7 +112,7 @@ On the installed machine:
    until you change them (connecting with new details replaces them).
 
 The device **auto-enrolls** into your fleet (tenant **QUANTUM**) and appears in
-**manager.esparksit.com**, where you can set its timezone, recording, and more.
+your **ThinClient Manager**, where you can set its timezone, recording, and more.
 Timezone and policy are pushed from the manager automatically.
 
 ---
@@ -136,9 +136,9 @@ in the manager on first boot.)
 |--------|-----|
 | **Admin Mode** (change settings, server, lock password) | `Ctrl` + `Alt` + `Shift` + `A` |
 | **Lock the screen** | `Super` (Windows key) + `L` |
-| **Check the OS version** | `Ctrl`+`Alt`+`F2` → `esparks`/`esparks` → `cat /opt/thinclient/VERSION` |
+| **Check the OS version** | The device page in the Manager shows it |
 | **Software updates** | Automatic. A prompt appears **on the connection screen** when a new version is available; accept it and the screen refreshes. |
-| **Fleet management** | manager.esparksit.com (timezone, recording, reboot, live view) |
+| **Fleet management** | your ThinClient Manager (timezone, recording, reboot, live view) |
 
 **Updates note:** over-the-air updates deliver software fixes to already-deployed
 machines. The connection-form defaults (blank first-time fields) are part of the
@@ -154,7 +154,7 @@ remember what they last used, so they don't need it.
 | Won't boot from USB | Enable USB boot / disable Secure Boot in BIOS; re-flash the USB. |
 | Saved password lost after reboot | The machine is running from **USB**, not installed. Do [Step 4](#step-4--install-to-the-internal-disk). |
 | Clock shows the wrong time | Set the timezone for the device/tenant in the manager; it applies on the next poll. |
-| Capture a diagnostic | `Ctrl`+`Alt`+`F2` → `esparks`/`esparks` → run **`getlogs`**, photograph the screen, send to support. |
+| Capture a diagnostic | **Get logs** on the device page in the Manager. |
 
 More detail: [TROUBLESHOOTING.md](TROUBLESHOOTING.md) · [RECOVERY.md](RECOVERY.md) ·
 [ADMIN.md](ADMIN.md) · [DEPLOYMENT.md](DEPLOYMENT.md)
@@ -164,7 +164,7 @@ More detail: [TROUBLESHOOTING.md](TROUBLESHOOTING.md) · [RECOVERY.md](RECOVERY.
 ## Quick reference
 
 - **Image:** `thinclient.iso` v1.0.22 · SHA-256 `dc8e0b8c…59322c6`
-- **Install:** boot USB → `Ctrl`+`Alt`+`F2` (`esparks`/`esparks`) → `sudo thinclient-install` → reboot without USB
+- **Install:** boot USB → Admin Mode (`Ctrl`+`Alt`+`Shift`+`A`) → **Install** → reboot without USB
 - **Default lock password:** `0000`
 - **Admin Mode:** `Ctrl`+`Alt`+`Shift`+`A`
-- **Manager:** manager.esparksit.com (tenant QUANTUM)
+- **Manager:** your ThinClient Manager

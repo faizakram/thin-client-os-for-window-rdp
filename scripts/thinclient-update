@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  ThinClient OS — pull-based OTA updater (Esparks IT Solutions)
+#  ThinClient OS — pull-based OTA updater
 #  Installed to: /opt/thinclient/bin/thinclient-update
 #
 #  Two modes:

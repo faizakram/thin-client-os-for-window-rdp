@@ -66,6 +66,9 @@ if python3 "$HERE/test-mem-harden.py"; then :; else fail_total=$((fail_total+1))
 banner "test-clipboard-usb"
 if python3 "$HERE/test-clipboard-usb.py"; then :; else fail_total=$((fail_total+1)); fi
 
+banner "test-hostname"
+if python3 "$HERE/test-hostname.py"; then :; else fail_total=$((fail_total+1)); fi
+
 # --- static guards added after live failures --------------------------------
 # A non-ASCII character in a GTK CSS blob that gets .encode("ascii") kills the GUI
 # app at import — that is how the chat panel vanished from a live device.

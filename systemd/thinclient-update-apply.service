@@ -1,5 +1,5 @@
 # =============================================================================
-#  ThinClient OS — OTA update APPLY (Esparks IT Solutions)
+#  ThinClient OS — OTA update APPLY
 #  Installed to: /etc/systemd/system/thinclient-update-apply.service
 #
 #  NOT timer-triggered. Started on demand by the connect window (via a scoped

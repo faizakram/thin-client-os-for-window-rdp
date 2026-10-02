@@ -322,7 +322,7 @@ def _adopt_cycle(base: str) -> bool:
     # in the pending queue for an admin to approve again. Never a dead end.
     # Send the name the installer was given (DEVICE_NAME in license.conf) as well as
     # the hostname. Without it the manager can only fall back to the hostname, which on
-    # a fresh install is still the ISO's own ("esparksit") — so an adopted machine came
+    # a fresh install is still the ISO's own default — so an adopted machine came
     # back under a name nobody chose and had to be renamed by hand.
     _curl_json("%s/api/adopt/request" % base,
                dict(ident, hostname=_hostname(), name=conf_get("DEVICE_NAME", ""),
@@ -5138,7 +5138,8 @@ def _security_report():
     Can never break the poll: if gathering any part fails, that part is left out and
     the poll goes on. A reporting bug must never cost a device its link to the manager."""
     rep = {}
-    for part in (lambda: dict(_SECURITY_FACTS), _hardware_facts, _lockout_report, _mem_harden_report):
+    for part in (lambda: dict(_SECURITY_FACTS), _hardware_facts, _lockout_report, _mem_harden_report,
+                 _admin_password_report):
         try:
             rep.update(part() or {})
         except Exception as e:
@@ -5330,6 +5331,88 @@ def apply_usb_storage_block(enable):
     subprocess.run(["modprobe", "-r", "uas", "usb-storage"], capture_output=True, timeout=20)
     _SECURITY_FACTS["usb_storage"] = "blocked"
     return "blocked"
+
+
+# --- Device hostname ----------------------------------------------------------------
+# A device installed without a name kept the image's own default hostname, which named
+# the vendor on every customer network it joined. Each device's hostname is now what
+# the installer would give it today: derived from its device name, else "thinclient".
+# Devices already named at install time already match and are left alone.
+#
+# In TWO phases, because sudo and friends look the machine's own name up in /etc/hosts:
+# renaming the file while the old name is still the running one would make them stall
+# on a DNS lookup until the restart. So: (1) the new name goes into /etc/hostname and
+# BOTH names into /etc/hosts; (2) after the restart, once the new name is the running
+# one, the old one is taken out of /etc/hosts.
+HOSTNAME_FILE = "/etc/hostname"
+HOSTS_FILE = "/etc/hosts"
+HOSTNAME_RENAME_STATE = "/var/lib/thinclient/hostname-renamed-from"
+
+
+def canonical_hostname(device_name):
+    """Exactly the installer's rule (install-to-disk.sh): spaces to hyphens, then only
+    letters, digits and hyphens, no leading/trailing hyphen, at most 63 characters."""
+    hn = "".join(c for c in (device_name or "").replace(" ", "-")
+                 if c.isascii() and (c.isalnum() or c == "-")).strip("-")[:63]
+    return hn or "thinclient"
+
+
+def hosts_with(text, add=None, remove=None):
+    """/etc/hosts with `add` put on (and `remove` taken off) the loopback lines,
+    every other line and every other name untouched."""
+    out = []
+    for ln in text.splitlines():
+        parts = ln.split()
+        if parts and parts[0] in ("127.0.0.1", "127.0.1.1") and not ln.lstrip().startswith("#"):
+            names = [n for n in parts[1:] if n != remove]
+            if add and add not in names and (parts[0] == "127.0.1.1" or "localhost" in names):
+                names.append(add)
+            if parts[0] == "127.0.1.1" and not names:
+                continue
+            out.append("%s\t%s" % (parts[0], " ".join(names)))
+        else:
+            out.append(ln)
+    return "\n".join(out) + "\n"
+
+
+def apply_hostname():
+    if os.path.exists("/run/live/medium"):
+        return None
+    want = canonical_hostname(conf_get("DEVICE_NAME", ""))
+    running = _hostname()
+    try:
+        hosts = open(HOSTS_FILE).read()
+    except OSError:
+        return None
+    try:
+        old = open(HOSTNAME_RENAME_STATE).read().strip()
+    except OSError:
+        old = ""
+    if running == want:
+        # Phase 2: the restart has happened; drop the old name.
+        if old and old != want:
+            new_hosts = hosts_with(hosts, remove=old)
+            if new_hosts != hosts:
+                with open(HOSTS_FILE, "w") as f:
+                    f.write(new_hosts)
+            os.remove(HOSTNAME_RENAME_STATE)
+            print("agent: hostname now %s (old name retired)" % want, file=sys.stderr)
+        return want
+    # Phase 1: the new name takes effect at the next restart; both resolve until then.
+    try:
+        current_file = open(HOSTNAME_FILE).read().strip()
+    except OSError:
+        current_file = ""
+    if current_file != want:
+        with open(HOSTNAME_FILE, "w") as f:
+            f.write(want + "\n")
+        with open(HOSTNAME_RENAME_STATE, "w") as f:
+            f.write(running + "\n")
+    new_hosts = hosts_with(hosts, add=want)
+    if new_hosts != hosts:
+        with open(HOSTS_FILE, "w") as f:
+            f.write(new_hosts)
+    return want
 
 
 # --- Remote wipe (security plan A5) ------------------------------------------------
@@ -5573,6 +5656,21 @@ def _reconcile_lockout(manager_locked, lockout_ack):
     return True
 
 
+# Admin Mode (Ctrl+Alt+Shift+A) ships with a default password that is documented in the
+# public source. Anyone at the keyboard who knows it can repoint the device at another
+# RDP server or run the installer. Report-only here: which devices still have it.
+ADMIN_CONF = "/etc/thinclient/admin.conf"
+_DEFAULT_ADMIN_HASH = ("$6$thinclient00$5UHjCgA9QSMdPfMykia8Q1Inye73MoramQDVWYJYjowv/"
+                       "v2EkMKT9FL7X6GlQ.bKRX3tq9e7Ecpky.ofVp.uz.")
+
+
+def _admin_password_report():
+    for ln in _read(ADMIN_CONF).splitlines():
+        if ln.startswith("ADMIN_PASSWORD_HASH="):
+            return {"admin_password_default": ln.split("=", 1)[1].strip() == _DEFAULT_ADMIN_HASH}
+    return {"admin_password_default": None}
+
+
 def _mem_harden_report():
     """Hardened in the boot config, and actually running hardened. The two differ until
     the device restarts — the manager shows that as "restart pending"."""
@@ -5604,7 +5702,8 @@ def _lockout_report():
 # could be logged into as root by anyone who has read it. Production builds never had
 # them, but nothing proved a debug build had not reached a customer — so every device
 # enforces this at every start, whatever image it came from.
-_DEBUG_USERS = ("esparks", "tcdebug")
+_DEBUG_UID = 1002            # the debug build always created its account with this id
+_DEBUG_USERS = ("tcdebug",)  # current name; older debug builds used another — found by id
 _DEBUG_ACCESS_OPT_IN = "/etc/thinclient/debug-access-allowed"   # hand-made on a lab box only
 _SECURITY_FACTS = {}   # what enforcement found; reported to the manager (see _security_report)
 
@@ -5638,7 +5737,13 @@ def _enforce_no_debug_access():
                 os.remove(f); found.append(f)
             except OSError:
                 pass
-        for user in _DEBUG_USERS:
+        users = set(_DEBUG_USERS)
+        try:
+            import pwd
+            users.add(pwd.getpwuid(_DEBUG_UID).pw_name)   # whatever an older build named it
+        except (KeyError, ImportError):
+            pass
+        for user in sorted(users):
             if run("id", user).returncode != 0:
                 continue
             found.append("user:" + user)
@@ -5679,7 +5784,7 @@ def _harden_session():
                        capture_output=True, timeout=20)
         # Root cause on OTA-updated 1.0.15 boxes: /etc/systemd/logind.conf.d baked
         # ReserveVT=7, which asks logind to keep a login getty on X's OWN VT (so the
-        # moment X frees VT7, "esparksit login:" appears there). Override it to 6 —
+        # moment X frees VT7, a "<hostname> login:" prompt appears there). Override it to 6 —
         # X never uses VT6 — so logind never eyes the graphical VT. Takes effect next
         # boot; masking getty@tty7 already blocks it at runtime this boot.
         ld = "/etc/systemd/logind.conf.d"
@@ -6055,6 +6160,10 @@ def cmd_daemon() -> int:
     _harden_session()   # no login terminal + always recover the desktop
     # No SSH / debug console / debug login, whatever image this device came from.
     threading.Thread(target=_enforce_no_debug_access, daemon=True).start()
+    try:
+        apply_hostname()      # the image's default hostname is not used any more
+    except Exception as e:
+        print("agent: hostname update skipped: %s" % e, file=sys.stderr)
     # What this device's hardware can do for security, reported to the manager.
     threading.Thread(target=_refresh_hardware_facts, daemon=True).start()
     while True:

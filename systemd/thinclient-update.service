@@ -1,5 +1,5 @@
 # =============================================================================
-#  ThinClient OS — OTA update check (Esparks IT Solutions)
+#  ThinClient OS — OTA update check
 #  Installed to: /etc/systemd/system/thinclient-update.service
 #  Triggered by thinclient-update.timer. No-op unless UPDATE_ENABLED=true.
 # =============================================================================

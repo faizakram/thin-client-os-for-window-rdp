@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  ThinClient OS — device activation from USB (Esparks IT Solutions)
+#  ThinClient OS — device activation from USB
 #  Installed to: /opt/thinclient/bin/thinclient-provision
 #  Run by:       thinclient-provision.service (on boot) + udev (on USB insert)
 #

@@ -1,5 +1,5 @@
 # =============================================================================
-#  ThinClient OS — device activation from USB (Esparks IT Solutions)
+#  ThinClient OS — device activation from USB
 #  Installed to: /etc/systemd/system/thinclient-provision.service
 #
 #  Runs on boot and (via udev) whenever a USB filesystem is plugged in. Imports
