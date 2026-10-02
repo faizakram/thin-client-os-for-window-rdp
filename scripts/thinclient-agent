@@ -5089,12 +5089,31 @@ def _apply_security_policy(raw, server_ms):
         sp.note_server_time(float(server_ms) / 1000.0)
     if raw is None:
         return sp.load()          # an older manager sends nothing: keep what we have
+    changed = False
     try:
-        if sp.save(raw):
+        changed = sp.save(raw)
+        if changed:
             print("agent: security policy updated", file=sys.stderr)
     except Exception as e:
         print("agent: security policy not saved: %s" % e, file=sys.stderr)
-    return sp.load()
+    pol = sp.load()
+    # Device-level protections that need DOING, not just reading: once after each
+    # agent start, then only when the policy actually changes — not on every poll. In
+    # the background, because grub-mkconfig takes seconds and must never hold the poll.
+    if changed or not _PROTECTIONS_DONE[0]:
+        _PROTECTIONS_DONE[0] = True
+        threading.Thread(target=_apply_device_protections, args=(pol,), daemon=True).start()
+    return pol
+
+
+_PROTECTIONS_DONE = [False]
+
+
+def _apply_device_protections(pol):
+    try:
+        apply_mem_harden(bool(pol.get("mem_harden")))
+    except Exception as e:
+        print("agent: memory hardening failed: %s" % e, file=sys.stderr)
 
 
 def _cert_seen():
@@ -5115,12 +5134,137 @@ def _security_report():
     Can never break the poll: if gathering any part fails, that part is left out and
     the poll goes on. A reporting bug must never cost a device its link to the manager."""
     rep = {}
-    for part in (lambda: dict(_SECURITY_FACTS), _hardware_facts, _lockout_report):
+    for part in (lambda: dict(_SECURITY_FACTS), _hardware_facts, _lockout_report, _mem_harden_report):
         try:
             rep.update(part() or {})
         except Exception as e:
             print("agent: security report part failed: %s" % e, file=sys.stderr)
     return rep
+
+
+# --- Memory hardening (security plan A3) ------------------------------------------
+# Switched on per tenant from the manager, after it has been tried on each hardware
+# model: the IOMMU line is the one part with any history of upsetting old graphics, so
+# integrated graphics are left out of it (igfx_off) and the whole thing is reversible.
+#   init_on_alloc / init_on_free  memory is zeroed as it is handed out and as it is
+#                                 released — finished sessions and old recordings do not
+#                                 linger, and at shutdown every exiting process's memory
+#                                 is zeroed on its way out
+#   intel_iommu=on,igfx_off       devices on Thunderbolt/PCIe ports cannot read RAM at
+#                                 will (AMD machines enable their IOMMU by default)
+# plus: sleep and hibernate masked (sleep keeps RAM powered; hibernate writes it to
+# disk), FireWire drivers blocked (a classic way to read memory from a port).
+#
+# Kernel parameters need a reboot, and THIS IS THE FIRST OTA THAT CHANGES THE BOOT
+# CONFIGURATION — earlier fixes avoided it on purpose. So: installed systems only (a
+# USB-booted machine has no /etc/default/grub of its own); the new grub.cfg is built
+# to a SEPARATE file and only swapped in if that worked and it carries the parameters;
+# any failure restores /etc/default/grub and leaves the working grub.cfg untouched.
+MEM_HARDEN_PARAMS = ("init_on_alloc=1", "init_on_free=1", "intel_iommu=on,igfx_off")
+MEM_HARDEN_STATE = "/var/lib/thinclient/mem-harden-applied"
+GRUB_DEFAULT = "/etc/default/grub"
+GRUB_CFG = "/boot/grub/grub.cfg"
+_SLEEP_TARGETS = ("sleep.target", "suspend.target", "hibernate.target", "hybrid-sleep.target")
+_FIREWIRE_CONF = "/etc/modprobe.d/thinclient-no-firewire.conf"
+_MEM_HARDEN_LOCK = threading.Lock()
+
+
+def cmdline_with(line, enable):
+    """GRUB_CMDLINE_LINUX_DEFAULT="..." with our parameters added or removed, and
+    everything else on it left exactly as it was."""
+    key, _, rest = line.partition("=")
+    val = rest.strip().strip('"')
+    words = [w for w in val.split() if w not in MEM_HARDEN_PARAMS]
+    if enable:
+        words += list(MEM_HARDEN_PARAMS)
+    return '%s="%s"' % (key, " ".join(words))
+
+
+def _grub_default_rewritten(text, enable):
+    out, seen = [], False
+    for ln in text.splitlines():
+        if ln.startswith("GRUB_CMDLINE_LINUX_DEFAULT="):
+            out.append(cmdline_with(ln, enable)); seen = True
+        else:
+            out.append(ln)
+    if not seen:
+        out.append(cmdline_with('GRUB_CMDLINE_LINUX_DEFAULT=""', enable))
+    return "\n".join(out) + "\n"
+
+
+def _apply_kernel_params(enable):
+    """Rewrite the boot parameters safely. Returns True if the boot config now matches
+    `enable` (effective from the next restart)."""
+    if os.path.exists("/run/live/medium") or not os.path.exists(GRUB_DEFAULT):
+        return False
+    try:
+        old = open(GRUB_DEFAULT).read()
+    except OSError:
+        return False
+    new = _grub_default_rewritten(old, enable)
+    if new == old:
+        return True
+    backup = GRUB_DEFAULT + ".tc-prev"
+    staged = GRUB_CFG + ".tc-new"
+    try:
+        with open(backup, "w") as f:
+            f.write(old)
+        with open(GRUB_DEFAULT, "w") as f:
+            f.write(new)
+        r = subprocess.run(["grub-mkconfig", "-o", staged], capture_output=True, text=True, timeout=180)
+        cfg = open(staged).read() if os.path.exists(staged) else ""
+        good = r.returncode == 0 and "linux" in cfg and \
+            (all(p in cfg for p in MEM_HARDEN_PARAMS) if enable else "init_on_free=1" not in cfg)
+        if not good:
+            raise RuntimeError("grub-mkconfig rc=%s %s" % (r.returncode, (r.stderr or "")[-300:]))
+        if os.path.exists(GRUB_CFG):
+            shutil.copy2(GRUB_CFG, GRUB_CFG + ".tc-prev")
+        os.replace(staged, GRUB_CFG)
+        print("agent: boot parameters %s (effective after restart)" % ("hardened" if enable else "restored"),
+              file=sys.stderr)
+        return True
+    except Exception as e:
+        print("agent: boot parameter change ABORTED, previous config kept: %s" % e, file=sys.stderr)
+        try:
+            with open(GRUB_DEFAULT, "w") as f:
+                f.write(old)
+        except OSError:
+            pass
+        try:
+            os.remove(staged)
+        except OSError:
+            pass
+        return False
+
+
+def apply_mem_harden(enable):
+    """Bring the device to the wanted state. Idempotent; a no-op when already there."""
+    with _MEM_HARDEN_LOCK:
+        want = "1" if enable else "0"
+        try:
+            if open(MEM_HARDEN_STATE).read().strip() == want:
+                return
+        except OSError:
+            if not enable:
+                return                     # never hardened: nothing to undo
+        run = lambda *a: subprocess.run(list(a), capture_output=True, timeout=30)
+        for t in _SLEEP_TARGETS:
+            run("systemctl", "mask" if enable else "unmask", t)
+        try:
+            if enable:
+                with open(_FIREWIRE_CONF, "w") as f:
+                    f.write("# thinclient: FireWire can read memory directly; blocked.\n"
+                            "install firewire_ohci /bin/false\ninstall firewire_core /bin/false\n")
+            elif os.path.exists(_FIREWIRE_CONF):
+                os.remove(_FIREWIRE_CONF)
+        except OSError:
+            pass
+        if _apply_kernel_params(enable):
+            try:
+                with open(MEM_HARDEN_STATE, "w") as f:
+                    f.write(want + "\n")
+            except OSError:
+                pass
 
 
 # --- Remote wipe (security plan A5) ------------------------------------------------
@@ -5362,6 +5506,17 @@ def _reconcile_lockout(manager_locked, lockout_ack):
         return False
     _hold_local_lockout()
     return True
+
+
+def _mem_harden_report():
+    """Hardened in the boot config, and actually running hardened. The two differ until
+    the device restarts — the manager shows that as "restart pending"."""
+    try:
+        applied = open(MEM_HARDEN_STATE).read().strip() == "1"
+    except OSError:
+        applied = False
+    running = all(p in _read("/proc/cmdline") for p in ("init_on_free=1", "init_on_alloc=1"))
+    return {"mem_harden": {"applied": applied, "running": running}}
 
 
 def _lockout_report():
