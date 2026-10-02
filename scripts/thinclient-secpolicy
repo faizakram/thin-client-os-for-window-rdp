@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+# =============================================================================
+#  ThinClient OS — device security policy (shared module)
+#  Installed to: /opt/thinclient/bin/thinclient-secpolicy
+#
+#  One place for the rules three programs must agree on: the agent (which receives
+#  the policy from the manager), the lock screen (password rules + lockout) and the
+#  connect window (certificate pinning, clipboard). Loaded by path, never run.
+#
+#  THE RULE THAT KEEPS EXISTING DEVICES SAFE: with no policy received — an older
+#  manager, or a device that has not reached the manager since it was installed —
+#  every function here answers exactly as the device behaved before this module
+#  existed. Each protection is switched on per tenant, from the manager, after it has
+#  been tested; nothing changes for an operator just because this file was updated.
+#
+#  Pure logic: no GTK, no network, no side effects at import time.
+# =============================================================================
+import hashlib
+import json
+import os
+import time
+
+POLICY_FILE = os.environ.get("TC_SEC_POLICY", "/var/lib/thinclient/security-policy.json")
+TRUSTED_TIME_FILE = os.environ.get("TC_TRUSTED_TIME", "/var/lib/thinclient/trusted-time")
+
+# Today's behaviour, field for field. Anything the manager does not send keeps it.
+DEFAULTS = {
+    # Windows-server certificate checking: "off" (today: /cert:ignore), "report" (learn
+    # and report the fingerprint, never refuse) or "enforce" (refuse a mismatch).
+    "cert_pin": "off",
+    "cert_pins": {},                 # {"host:port": ["<sha256 hex>", ...]}
+    "password": {
+        "enabled": False,            # today: any non-empty password, no expiry
+        "min_len": 8,
+        "classes": "alnum",          # "digits" | "alnum" | "alnum_symbol"
+        "max_age_days": 15,          # 0 = never expires
+        "remind_days": 3,
+        "history": 5,
+    },
+    "lockout": {"enabled": False, "attempts": 3},
+    "mem_harden": False,
+    "usb_storage_block": False,
+    "clipboard": True,               # today: always shared with Windows
+}
+
+DEFAULT_LOCK_PW = "0000"             # the factory password; never acceptable under a policy
+
+
+# Keys whose value is a free-form map, taken whole rather than merged field by field.
+# Merging only keeps keys the defaults already have, and the default pin map is empty —
+# so merging silently dropped every pinned fingerprint and pinning never matched. Found
+# by test before anything used it.
+_FREEFORM = {"cert_pins"}
+
+
+def _merge(base, over):
+    out = dict(base)
+    for k, v in (over or {}).items():
+        if k in _FREEFORM:
+            out[k] = v
+        elif k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = _merge(out[k], v)
+        elif k in out:
+            out[k] = v
+    return out
+
+
+def normalise(raw):
+    """Manager-sent policy merged over the defaults, with every value range-checked.
+    A malformed or hostile value falls back to the default rather than, say, turning
+    a lockout of 3 into a lockout of 0 (lock on the first keystroke) or 10000."""
+    p = _merge(DEFAULTS, raw if isinstance(raw, dict) else {})
+    if p["cert_pin"] not in ("off", "report", "enforce"):
+        p["cert_pin"] = "off"
+    pins = {}
+    for k, v in (p.get("cert_pins") or {}).items():
+        if isinstance(k, str) and isinstance(v, list):
+            fps = [normalise_fp(x) for x in v if isinstance(x, str)]
+            fps = [x for x in fps if x]
+            if fps:
+                pins[k.strip().lower()] = fps
+    p["cert_pins"] = pins
+    pw = p["password"]
+    pw["enabled"] = bool(pw.get("enabled"))
+    pw["min_len"] = _clamp(pw.get("min_len"), 4, 64, 8)
+    if pw.get("classes") not in ("digits", "alnum", "alnum_symbol"):
+        pw["classes"] = "alnum"
+    pw["max_age_days"] = _clamp(pw.get("max_age_days"), 0, 365, 15)
+    pw["remind_days"] = _clamp(pw.get("remind_days"), 0, 30, 3)
+    pw["history"] = _clamp(pw.get("history"), 0, 24, 5)
+    lo = p["lockout"]
+    lo["enabled"] = bool(lo.get("enabled"))
+    lo["attempts"] = _clamp(lo.get("attempts"), 3, 10, 3)
+    for k in ("mem_harden", "usb_storage_block", "clipboard"):
+        p[k] = bool(p.get(k))
+    return p
+
+
+def _clamp(v, lo, hi, default):
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, v))
+
+
+def load(path=None):
+    """The policy as last received. Missing or unreadable = today's behaviour."""
+    try:
+        with open(path or POLICY_FILE) as f:
+            return normalise(json.load(f))
+    except (OSError, ValueError):
+        return normalise({})
+
+
+def save(raw, path=None):
+    """Persist the manager's policy (agent only). Atomic, and kept across reboots so a
+    device that starts offline still applies the last policy it was given — a lockout
+    or a USB block must not lapse just because the network is down. Returns True when
+    the stored policy changed."""
+    target = path or POLICY_FILE
+    new = normalise(raw)
+    if load(target) == new and os.path.exists(target):
+        return False
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    tmp = target + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(new, f, sort_keys=True)
+    os.chmod(tmp, 0o644)          # no secrets in it; the kiosk user must read it
+    os.replace(tmp, target)
+    return True
+
+
+# ---------------------------------------------------------------------------------
+# Trusted clock
+# ---------------------------------------------------------------------------------
+
+def note_server_time(epoch, path=None):
+    """Remember the latest time the MANAGER vouched for (agent only). Monotonic: an
+    earlier value is ignored, so it can only ever move forward."""
+    target = path or TRUSTED_TIME_FILE
+    try:
+        epoch = float(epoch)
+    except (TypeError, ValueError):
+        return
+    if epoch <= trusted_floor(target):
+        return
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        tmp = target + ".tmp"
+        with open(tmp, "w") as f:
+            f.write("%d\n" % int(epoch))
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, target)
+    except OSError:
+        pass
+
+
+def trusted_floor(path=None):
+    try:
+        with open(path or TRUSTED_TIME_FILE) as f:
+            return float(f.read().strip() or 0)
+    except (OSError, ValueError):
+        return 0.0
+
+
+def trusted_now(path=None):
+    """Now, but never earlier than the last time the manager confirmed.
+
+    Password expiry would otherwise be beaten by setting the device clock back: a
+    password that expires in 2 days would stay valid for ever. A clock set FORWARD only
+    makes things expire sooner, which is harmless, so the larger of the two wins."""
+    return max(time.time(), trusted_floor(path))
+
+
+# ---------------------------------------------------------------------------------
+# Lock-screen password rules
+# ---------------------------------------------------------------------------------
+
+def check_password(pw, policy):
+    """None when `pw` is acceptable under the policy, else the reason, in words an
+    operator can act on. With the policy off this is today's only rule: not empty."""
+    if not pw:
+        return "Password can't be empty"
+    p = policy["password"]
+    if not p["enabled"]:
+        return None
+    if pw == DEFAULT_LOCK_PW:
+        return "Choose a password other than the factory default"
+    if len(pw) < p["min_len"]:
+        return "Use at least %d characters" % p["min_len"]
+    has_d = any(c.isdigit() for c in pw)
+    has_a = any(c.isalpha() for c in pw)
+    has_s = any(not c.isalnum() for c in pw)
+    if p["classes"] == "digits" and not pw.isdigit():
+        return "Use digits only"
+    if p["classes"] in ("alnum", "alnum_symbol") and not (has_d and has_a):
+        return "Use both letters and numbers"
+    if p["classes"] == "alnum_symbol" and not has_s:
+        return "Include at least one symbol (for example ! or #)"
+    return None
+
+
+def password_status(meta, policy, now=None):
+    """Where the operator's CURRENT password stands under the policy:
+        ("ok", None) | ("remind", days_left) | ("expired", None) | ("must_change", reason)
+    `meta` is the lock file's sidecar ({"set_at", "is_default", "must_change"}). A
+    password set before this existed has no set_at: it is treated as set when the
+    policy was first applied (the sidecar records that), so turning a policy on gives
+    everyone a full period rather than expiring the whole fleet at once."""
+    p = policy["password"]
+    if not p["enabled"]:
+        return ("ok", None)
+    if meta.get("must_change"):
+        return ("must_change", "Your administrator has asked you to set a new password")
+    if meta.get("is_default", False):
+        return ("must_change", "Set your own password — the factory default can't be kept")
+    if meta.get("weak", False):
+        return ("must_change", "Your password no longer meets the rules — please choose a new one")
+    if p["max_age_days"] <= 0:
+        return ("ok", None)
+    set_at = float(meta.get("set_at") or 0)
+    if set_at <= 0:
+        return ("ok", None)
+    now = trusted_now() if now is None else now
+    age_days = (now - set_at) / 86400.0
+    left = p["max_age_days"] - age_days
+    if left <= 0:
+        return ("expired", None)
+    if left <= p["remind_days"]:
+        return ("remind", max(1, int(left + 0.999)))
+    return ("ok", None)
+
+
+def reused(pw, history, hasher):
+    """Is `pw` one of the recent passwords? `history` holds "salt:hash" records and
+    `hasher(pw, salt)` recomputes one — the plain passwords are never kept."""
+    for rec in history or []:
+        try:
+            salt, h = rec.split(":", 1)
+        except ValueError:
+            continue
+        if hasher(pw, salt) == h:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------------
+# Lockout counter
+# ---------------------------------------------------------------------------------
+
+def lockout_after_failure(state, policy, now=None):
+    """Record one wrong password. Returns (new_state, locked_now). The count is kept
+    across reboots by the caller, so switching the machine off and on is not a way to
+    get fresh guesses. With the lockout off it still counts (for the report) but
+    never locks."""
+    now = time.time() if now is None else now
+    s = dict(state or {})
+    s["fails"] = int(s.get("fails", 0)) + 1
+    s["last_fail"] = now
+    lo = policy["lockout"]
+    locked = bool(lo["enabled"]) and s["fails"] >= lo["attempts"]
+    if locked and not s.get("locked_at"):
+        s["locked_at"] = now
+        s["reported"] = False
+    return s, locked
+
+
+def lockout_cleared():
+    """State after a correct password or a manager unlock."""
+    return {"fails": 0}
+
+
+# ---------------------------------------------------------------------------------
+# Certificate pinning
+# ---------------------------------------------------------------------------------
+
+def normalise_fp(fp):
+    """A SHA-256 fingerprint as 64 lower-case hex digits, from any of the usual
+    spellings ("AB:CD:…", "abcd…", "sha256:…"). None if it is not one."""
+    s = (fp or "").strip().lower()
+    if s.startswith("sha256:"):
+        s = s[7:]
+    s = s.replace(":", "").replace(" ", "")
+    if len(s) == 64 and all(c in "0123456789abcdef" for c in s):
+        return s
+    return None
+
+
+def pin_decision(policy, host, port, seen_fp):
+    """What to do with the certificate a server just presented:
+        ("allow", None)          — pinning off, or it matches a pin
+        ("learn", fp)            — no pin for this server yet: allow, report it
+        ("warn", fp)             — mismatch in report mode: allow, report LOUDLY
+        ("refuse", fp)           — mismatch in enforce mode: do not send the password
+    """
+    mode = policy["cert_pin"]
+    fp = normalise_fp(seen_fp)
+    if mode == "off":
+        return ("allow", None)
+    key = "%s:%s" % ((host or "").strip().lower(), int(port or 3389))
+    pins = policy["cert_pins"].get(key) or []
+    if not pins:
+        return ("learn", fp)
+    if fp and fp in pins:
+        return ("allow", None)
+    return ("refuse", fp) if mode == "enforce" else ("warn", fp)
+
+
+def lock_hash(pw, salt_hex, iterations=120000):
+    """The lock screen's PBKDF2 — here so the manager-reset path and history checks
+    hash exactly the same way the lock screen does."""
+    return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt_hex), iterations).hex()

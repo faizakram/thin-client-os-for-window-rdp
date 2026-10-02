@@ -3920,7 +3920,7 @@ def _rdp_server_ip():
     except OSError:
         pass
     try:
-        for line in open("/var/lib/thinclient/rdp-managed"):
+        for line in open(MANAGED_RDP):
             if line.startswith("HOST="):
                 h = line.split("=", 1)[1].strip()
                 if h:
@@ -4664,7 +4664,26 @@ def _apply_timezone(tz: str):
         print("agent: timezone set failed: %s" % e, file=sys.stderr)
 
 
-MANAGED_RDP = "/var/lib/thinclient/rdp-managed"
+# The server-managed RDP profile — including the Windows password — lives in RAM
+# (/run is tmpfs), never on disk. It used to be /var/lib/thinclient/rdp-managed, "protected"
+# by XOR with a key derived from /etc/machine-id on the SAME disk: anyone holding a pulled
+# disk could read the password in minutes. The manager resends it on every poll, so after
+# a reboot the device has it again within seconds of reaching the manager.
+MANAGED_RDP = os.path.join(RUN_DIR, "rdp-managed")
+LEGACY_MANAGED_RDP = "/var/lib/thinclient/rdp-managed"
+
+
+def _purge_disk_credentials():
+    """Delete the on-disk copy left by older versions. Run at every start, so a device
+    that was rolled back and forward again cannot keep one either."""
+    for f in (LEGACY_MANAGED_RDP, LEGACY_MANAGED_RDP + ".tmp"):
+        try:
+            os.remove(f)
+            print("agent: removed on-disk RDP credentials (%s)" % f, file=sys.stderr)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            print("agent: could not remove %s: %s" % (f, e), file=sys.stderr)
 
 _RDP_OBF_KEY = None
 
@@ -4772,10 +4791,11 @@ def _apply_gfx_codec(code):
 
 def _apply_managed_rdp(rdp):
     """Write (or remove) the server-managed RDP profile the connect form reads.
-    `rdp` = {host,user,password} from the poll, or None/empty to clear. The
-    password is stored obfuscated (same machine-id key the connect form uses);
-    the file is root:<session-group> 0640 so the kiosk user can read it but it is
-    not world-readable. Removing the file drops the device back to its local
+    `rdp` = {host,user,password} from the poll, or None/empty to clear. The file is
+    in RAM (MANAGED_RDP, under /run) and gone at power-off; the obfuscation is kept
+    only so the format the connect form reads is unchanged. The file is
+    root:<session-group> 0640 so the kiosk user can read it but it is not
+    world-readable. Removing the file drops the device back to its local
     profile (the 'remember what the operator typed' behaviour)."""
     try:
         if not rdp or not rdp.get("host"):
@@ -4994,6 +5014,69 @@ def cmd_poll() -> int:
     _drain_pending_recordings(base, dict(creds))
     _log_sync_maybe()
     return 0
+
+
+# Debug access that must never exist on a fleet device. The debug user and its password
+# were hard-coded in the (public) source for debug builds, so a device built that way
+# could be logged into as root by anyone who has read it. Production builds never had
+# them, but nothing proved a debug build had not reached a customer — so every device
+# enforces this at every start, whatever image it came from.
+_DEBUG_USERS = ("esparks", "tcdebug")
+_DEBUG_ACCESS_OPT_IN = "/etc/thinclient/debug-access-allowed"   # hand-made on a lab box only
+_SECURITY_FACTS = {}   # what enforcement found; reported to the manager (see _security_report)
+
+
+def _enforce_no_debug_access():
+    """No SSH, no debug console, no debug login — on every start, idempotently.
+
+    The only exception is a box someone has deliberately opted in by creating
+    /etc/thinclient/debug-access-allowed by hand. No image creates it and no remote
+    command can, so it cannot appear on a fleet device by accident. Anyone able to
+    create it already has root on that box."""
+    try:
+        flags = open("/etc/thinclient/.build-flags").read()
+    except OSError:
+        flags = ""
+    _SECURITY_FACTS["debug_build"] = "DEBUG_SSH=1" in flags
+    if os.path.exists(_DEBUG_ACCESS_OPT_IN):
+        _SECURITY_FACTS["debug_access"] = "opted-in"
+        return
+    run = lambda *a: subprocess.run(list(a), capture_output=True, timeout=30)
+    found = []
+    try:
+        for unit in ("ssh.service", "ssh.socket", "sshd.service"):
+            if run("systemctl", "is-enabled", unit).returncode == 0 or \
+               run("systemctl", "is-active", unit).returncode == 0:
+                found.append(unit)
+            run("systemctl", "disable", "--now", unit)
+            run("systemctl", "mask", unit)
+        for f in glob.glob("/etc/ssh/sshd_config.d/*debug*.conf"):
+            try:
+                os.remove(f); found.append(f)
+            except OSError:
+                pass
+        for user in _DEBUG_USERS:
+            if run("id", user).returncode != 0:
+                continue
+            found.append("user:" + user)
+            # Locked and expired rather than deleted: deleting a user can orphan files,
+            # and a locked, expired account with no shell and no sudo is equally dead.
+            run("usermod", "-L", "-e", "1", "-s", "/usr/sbin/nologin", user)
+            run("gpasswd", "-d", user, "sudo")
+        # The debug console on Ctrl+Alt+F2.
+        if run("systemctl", "is-enabled", "getty@tty2.service").returncode == 0:
+            found.append("getty@tty2")
+        run("systemctl", "disable", "--now", "getty@tty2.service")
+        run("systemctl", "mask", "getty@tty2.service")
+        # A debug image set a root password; production images never did. Lock it either
+        # way — nothing on this appliance logs in as root with a password.
+        run("passwd", "-l", "root")
+    except Exception as e:
+        print("agent: debug-access enforcement incomplete: %s" % e, file=sys.stderr)
+    _SECURITY_FACTS["debug_access"] = "removed" if found else "none"
+    _SECURITY_FACTS["ssh_active"] = run("systemctl", "is-active", "ssh.service").returncode == 0
+    if found:
+        print("agent: removed debug access: %s" % ", ".join(found), file=sys.stderr)
 
 
 def _harden_session():
@@ -5385,7 +5468,10 @@ def cmd_daemon() -> int:
         os.makedirs(RUN_DIR, exist_ok=True); os.chmod(RUN_DIR, 0o1777)
     except OSError:
         pass
+    _purge_disk_credentials()   # the Windows password is never kept on disk
     _harden_session()   # no login terminal + always recover the desktop
+    # No SSH / debug console / debug login, whatever image this device came from.
+    threading.Thread(target=_enforce_no_debug_access, daemon=True).start()
     while True:
         now = time.time()
         if now - last_enforce >= enforce_every:

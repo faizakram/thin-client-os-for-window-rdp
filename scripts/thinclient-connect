@@ -53,7 +53,12 @@ PROFILE = os.environ.get("TC_RDP_PROFILE", os.path.expanduser("~/.thinclient-rdp
 # present it takes precedence over the local PROFILE: the form pre-fills the IP +
 # username, connects with a password the operator can never see, and the operator
 # may override for ONE session (reverts on restart, when the agent re-writes this).
-MANAGED_RDP = os.environ.get("TC_MANAGED_RDP", "/var/lib/thinclient/rdp-managed")
+# In RAM (/run is tmpfs) — see the agent: the Windows password is never on disk.
+MANAGED_RDP = os.environ.get("TC_MANAGED_RDP", "/run/thinclient/rdp-managed")
+# An operator-typed password is kept in RAM as well, so a pulled disk carries none.
+# Host, user, port and domain still persist on disk (they are not secrets), so after a
+# reboot the form is pre-filled and only the password is typed again.
+PROFILE_PW = os.environ.get("TC_RDP_PROFILE_PW", "/run/thinclient/rdp-profile-pw-%d" % os.getuid())
 LOGDIR = os.environ.get("TC_LOG_DIR", "/var/log/thinclient")
 
 # OTA update prompt state. `thinclient-update --check` (root, on a timer) writes
@@ -303,24 +308,53 @@ def profile_get(key, default=""):
         pass
     return default
 
+def _write_private(path, text):
+    """Atomic write, mode 0600 from the moment it exists."""
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
 def save_profile(host, port, user, pw, dom):
-    """Persist the last SUCCESSFUL connection so it auto-fills next time. Atomic
-    write, mode 0600, password obfuscated. Failures are non-fatal (best effort)."""
+    """Persist the last SUCCESSFUL connection so it auto-fills next time.
+
+    Everything EXCEPT the password goes to disk. The password goes to RAM only
+    (PROFILE_PW): it used to sit in this file "obfuscated" with a key derived from
+    /etc/machine-id — on the same disk — so a pulled disk gave it up in minutes.
+    Failures are non-fatal (best effort)."""
     try:
-        tmp = PROFILE + ".tmp"
-        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write("# ThinClient saved RDP connection (per-device, auto-filled).\n")
-            f.write("# PASSWORD_OBF is obfuscated with a device-local key, not\n")
-            f.write("# strong encryption. A reflash/disk wipe clears it.\n")
-            f.write("SERVER_IP=%s\n" % host)
-            f.write("PORT=%s\n" % port)
-            f.write("USERNAME=%s\n" % user)
-            f.write("DOMAIN=%s\n" % dom)
-            f.write("PASSWORD_OBF=%s\n" % _obfuscate(pw))
-        os.replace(tmp, PROFILE)
+        _write_private(PROFILE,
+            "# ThinClient saved RDP connection (per-device, auto-filled).\n"
+            "# The password is NOT stored here — it is kept in memory until restart.\n"
+            "SERVER_IP=%s\nPORT=%s\nUSERNAME=%s\nDOMAIN=%s\n" % (host, port, user, dom))
     except OSError:
         pass
+    try:
+        os.makedirs(os.path.dirname(PROFILE_PW), exist_ok=True)
+        _write_private(PROFILE_PW, _obfuscate(pw))
+    except OSError:
+        pass
+
+
+def saved_password():
+    """The operator-typed password, from RAM. Moves an old on-disk copy into RAM the
+    first time it is seen and rewrites the profile without it, so updating the device
+    does not make anyone retype a password they saved — it lasts until the next
+    restart, like any other password now."""
+    try:
+        with open(PROFILE_PW) as f:
+            return _deobfuscate(f.read().strip())
+    except OSError:
+        pass
+    legacy = profile_get("PASSWORD_OBF")
+    if not legacy:
+        return ""
+    pw = _deobfuscate(legacy)
+    save_profile(profile_get("SERVER_IP"), profile_get("PORT", "3389"),
+                 profile_get("USERNAME"), pw, profile_get("DOMAIN"))
+    return pw
 
 def managed_rdp():
     """The server-managed RDP profile (written by the agent from the manager), or
@@ -688,7 +722,7 @@ class Connect(Gtk.Window):
             self.e_user.set_editable(False); self.e_user.set_can_focus(False)
         # In managed mode the field stays EMPTY (the managed password is never put
         # in a widget); a placeholder tells the operator they can just connect.
-        self.e_pass   = Gtk.Entry(text=("" if m else _deobfuscate(profile_get("PASSWORD_OBF"))))
+        self.e_pass   = Gtk.Entry(text=("" if m else saved_password()))
         self.e_pass.set_visibility(False)
         if m:
             self.e_pass.set_placeholder_text("•••••••• managed — leave blank to use, or type to override")

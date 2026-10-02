@@ -181,21 +181,29 @@ chmod 0775 /var/log/thinclient
 # 7. Security hardening — remove attack surface / avoid pulling a desktop.
 # ---------------------------------------------------------------------------
 # === Debug SSH — ONLY when built with TC_DEBUG_SSH=1. OFF for production. =====
-# Debug creds (esparks/esparks, root/esparks-debug) exist only in debug images.
+# This source is PUBLIC, so a debug image must never carry a password written here:
+# each debug build gets a random one, printed once in the build log. Even then, the
+# agent disables all of this at its first start unless the box was opted in by hand
+# (/etc/thinclient/debug-access-allowed) — so a debug image that escapes to a
+# customer still has no remote or console login.
+DEBUG_PW=""
 if [ "$(sed -n 's/^DEBUG_SSH=//p' /etc/thinclient/.build-flags 2>/dev/null)" = "1" ]; then
-  echo "[hook] DEBUG_SSH=1 — enabling debug SSH access"
+  DEBUG_PW="$(head -c 18 /dev/urandom | base64 | tr -d '/+=' | cut -c1-20)"
+  echo "[hook] DEBUG_SSH=1 — debug access enabled. ONE-TIME debug password (user tcdebug and root): ${DEBUG_PW}"
   systemctl enable ssh.service 2>/dev/null || true
   mkdir -p /etc/ssh/sshd_config.d
-  cat >/etc/ssh/sshd_config.d/99-esparks-debug.conf <<'EOF'
+  cat >/etc/ssh/sshd_config.d/99-thinclient-debug.conf <<'EOF'
 PasswordAuthentication yes
 PermitRootLogin yes
 EOF
-  echo 'root:esparks-debug' | chpasswd 2>/dev/null || true
+  echo "root:${DEBUG_PW}" | chpasswd 2>/dev/null || true
   usermod -s /bin/bash root 2>/dev/null || true   # DEBUG: allow root shell/SSH
 else
-  # production: no remote login, root stays nologin (set above)
-  systemctl disable ssh.service 2>/dev/null || true
-  rm -f /etc/ssh/sshd_config.d/99-esparks-debug.conf 2>/dev/null || true
+  # production: no remote login, root stays nologin (set above), and no SSH server
+  # left enabled even though the package may be present.
+  systemctl disable ssh.service ssh.socket 2>/dev/null || true
+  systemctl mask ssh.service ssh.socket 2>/dev/null || true
+  rm -f /etc/ssh/sshd_config.d/99-*debug.conf 2>/dev/null || true
 fi
 # Kill magic SysRq (prevents console kill combos on an exposed keyboard).
 mkdir -p /etc/sysctl.d
@@ -331,7 +339,7 @@ chvt 1 2>/dev/null || true
   echo "----- Xorg log tail -----"
   tail -20 /var/log/lightdm/x-0.log /var/log/Xorg.0.log 2>/dev/null
   echo "==================================================================="
-  echo " Backup: press Ctrl+Alt+F2, login  esparks / esparks , then run: getlogs"
+  echo " Support can collect full diagnostics remotely from the manager (Get logs)."
   echo "==================================================================="
 } >/dev/tty1 2>&1
 sleep 100000   # hold the diagnostic on screen
@@ -350,12 +358,13 @@ EOF
 systemctl enable thinclient-rescue.service 2>/dev/null || true
 
 # --- Debug console on tty2 — ONLY when built with TC_DEBUG_SSH=1 -------------
-if [ "$(sed -n 's/^DEBUG_SSH=//p' /etc/thinclient/.build-flags 2>/dev/null)" = "1" ]; then
-  if ! id esparks >/dev/null 2>&1; then
-    useradd -m -u 1002 -s /bin/bash -c "Esparks Debug" esparks
+# Same random password as above (DEBUG_PW), never a fixed one.
+if [ -n "${DEBUG_PW}" ]; then
+  if ! id tcdebug >/dev/null 2>&1; then
+    useradd -m -u 1002 -s /bin/bash -c "Thin client debug" tcdebug
   fi
-  echo 'esparks:esparks' | chpasswd
-  usermod -aG sudo esparks || true
+  echo "tcdebug:${DEBUG_PW}" | chpasswd
+  usermod -aG sudo tcdebug || true
   cat >/usr/local/bin/getlogs <<'GL'
 #!/bin/sh
 sudo sh -c '

@@ -165,6 +165,12 @@ populate() {
   install -d "${BUILD_DIR}/config/package-lists"
   local pl
   for pl in "${PROJECT_ROOT}"/config/live-build/package-lists/*.list.chroot; do
+    # The SSH server is a DEBUG-only package. A production image used to ship it
+    # (disabled), which left a remote-login service one systemctl away; now it is not
+    # installed at all unless the image is explicitly built with TC_DEBUG_SSH=1.
+    if [[ "$(basename "$pl")" == *debug-ssh* && "${TC_DEBUG_SSH:-0}" != "1" ]]; then
+      continue
+    fi
     filter_pkglist "$pl" "${BUILD_DIR}/config/package-lists/$(basename "$pl")"
   done
 

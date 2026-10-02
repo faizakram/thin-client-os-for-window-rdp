@@ -42,6 +42,12 @@ if python3 "$HERE/test-camera-recovery.py"; then :; else fail_total=$((fail_tota
 banner "test-lock-chat"
 if python3 "$HERE/test-lock-chat.py"; then :; else fail_total=$((fail_total+1)); fi
 
+banner "test-secpolicy"
+if python3 "$HERE/test-secpolicy.py"; then :; else fail_total=$((fail_total+1)); fi
+
+banner "test-secure-credentials"
+if python3 "$HERE/test-secure-credentials.py"; then :; else fail_total=$((fail_total+1)); fi
+
 # --- static guards added after live failures --------------------------------
 # A non-ASCII character in a GTK CSS blob that gets .encode("ascii") kills the GUI
 # app at import — that is how the chat panel vanished from a live device.
