@@ -356,6 +356,139 @@ def saved_password():
                  profile_get("USERNAME"), pw, profile_get("DOMAIN"))
     return pw
 
+# --- Security policy + Windows-server identity (security plan G1) ---------------
+_SECPOL = None
+
+
+def secpolicy():
+    """The shared security-policy module, or None if it cannot be loaded. None means
+    "behave exactly as before": a missing or broken module must never be the reason
+    an operator cannot connect."""
+    global _SECPOL
+    if _SECPOL is None:
+        _SECPOL = False
+        try:
+            import importlib.machinery, importlib.util
+            here = os.path.dirname(os.path.abspath(__file__))
+            for path in (os.path.join(here, "thinclient-secpolicy"),
+                         "/opt/thinclient/bin/thinclient-secpolicy"):
+                if os.path.exists(path):
+                    spec = importlib.util.spec_from_loader(
+                        "tc_secpolicy", importlib.machinery.SourceFileLoader("tc_secpolicy", path))
+                    mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+                    _SECPOL = mod
+                    break
+        except Exception as e:
+            sys.stderr.write("thinclient-connect: security policy unavailable: %s\n" % e)
+    return _SECPOL or None
+
+
+def _recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise OSError("connection closed")
+        buf += chunk
+    return buf
+
+
+def rdp_cert_fingerprint(host, port, timeout=5.0):
+    """(sha256-hex, None) for the TLS certificate an RDP server presents, or
+    (None, reason). Speaks only the opening of RDP: the same X.224 connection request
+    FreeRDP sends (asking for TLS or NLA), then the TLS handshake — and hangs up. No
+    credentials are ever sent. Pure standard library."""
+    import hashlib, socket, ssl, struct
+    # TPKT(4) + X.224 Connection Request(7) + RDP_NEG_REQ(8): requestedProtocols =
+    # PROTOCOL_SSL | PROTOCOL_HYBRID, i.e. "TLS, NLA welcome" — what FreeRDP asks for.
+    req = bytes([0x03, 0x00, 0x00, 0x13,
+                 0x0e, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00,
+                 0x01, 0x00, 0x08, 0x00, 0x03, 0x00, 0x00, 0x00])
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout) as s:
+            s.settimeout(timeout)
+            s.sendall(req)
+            hdr = _recv_exact(s, 4)
+            if hdr[0] != 0x03:
+                return None, "not-rdp"
+            body = _recv_exact(s, struct.unpack(">H", hdr[2:4])[0] - 4)
+            if len(body) >= 15 and body[7] == 0x03:
+                return None, "negotiation-failed"
+            if len(body) >= 15 and body[7] == 0x02 and struct.unpack("<I", body[11:15])[0] == 0:
+                return None, "no-tls"          # legacy "RDP security": there is no certificate
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE    # self-signed is normal for RDP: we PIN, not trust
+            with ctx.wrap_socket(s) as t:
+                der = t.getpeercert(binary_form=True)
+            return (hashlib.sha256(der).hexdigest(), None) if der else (None, "no-certificate")
+    except (OSError, ssl.SSLError, ValueError) as e:
+        return None, "unreachable" if isinstance(e, (socket.timeout, ConnectionError)) else "tls-error"
+
+
+CERT_SEEN = os.environ.get("TC_CERT_SEEN", "/run/thinclient/cert-seen.json")
+
+
+def record_cert(host, port, fp, decision, error):
+    """Leave what this connection saw for the agent to report to the manager, which
+    learns the first fingerprint per server and alerts on a different one. RAM only."""
+    import json, time as _t
+    try:
+        with open(CERT_SEEN) as f:
+            seen = json.load(f)
+    except (OSError, ValueError):
+        seen = {}
+    seen["%s:%s" % (host.strip().lower(), int(port))] = {
+        "fp": fp, "decision": decision, "error": error, "at": int(_t.time())}
+    try:
+        os.makedirs(os.path.dirname(CERT_SEEN), exist_ok=True)
+        tmp = CERT_SEEN + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(seen, f)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, CERT_SEEN)
+    except OSError:
+        pass
+
+
+def server_identity_decision(host, port):
+    """"allow" or a refusal message — whether to hand this server the password.
+
+    Pinning OFF (no policy yet): returns "allow" WITHOUT touching the network, so the
+    connection is byte-for-byte what it was before. REPORT mode: always "allow",
+    noting what was seen (a mismatch is reported loudly). ENFORCE mode: refuses a
+    server whose certificate does not match the one the manager learned for it, and
+    one whose identity could not be checked at all.
+
+    Known limit: FreeRDP opens its own connection a moment later with /cert:ignore,
+    and reconnects mid-session the same way. An attacker able to let this check pass
+    and intercept only FreeRDP's connection is not stopped here; one who sits on the
+    path — the normal case — intercepts this check too, and is."""
+    sp = secpolicy()
+    if not sp:
+        return "allow"
+    try:
+        policy = sp.load()
+    except Exception:
+        return "allow"
+    if policy["cert_pin"] == "off":
+        return "allow"
+    fp, err = rdp_cert_fingerprint(host, port)
+    if fp is None:
+        record_cert(host, port, None, "unverified", err)
+        if policy["cert_pin"] == "enforce":
+            return ("This server's identity couldn't be checked, so your password was not sent. "
+                    "Try again in a moment; if it keeps happening, contact your administrator.")
+        return "allow"
+    decision, _ = sp.pin_decision(policy, host, port, fp)
+    record_cert(host, port, fp, decision, None)
+    if decision == "refuse":
+        return ("This server is not the one your device knows, so your password was not sent. "
+                "Your administrator has been notified.")
+    return "allow"
+
+
 def managed_rdp():
     """The server-managed RDP profile (written by the agent from the manager), or
     None. host/user are cleartext; the password is obfuscated with the same
@@ -1195,6 +1328,14 @@ class Connect(Gtk.Window):
             return
         if not self.rdp:
             self.msg(Gtk.MessageType.ERROR, "FreeRDP missing", "No RDP client is installed.")
+            return
+
+        # Is this really OUR server? Checked before the password leaves the device.
+        # With pinning off (the default until the manager turns it on) this returns at
+        # once without any network traffic.
+        verdict = server_identity_decision(host, port)
+        if verdict != "allow":
+            self.msg(Gtk.MessageType.ERROR, "Can’t connect safely", verdict, retry=True)
             return
 
         argv = self.rdp_argv(host, port, user, dom, sec)

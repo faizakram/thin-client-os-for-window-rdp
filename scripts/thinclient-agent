@@ -4889,6 +4889,8 @@ def cmd_poll() -> int:
         chat_open=_chat_active(),                                        # panel open -> server may expect fast polls
         **_disk_stats(),                                                 # disk fills = recording/updates/session all die
         **_update_last(),                                                # why the last update attempt ended how it did
+        security=_security_report(),                                     # what this device's security IS
+        cert_seen=_cert_seen(),                                          # RDP server certificates seen
         now_ms=int(time.time() * 1000)))                                 # device wall clock (live-view time source)
     if resp is None:
         _STREAM_ACTIVE = False
@@ -4971,6 +4973,9 @@ def cmd_poll() -> int:
     # Server-managed RDP video codec (e.g. pin a hang-prone box to legacy bitmap).
     _apply_gfx_codec(resp.get("gfx_codec"))
     _apply_update_url(resp.get("update_url"))
+    # Security policy: saved for the lock screen / connect window to read, and the
+    # manager's clock noted so password expiry cannot be beaten by winding the clock back.
+    _apply_security_policy(resp.get("security"), resp.get("server_ms"))
     # Support chat: deliver admin replies + send the operator's queued messages.
     _chat_sync(base, dict(creds), resp.get("chat", []), resp.get("chat_reactions"))
     # Prune the local chat log to the tenant's retention (throttled ~6h) so the
@@ -5014,6 +5019,177 @@ def cmd_poll() -> int:
     _drain_pending_recordings(base, dict(creds))
     _log_sync_maybe()
     return 0
+
+
+# --- Security policy (security plan) ----------------------------------------------
+# The manager sends a `security` policy on every poll; it is saved, so a device that
+# starts offline keeps applying the last one it was given. No policy = today's
+# behaviour, which is what lets this code reach the fleet before anything is switched on.
+CERT_SEEN = os.path.join(RUN_DIR, "cert-seen.json")
+_SECPOL_MOD = None
+
+
+def _secpolicy():
+    """The shared thinclient-secpolicy module (next to this script), or None."""
+    global _SECPOL_MOD
+    if _SECPOL_MOD is None:
+        _SECPOL_MOD = False
+        try:
+            import importlib.machinery, importlib.util
+            here = os.path.dirname(os.path.abspath(__file__))
+            for path in (os.path.join(here, "thinclient-secpolicy"),
+                         "/opt/thinclient/bin/thinclient-secpolicy"):
+                if os.path.exists(path):
+                    spec = importlib.util.spec_from_loader(
+                        "tc_secpolicy", importlib.machinery.SourceFileLoader("tc_secpolicy", path))
+                    mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+                    _SECPOL_MOD = mod
+                    break
+        except Exception as e:
+            print("agent: security policy module unavailable: %s" % e, file=sys.stderr)
+    return _SECPOL_MOD or None
+
+
+def _apply_security_policy(raw, server_ms):
+    """Save the manager's policy and note the time it vouched for. Each protection
+    reads the saved policy itself, so applying it here is just persisting it."""
+    sp = _secpolicy()
+    if not sp:
+        return None
+    if server_ms:
+        sp.note_server_time(float(server_ms) / 1000.0)
+    if raw is None:
+        return sp.load()          # an older manager sends nothing: keep what we have
+    try:
+        if sp.save(raw):
+            print("agent: security policy updated", file=sys.stderr)
+    except Exception as e:
+        print("agent: security policy not saved: %s" % e, file=sys.stderr)
+    return sp.load()
+
+
+def _cert_seen():
+    """What the connect window saw of each RDP server's certificate (RAM file)."""
+    try:
+        with open(CERT_SEEN) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _security_report():
+    """Reported on every poll: what this device's security actually IS, as opposed to
+    what the manager asked for. Cheap — the expensive facts are gathered in the
+    background (_refresh_hardware_facts).
+
+    Can never break the poll: if gathering any part fails, that part is left out and
+    the poll goes on. A reporting bug must never cost a device its link to the manager."""
+    rep = {}
+    for part in (lambda: dict(_SECURITY_FACTS), _hardware_facts, _lockout_report):
+        try:
+            rep.update(part() or {})
+        except Exception as e:
+            print("agent: security report part failed: %s" % e, file=sys.stderr)
+    return rep
+
+
+# --- Hardware & security facts (security plan A1) ---------------------------------
+# Which machines CAN be fully protected: memory encryption (the only real defence
+# against RAM pulled out and read), a TPM (needed for disk encryption), Secure Boot.
+_HW_FACTS = {}
+_HW_FACTS_AT = [0.0]
+_HW_REFRESH_SECS = 6 * 3600
+
+
+def _read(path, default=""):
+    try:
+        with open(path, "rb") as f:
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return default
+
+
+def _kernel_log():
+    """The boot's kernel messages. The dmesg ring can have rotated on a box that has
+    been up for weeks, so the journal's copy of this boot is preferred."""
+    for cmd in (["journalctl", "-k", "-b", "--no-pager", "-q"], ["dmesg"]):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=20).stdout
+            if out:
+                return out
+        except Exception:
+            continue
+    return ""
+
+
+def gather_hardware_facts(root=""):
+    """Pure-ish: everything comes from files under `root` (tests point it elsewhere)
+    plus the kernel log. Facts it cannot determine are reported as None, never guessed."""
+    f = {}
+    cpu = _read(root + "/proc/cpuinfo")
+    model = next((l.split(":", 1)[1].strip() for l in cpu.splitlines() if l.startswith("model name")), None)
+    flags = next((l.split(":", 1)[1].split() for l in cpu.splitlines() if l.startswith("flags")), [])
+    f["cpu_model"] = model
+    f["mem_enc_supported"] = ("sme" in flags) or ("tme" in flags) if flags else None
+    klog = _kernel_log() if not root else _read(root + "/klog")
+    f["mem_enc_active"] = bool(
+        "x86/tme: enabled by BIOS" in klog or "Memory Encryption Features active" in klog)
+    tpm = root + "/sys/class/tpm/tpm0"
+    if os.path.isdir(tpm):
+        major = _read(tpm + "/tpm_version_major").strip() or None
+        # Firmware TPMs (Intel PTT, AMD fTPM) use the CRB interface; discrete chips are
+        # nearly always TIS. A heuristic, reported as such — it decides between
+        # "TPM only" and "TPM + PIN" in the plan, so it is a hint, not a verdict.
+        iface = "crb" if "tpm_crb" in klog else ("tis" if "tpm_tis" in klog else None)
+        f["tpm"] = {"present": True, "version": major, "interface": iface}
+    else:
+        f["tpm"] = {"present": False}
+    efi = root + "/sys/firmware/efi"
+    f["uefi"] = os.path.isdir(efi)
+    sb = _read(efi + "/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-e0f84a3cb4bd", None) \
+        if f["uefi"] else None
+    f["secure_boot"] = (len(sb) >= 5 and ord(sb[4]) == 1) if sb else (False if f["uefi"] else None)
+    f["mor_supported"] = os.path.exists(
+        efi + "/efivars/MemoryOverwriteRequestControl-e20939be-32d4-41be-a150-897f85d49829")
+    cmdline = _read(root + "/proc/cmdline")
+    f["kernel_hardening"] = all(x in cmdline for x in ("init_on_free=1", "init_on_alloc=1"))
+    try:
+        f["iommu_active"] = bool(os.listdir(root + "/sys/class/iommu"))
+    except OSError:
+        f["iommu_active"] = False
+    f["live_medium"] = os.path.exists(root + "/run/live/medium")
+    return f
+
+
+def _disk_encrypted():
+    try:
+        out = subprocess.run(["lsblk", "-rno", "TYPE"], capture_output=True, text=True, timeout=10).stdout
+        return "crypt" in out.split()
+    except Exception:
+        return None
+
+
+def _refresh_hardware_facts():
+    """Background: gather once at start, then every 6 hours."""
+    while True:
+        try:
+            facts = gather_hardware_facts()
+            facts["disk_encrypted"] = _disk_encrypted()
+            _HW_FACTS.clear(); _HW_FACTS.update(facts)
+            _HW_FACTS_AT[0] = time.time()
+        except Exception as e:
+            print("agent: hardware facts failed: %s" % e, file=sys.stderr)
+        time.sleep(_HW_REFRESH_SECS)
+
+
+def _hardware_facts():
+    return {"hardware": dict(_HW_FACTS)} if _HW_FACTS else {}
+
+
+def _lockout_report():
+    return {}   # filled in by the lock-screen policy (security plan A4)
 
 
 # Debug access that must never exist on a fleet device. The debug user and its password
@@ -5472,6 +5648,8 @@ def cmd_daemon() -> int:
     _harden_session()   # no login terminal + always recover the desktop
     # No SSH / debug console / debug login, whatever image this device came from.
     threading.Thread(target=_enforce_no_debug_access, daemon=True).start()
+    # What this device's hardware can do for security, reported to the manager.
+    threading.Thread(target=_refresh_hardware_facts, daemon=True).start()
     while True:
         now = time.time()
         if now - last_enforce >= enforce_every:
