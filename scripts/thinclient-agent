@@ -5114,6 +5114,10 @@ def _apply_device_protections(pol):
         apply_mem_harden(bool(pol.get("mem_harden")))
     except Exception as e:
         print("agent: memory hardening failed: %s" % e, file=sys.stderr)
+    try:
+        apply_usb_storage_block(bool(pol.get("usb_storage_block")))
+    except Exception as e:
+        print("agent: USB storage block failed: %s" % e, file=sys.stderr)
 
 
 def _cert_seen():
@@ -5265,6 +5269,67 @@ def apply_mem_harden(enable):
                     f.write(want + "\n")
             except OSError:
                 pass
+
+
+# --- USB storage block (security plan G7) -----------------------------------------
+# Pen drives, USB disks and USB card readers stop working; keyboards, mice, webcams,
+# headsets, printers, phone tethering and 4G modems do not — they are other USB classes
+# with their own drivers. Only the storage drivers (usb-storage, uas) are refused.
+#
+# Never on a device that BOOTS from USB: some thin clients do, and a later initramfs
+# rebuild would copy this refusal into early boot and leave the machine unable to find
+# its own disk. MMC/SD drivers are never touched for the same reason (eMMC boot disks).
+_USB_BLOCK_CONF = "/etc/modprobe.d/thinclient-no-usb-storage.conf"
+
+
+def _boot_disk_transport():
+    """'usb', 'sata', 'nvme', ... for the disk holding /, or None if unknown."""
+    try:
+        src = subprocess.run(["findmnt", "-no", "SOURCE", "/"], capture_output=True,
+                             text=True, timeout=10).stdout.strip()
+        if not src.startswith("/dev/"):
+            return None
+        parent = subprocess.run(["lsblk", "-no", "PKNAME", src], capture_output=True,
+                                text=True, timeout=10).stdout.strip().splitlines()
+        disk = "/dev/" + (parent[0].strip() if parent and parent[0].strip() else os.path.basename(src))
+        tran = subprocess.run(["lsblk", "-dno", "TRAN", disk], capture_output=True,
+                              text=True, timeout=10).stdout.strip()
+        return tran or None
+    except Exception:
+        return None
+
+
+def apply_usb_storage_block(enable):
+    """Returns the state reached: "blocked" | "allowed" | "skipped-usb-boot" | "skipped-live"."""
+    if not enable:
+        if os.path.exists(_USB_BLOCK_CONF):
+            try:
+                os.remove(_USB_BLOCK_CONF)
+                print("agent: USB storage allowed again", file=sys.stderr)
+            except OSError:
+                pass
+        _SECURITY_FACTS["usb_storage"] = "allowed"
+        return "allowed"
+    if os.path.exists("/run/live/medium"):
+        _SECURITY_FACTS["usb_storage"] = "skipped-live"
+        return "skipped-live"
+    tran = _boot_disk_transport()
+    if tran in (None, "usb"):
+        # Unknown counts as unsafe: better an unblocked port than an unbootable machine.
+        _SECURITY_FACTS["usb_storage"] = "skipped-usb-boot"
+        print("agent: USB storage block skipped — boot disk transport is %s" % tran, file=sys.stderr)
+        return "skipped-usb-boot"
+    try:
+        with open(_USB_BLOCK_CONF, "w") as f:
+            f.write("# thinclient: USB mass storage blocked by policy (other USB devices work).\n"
+                    "install usb-storage /bin/false\ninstall uas /bin/false\n")
+    except OSError as e:
+        print("agent: USB storage block not written: %s" % e, file=sys.stderr)
+        return "allowed"
+    # Unload now if nothing is using it; otherwise it takes effect once the stick is out.
+    subprocess.run(["modprobe", "-r", "uas", "usb-storage"], capture_output=True, timeout=20)
+    _SECURITY_FACTS["usb_storage"] = "blocked"
+    return "blocked"
 
 
 # --- Remote wipe (security plan A5) ------------------------------------------------

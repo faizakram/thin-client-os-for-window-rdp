@@ -493,6 +493,17 @@ def server_identity_decision(host, port):
     return "allow"
 
 
+def clipboard_allowed():
+    """Shared clipboard with Windows — on, as always, unless the tenant switched it off."""
+    sp = secpolicy()
+    if not sp:
+        return True
+    try:
+        return bool(sp.load()["clipboard"])
+    except Exception:
+        return True
+
+
 def managed_rdp():
     """The server-managed RDP profile (written by the agent from the manager), or
     None. host/user are cleartext; the password is obfuscated with the same
@@ -1264,7 +1275,10 @@ class Connect(Gtk.Window):
         if dom:
             argv.append("/d:%s" % dom)
         argv += ["/from-stdin:force", "/f", "/cert:ignore", "/sec:%s" % sec,
-                 "/clipboard",
+                 # Copy/paste with Windows: on unless the tenant turned it off (an
+                 # operator copying customer data out of the session). "-clipboard"
+                 # verified against FreeRDP 3.15.0, the version the devices run.
+                 "/clipboard" if clipboard_allowed() else "-clipboard",
                  # Don't grab the keyboard exclusively — normal typing still goes
                  # to Windows, but the local WM's shortcuts (Super+L screen lock,
                  # admin hotkey) fire even inside the fullscreen RDP session.
