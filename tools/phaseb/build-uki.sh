@@ -12,7 +12,15 @@ apt-get update -qq
 apt-get install -y -qq --no-install-recommends linux-image-amd64 >/dev/null
 KVER=$(ls /lib/modules | sort -V | tail -1)
 echo "kernel: $KVER"
+# Every boot unlocks through the TPM. The installer seals the key into the machine's TPM
+# with NO PCR conditions (it runs under a different boot chain, so PCR 7 would not match);
+# first boot (tc-tpm-enroll) re-seals it to PCR 7 + our signed PCR 11 policy and wipes
+# the unconditional seal. No key file is ever written to disk. (A key file plus
+# tpm2-device=auto crashed systemd-cryptsetup 257 while no TPM token existed yet, and a
+# key file alone never falls back to the token once the file is gone.)
 CMDLINE="rd.luks.name=${LUKS_UUID}=root rd.luks.options=${LUKS_UUID}=tpm2-device=auto,headless=true root=/dev/mapper/root rw quiet splash lockdown=confidentiality loglevel=3"
+# Debug build only (TC_UKI_DEBUG=1): everything to the serial console as well.
+[ "${TC_UKI_DEBUG:-0}" = 1 ] && CMDLINE="$CMDLINE console=tty0 console=ttyS0,115200 systemd.log_level=debug systemd.log_target=console rd.udev.log_level=info"
 dracut --force --no-hostonly --kver "$KVER" \
   --add "systemd crypt systemd-cryptsetup tpm2-tss" \
   --omit "plymouth network network-manager iscsi nfs" \

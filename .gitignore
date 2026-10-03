@@ -29,3 +29,4 @@ config/build.local.env
 # Phase B signing keys (boot-signing MOK + TPM PCR policy) — build host ONLY, never committed
 keys/
 build-phaseb/
+build-phaseb-debug/

@@ -1,0 +1,25 @@
+#!/bin/bash
+# First boot of an encrypted install. The installer sealed the disk key into this
+# machine's TPM with NO conditions (it ran under a different boot chain). Now, under
+# the real Secure Boot chain, seal it again bound to Secure Boot state (PCR 7) and to
+# boot images signed with our PCR policy key (PCR 11), and wipe the unconditional seal
+# in the same step. There is deliberately no recovery key (disposable device: if the
+# TPM ever refuses, the machine is reinstalled).
+set -euo pipefail
+DEV="${LUKS_DEV:?}"
+MARK=/etc/thinclient-tpm-firstboot
+log(){ echo "tc-tpm-enroll: $*" | systemd-cat -t tc-tpm-enroll -p info; echo "$*"; }
+
+# Unlock with the existing (unconditional) seal, enrol the bound one, and wipe every
+# other TPM slot — systemd-cryptenroll never wipes the slot it just created.
+systemd-cryptenroll "$DEV" --unlock-tpm2-device=auto --tpm2-device=auto \
+  --tpm2-pcrs=7 --tpm2-public-key=/etc/systemd/tpm2-pcr-public-key.pem --tpm2-public-key-pcrs=11 \
+  --wipe-slot=tpm2
+
+# Exactly one TPM seal must remain, and it must carry the Secure Boot + signed-image policy.
+dump=$(cryptsetup luksDump "$DEV")
+[ "$(grep -c 'systemd-tpm2' <<<"$dump")" = 1 ] || { log "unexpected number of TPM seals"; exit 1; }
+grep -qE 'tpm2-hash-pcrs:\s+7' <<<"$dump" || { log "seal is not bound to PCR 7"; exit 1; }
+grep -qE 'tpm2-pubkey-pcrs:\s+11' <<<"$dump" || { log "seal is not bound to the signed PCR 11 policy"; exit 1; }
+rm -f "$MARK"; sync
+log "disk key sealed to Secure Boot state + signed boot images; temporary seal wiped"
