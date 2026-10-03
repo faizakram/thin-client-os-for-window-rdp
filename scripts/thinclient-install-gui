@@ -1,0 +1,668 @@
+#!/usr/bin/env python3
+# =============================================================================
+#  ThinClient OS — install wizard
+#  Installed to: /opt/thinclient/bin/thinclient-install-gui
+#
+#  A graphical front-end for thinclient-install, started from Admin Mode -> Install.
+#  It replaces the terminal: a technician picked a disk by TYPING its device name
+#  twice, read a pairing code off scrolling text and typed a one-time password into
+#  a black window. The installer underneath is unchanged and still does every step;
+#  this only asks the questions and shows the progress:
+#
+#     1 Check    UEFI / Secure Boot / TPM 2.0, with the BIOS fix for anything missing
+#     2 Disk     a list (the USB stick it booted from is never offered)
+#     3 Name     the name shown in the manager
+#     4 Install  approval (pairing code + one-time password), then progress
+#     5 Done     what happens at the first start
+#
+#  It runs as the session user and starts the installer through sudo with
+#  `--ui --disk X --confirm X --name N` (options, because sudo strips the
+#  environment). The installer answers with "@@TC ..." lines; everything else it
+#  prints goes to the Details box.
+# =============================================================================
+import json, os, re, signal, subprocess, sys
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, GLib, Gdk, Pango
+
+INSTALLER = os.environ.get("TC_INSTALLER", "/opt/thinclient/bin/thinclient-install")
+# Tests replace the privileged launcher with a stub; real use goes through sudo.
+LAUNCH = json.loads(os.environ["TC_INSTALL_CMD"]) if os.environ.get("TC_INSTALL_CMD") else ["sudo", "-n", INSTALLER]
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+PCT = re.compile(r"\s(\d{1,3})%\s")
+
+CSS = b"""
+window { background-color: #0b1220; }
+.card { background-color: #0e1728; border: 1px solid #1b2740; border-radius: 12px; padding: 22px 26px; }
+.title { color: #e6edf7; font-size: 22px; font-weight: bold; }
+.subtitle { color: #8a97b0; font-size: 13px; }
+label { color: #c3cee3; }
+.steps label { color: #5b6784; font-size: 12px; }
+.steps label.current { color: #e6edf7; font-weight: bold; }
+.steps label.past { color: #3fb950; }
+.ok { color: #3fb950; font-weight: bold; }
+.bad { color: #f85149; font-weight: bold; }
+.hint { color: #8a97b0; font-size: 12px; }
+.err { color: #ff7b72; font-size: 13px; }
+.code { color: #ffffff; font-size: 44px; font-weight: bold; letter-spacing: 8px; }
+.codebox { background: #101a2e; border: 1px solid #2f6fed; border-radius: 12px; padding: 14px 28px; }
+entry { background: #101a2e; color: #e6edf7; border: 1px solid #28395c; border-radius: 6px; padding: 9px; font-size: 15px; }
+.primary { background: #2f6fed; color: #ffffff; font-weight: bold; padding: 10px 26px; border-radius: 8px; }
+.primary:disabled { background: #223052; color: #6b7a99; }
+.secondary { background: #16223d; color: #e6edf7; border: 1px solid #28395c; padding: 10px 20px; border-radius: 8px; }
+.danger { background: #c42b1c; color: #ffffff; font-weight: bold; padding: 10px 22px; border-radius: 8px; }
+list, list row { background: #0e1728; }
+list row { border-bottom: 1px solid #1b2740; padding: 10px 6px; }
+list row:selected { background: #17284a; }
+.diskname { color: #e6edf7; font-size: 15px; font-weight: bold; }
+.badge { color: #fbbf24; font-size: 11px; font-weight: bold; }
+progressbar trough { background: #16223c; border-radius: 6px; min-height: 10px; }
+progressbar progress { background: #2f6fed; border-radius: 6px; min-height: 10px; }
+progressbar text { color: #e6edf7; font-size: 12px; }
+.running { color: #fbbf24; font-weight: bold; }
+textview, textview text { background: #070d18; color: #9fb0cc; font-family: monospace; font-size: 11px; }
+dialog, messagedialog { background-color: #0b1220; }
+dialog label, messagedialog label { color: #e6edf7; }
+"""
+
+STEPS = ["Check", "Disk", "Name", "Install", "Done"]
+
+# Installer stages, in order, with what a technician reads. Only the ones the
+# installer actually reports are shown (no "encrypt"/"seal" on a standard image).
+STAGES = [
+    ("approval",  "Approval from your administrator"),
+    ("partition", "Preparing the disk"),
+    ("encrypt",   "Encrypting the disk"),
+    ("seal",      "Sealing the disk key into this computer's TPM"),
+    ("copy",      "Copying the system"),
+    ("configure", "Setting up this device"),
+    ("boot",      "Installing the boot files"),
+]
+
+CHECK_TEXT = {
+    "uefi":       ("Started in UEFI mode",
+                   "In the BIOS: disable CSM / Legacy boot, then start the USB stick from its “UEFI:” boot entry."),
+    "secureboot": ("Secure Boot is on",
+                   "In the BIOS: Security → Secure Boot → Enabled (disable CSM first if it refuses)."),
+    "tpm":        ("TPM 2.0 is available",
+                   "In the BIOS: switch on “AMD fTPM”, “Intel PTT” or “Security Chip”."),
+}
+
+
+def human_size(b):
+    b = float(b or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if b < 1000 or unit == "TB":
+            return ("%.0f %s" % (b, unit)) if unit in ("B", "KB") else ("%.1f %s" % (b, unit)).replace(".0 ", " ")
+        b /= 1000.0
+
+
+def live_disk():
+    """The disk the live system started from — never offered as a target."""
+    if os.environ.get("TC_LIVE_DISK") is not None:
+        return os.environ["TC_LIVE_DISK"]
+    try:
+        src = subprocess.run(["findmnt", "-no", "SOURCE", "/run/live/medium"],
+                             capture_output=True, text=True, timeout=10).stdout.strip()
+        if not src:
+            return ""
+        parent = subprocess.run(["lsblk", "-no", "PKNAME", src], capture_output=True,
+                                text=True, timeout=10).stdout.strip().splitlines()
+        return parent[0].strip() if parent and parent[0].strip() else os.path.basename(src)
+    except Exception:
+        return ""
+
+
+def list_disks():
+    """[{name, path, size, model, usb}] — whole disks a technician could install to."""
+    try:
+        if os.environ.get("TC_LSBLK_JSON"):
+            data = json.load(open(os.environ["TC_LSBLK_JSON"]))
+        else:
+            data = json.loads(subprocess.run(
+                ["lsblk", "-J", "-b", "-d", "-o", "NAME,SIZE,MODEL,TYPE,TRAN,RO"],
+                capture_output=True, text=True, timeout=15).stdout or "{}")
+    except Exception:
+        return []
+    skip = live_disk()
+    out = []
+    for d in data.get("blockdevices", []):
+        name = d.get("name") or ""
+        if d.get("type") != "disk" or name == skip or str(d.get("ro")) in ("1", "True", "true"):
+            continue
+        if re.match(r"^(loop|zram|ram|sr|fd)\d*", name):
+            continue
+        out.append({"name": name, "path": "/dev/" + name, "size": int(d.get("size") or 0),
+                    "model": (d.get("model") or "").strip() or "Disk", "usb": d.get("tran") == "usb"})
+    return out
+
+
+class Wizard(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Install ThinClient")
+        self.set_default_size(860, 620)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.connect("delete-event", self._on_close)
+        prov = Gtk.CssProvider(); prov.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), prov,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self.proc = None
+        self.buf = b""
+        self.encrypted_image = False
+        self.checks = {}
+        self.disk = None
+        self.stage_rows = {}
+        self.current_stage = None
+        self.done_ok = False
+        self.fail_msg = ""
+        self.started_writing = False
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        outer.set_border_width(24)
+        self.add(outer)
+        self.steps_box = Gtk.Box(spacing=18)
+        self.steps_box.get_style_context().add_class("steps")
+        self.step_lbls = []
+        for i, s in enumerate(STEPS):
+            l = Gtk.Label(label="%d  %s" % (i + 1, s))
+            self.step_lbls.append(l)
+            self.steps_box.pack_start(l, False, False, 0)
+        outer.pack_start(self.steps_box, False, False, 0)
+
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.NONE)
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        card.get_style_context().add_class("card")
+        card.pack_start(self.stack, True, True, 0)
+        outer.pack_start(card, True, True, 0)
+
+        self.buttons = Gtk.Box(spacing=10)
+        self.btn_cancel = self._button("Cancel", "secondary", self._on_cancel)
+        self.btn_back = self._button("Back", "secondary", self._on_back)
+        self.btn_next = self._button("Next", "primary", self._on_next)
+        self.buttons.pack_start(self.btn_cancel, False, False, 0)
+        self.buttons.pack_end(self.btn_next, False, False, 0)
+        self.buttons.pack_end(self.btn_back, False, False, 0)
+        outer.pack_start(self.buttons, False, False, 0)
+
+        self._build_check(); self._build_disk(); self._build_name()
+        self._build_install(); self._build_done(); self._build_failed()
+        self.show_all()
+        self.page = None
+        self._go("check")
+        GLib.idle_add(self._run_preflight)
+
+    # ---- helpers ------------------------------------------------------------------
+    def _button(self, text, cls, cb):
+        b = Gtk.Button(label=text)
+        b.get_style_context().add_class(cls)
+        b.connect("clicked", lambda *_: cb())
+        return b
+
+    def _label(self, text, cls=None, wrap=True, xalign=0.0):
+        l = Gtk.Label(label=text)
+        l.set_xalign(xalign); l.set_line_wrap(wrap)
+        if cls:
+            l.get_style_context().add_class(cls)
+        return l
+
+    def _page(self, name, title, subtitle):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.pack_start(self._label(title, "title"), False, False, 0)
+        if subtitle:
+            box.pack_start(self._label(subtitle, "subtitle"), False, False, 0)
+        self.stack.add_named(box, name)
+        return box
+
+    def _go(self, page):
+        self.page = page
+        self.stack.set_visible_child_name(page)
+        idx = {"check": 0, "disk": 1, "name": 2, "install": 3, "done": 4, "failed": 3}[page]
+        for i, l in enumerate(self.step_lbls):
+            ctx = l.get_style_context()
+            for c in ("current", "past"):
+                ctx.remove_class(c)
+            ctx.add_class("current" if i == idx else ("past" if i < idx else "upcoming"))
+        self.btn_back.set_visible(page in ("disk", "name"))
+        self.btn_cancel.set_visible(page in ("check", "disk", "name", "install"))
+        self.btn_next.set_visible(page in ("check", "disk", "name", "done", "failed"))
+        self.btn_next.set_label({"name": "Install", "done": "Restart now", "failed": "Close"}.get(page, "Next"))
+        ctx = self.btn_next.get_style_context()
+        if page == "name":
+            ctx.remove_class("primary"); ctx.add_class("danger")
+        else:
+            ctx.remove_class("danger"); ctx.add_class("primary")
+        self._update_next()
+
+    def _update_next(self):
+        p = self.page
+        ok = True
+        if p == "check":
+            ok = self.checks.get("_done", False) and (not self.encrypted_image or all(
+                self.checks.get(k) == "ok" for k in ("uefi", "secureboot", "tpm")))
+        elif p == "disk":
+            ok = self.disk is not None
+        elif p == "name":
+            ok = bool(self.name_entry.get_text().strip())
+        self.btn_next.set_sensitive(ok)
+
+    def _msg(self, title, text, buttons=(("OK", Gtk.ResponseType.OK),), danger_ok=False):
+        d = Gtk.Dialog(title=title, transient_for=self, modal=True)
+        d.set_default_size(520, -1)
+        area = d.get_content_area(); area.set_spacing(10); area.set_border_width(18)
+        area.pack_start(self._label(title, "title"), False, False, 0)
+        area.pack_start(self._label(text), False, False, 0)
+        for label, resp in buttons:
+            b = d.add_button(label, resp)
+            if danger_ok and resp == Gtk.ResponseType.OK:
+                b.get_style_context().add_class("danger")
+        d.show_all()
+        r = d.run(); d.destroy()
+        return r
+
+    # ---- page 1: machine checks ---------------------------------------------------------
+    def _build_check(self):
+        box = self._page("check", "Install ThinClient on this computer",
+                         "First, a quick check that this computer is ready.")
+        self.image_lbl = self._label("Checking…", "subtitle")
+        box.pack_start(self.image_lbl, False, False, 4)
+        self.check_rows = {}
+        for key, (ok_text, fix) in CHECK_TEXT.items():
+            row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            line = Gtk.Box(spacing=10)
+            icon = self._label("…", wrap=False)
+            text = self._label(ok_text)
+            line.pack_start(icon, False, False, 0); line.pack_start(text, True, True, 0)
+            hint = self._label(fix, "hint")
+            row.pack_start(line, False, False, 0); row.pack_start(hint, False, False, 0)
+            box.pack_start(row, False, False, 4)
+            self.check_rows[key] = (row, icon, hint)
+        self.check_err = self._label("", "err")
+        box.pack_start(self.check_err, False, False, 6)
+        self.btn_recheck = self._button("Check again", "secondary", self._run_preflight)
+        b = Gtk.Box(); b.pack_start(self.btn_recheck, False, False, 0)
+        box.pack_start(b, False, False, 0)
+
+    def _run_preflight(self):
+        self.checks = {}
+        self.image_lbl.set_text("Checking…")
+        for row, icon, hint in self.check_rows.values():
+            icon.set_text("…"); hint.hide(); row.show()
+        self.check_err.set_text("")
+        self._update_next()
+        try:
+            r = subprocess.run(LAUNCH + ["--ui", "--preflight"], capture_output=True, text=True, timeout=60)
+            out = r.stdout + r.stderr
+        except Exception as e:
+            out = ""
+            self.check_err.set_text("Could not run the installer: %s" % e)
+        for ln in out.splitlines():
+            if not ln.startswith("@@TC check "):
+                continue
+            parts = ln.split()
+            if len(parts) >= 4:
+                self.checks[parts[2]] = parts[3]
+        self.encrypted_image = self.checks.get("image") == "encrypted"
+        if "image" not in self.checks:
+            if not self.check_err.get_text():
+                self.check_err.set_text("The installer did not answer. Is this the live USB system? Details:\n%s"
+                                        % ANSI.sub("", out).strip()[-400:])
+        elif not self.encrypted_image:
+            self.image_lbl.set_text("This is a standard (unencrypted) installation image.")
+            for row, _, _ in self.check_rows.values():
+                row.hide()
+        else:
+            self.image_lbl.set_text("This image installs ENCRYPTED. The computer needs all three:")
+            for key, (row, icon, hint) in self.check_rows.items():
+                good = self.checks.get(key) == "ok"
+                icon.set_text("✔" if good else "✘")
+                ctx = icon.get_style_context()
+                ctx.remove_class("ok"); ctx.remove_class("bad"); ctx.add_class("ok" if good else "bad")
+                hint.set_visible(not good)
+            if not all(self.checks.get(k) == "ok" for k in ("uefi", "secureboot", "tpm")):
+                self.check_err.set_text("Fix the items above in the BIOS, restart from the USB stick, "
+                                        "and run the installer again. Nothing has been changed.")
+        self.checks["_done"] = "image" in self.checks
+        self._update_next()
+        return False
+
+    # ---- page 2: disk -------------------------------------------------------------------
+    def _build_disk(self):
+        box = self._page("disk", "Choose the disk to install on",
+                         "Everything on the chosen disk will be erased. The USB stick you started from is not listed.")
+        self.disk_list = Gtk.ListBox()
+        self.disk_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.disk_list.connect("row-selected", self._on_disk_selected)
+        sw = Gtk.ScrolledWindow(); sw.set_min_content_height(260); sw.add(self.disk_list)
+        box.pack_start(sw, True, True, 0)
+        self.disk_empty = self._label("", "err")
+        box.pack_start(self.disk_empty, False, False, 0)
+
+    def _fill_disks(self):
+        for c in self.disk_list.get_children():
+            self.disk_list.remove(c)
+        self.disks = list_disks()
+        self.disk = None
+        for d in self.disks:
+            row = Gtk.ListBoxRow()
+            v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            top = Gtk.Box(spacing=10)
+            top.pack_start(self._label("%s  —  %s" % (d["model"], human_size(d["size"])), "diskname", wrap=False), False, False, 0)
+            if d["usb"]:
+                top.pack_start(self._label("USB", "badge", wrap=False), False, False, 0)
+            v.pack_start(top, False, False, 0)
+            v.pack_start(self._label(d["path"], "hint", wrap=False), False, False, 0)
+            row.add(v); row.disk = d
+            self.disk_list.add(row)
+        self.disk_list.show_all()
+        self.disk_empty.set_text("" if self.disks else
+                                 "No disk was found to install on. Check that the internal disk is connected.")
+        internal = [i for i, d in enumerate(self.disks) if not d["usb"]]
+        if len(internal) == 1:
+            self.disk_list.select_row(self.disk_list.get_row_at_index(internal[0]))
+        self._update_next()
+
+    def _on_disk_selected(self, _lb, row):
+        self.disk = row.disk if row else None
+        self._update_next()
+
+    # ---- page 3: name -------------------------------------------------------------------
+    def _build_name(self):
+        box = self._page("name", "Name this device",
+                         "The name the device has in the manager, e.g. “Reception-PC”.")
+        self.name_entry = Gtk.Entry()
+        self.name_entry.set_max_length(63)
+        self.name_entry.set_placeholder_text("Device name")
+        self.name_entry.connect("changed", lambda *_: self._update_next())
+        self.name_entry.connect("activate", lambda *_: self.btn_next.get_sensitive() and self._on_next())
+        box.pack_start(self.name_entry, False, False, 6)
+        self.name_summary = self._label("", "hint")
+        box.pack_start(self.name_summary, False, False, 0)
+
+    # ---- page 4: install ---------------------------------------------------------------
+    def _build_install(self):
+        box = self._page("install", "Installing", "")
+        self.inst_status = self._label("Starting…", "subtitle")
+        box.pack_start(self.inst_status, False, False, 0)
+
+        # Approval: the pairing code, then the one-time password.
+        self.approval_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.approval_box.set_no_show_all(True)
+        self.approval_box.pack_start(self._label(
+            "This computer needs approval. Give your administrator this code; they approve it in the "
+            "manager and give you a one-time password.", wrap=True), False, False, 0)
+        cb = Gtk.Box(); cb.get_style_context().add_class("codebox")
+        self.code_lbl = self._label("------", "code", wrap=False, xalign=0.5)
+        cb.pack_start(self.code_lbl, True, True, 0)
+        h = Gtk.Box(); h.set_center_widget(cb)
+        self.approval_box.pack_start(h, False, False, 4)
+        self.wait_lbl = self._label("Waiting for approval…", "hint", xalign=0.5)
+        self.approval_box.pack_start(self.wait_lbl, False, False, 0)
+        self.otp_row = Gtk.Box(spacing=10)
+        self.otp_entry = Gtk.Entry(); self.otp_entry.set_placeholder_text("One-time password")
+        self.otp_entry.set_visibility(True); self.otp_entry.set_width_chars(18)
+        self.otp_entry.connect("activate", lambda *_: self._send_otp())
+        self.otp_btn = self._button("Submit", "primary", self._send_otp)
+        self.otp_row.pack_start(self.otp_entry, True, True, 0)
+        self.otp_row.pack_start(self.otp_btn, False, False, 0)
+        self.approval_box.pack_start(self.otp_row, False, False, 0)
+        self.otp_err = self._label("", "err")
+        self.approval_box.pack_start(self.otp_err, False, False, 0)
+        for w in (h, cb, self.code_lbl, self.wait_lbl, self.otp_err):
+            w.show()
+        box.pack_start(self.approval_box, False, False, 0)
+
+        self.stage_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.pack_start(self.stage_box, False, False, 6)
+        self.progress = Gtk.ProgressBar(); self.progress.set_no_show_all(True)
+        box.pack_start(self.progress, False, False, 0)
+
+        exp = Gtk.Expander(label="Details")
+        self.log_view = Gtk.TextView(); self.log_view.set_editable(False)
+        self.log_view.set_wrap_mode(Gtk.WrapMode.CHAR)
+        sw = Gtk.ScrolledWindow(); sw.set_min_content_height(140); sw.add(self.log_view)
+        exp.add(sw)
+        box.pack_end(exp, True, True, 0)
+
+    def _stage(self, key):
+        """Mark `key` running and everything before it done."""
+        if key not in dict(STAGES):
+            return
+        if self.current_stage and self.current_stage in self.stage_rows:
+            self._stage_mark(self.current_stage, "done")
+        if key not in self.stage_rows:
+            line = Gtk.Box(spacing=10)
+            icon = self._label("○", wrap=False)
+            text = self._label(dict(STAGES)[key])
+            line.pack_start(icon, False, False, 0); line.pack_start(text, True, True, 0)
+            line.show_all()
+            self.stage_box.pack_start(line, False, False, 0)
+            self.stage_rows[key] = icon
+        self._stage_mark(key, "run")
+        self.current_stage = key
+        self.inst_status.set_text(dict(STAGES)[key] + "…")
+        if key != "approval":
+            self.approval_box.hide()
+            self.btn_cancel.set_sensitive(False)     # the disk is being changed now
+            self.started_writing = True
+        if key == "copy":
+            self.progress.set_fraction(0.0); self.progress.show()
+        else:
+            self.progress.hide()
+
+    def _stage_mark(self, key, state):
+        icon = self.stage_rows[key]
+        icon.set_text({"run": "●", "done": "✔"}[state])
+        ctx = icon.get_style_context(); ctx.remove_class("ok"); ctx.remove_class("running")
+        ctx.add_class("ok" if state == "done" else "running")
+
+    def _start_install(self):
+        self._go("install")
+        cmd = LAUNCH + ["--ui", "--disk", self.disk["path"], "--confirm", self.disk["path"],
+                        "--name", self.name_entry.get_text().strip()]
+        try:
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT, bufsize=0)
+        except Exception as e:
+            self.fail_msg = "Could not start the installer: %s" % e
+            self._finish(1)
+            return
+        GLib.io_add_watch(self.proc.stdout.fileno(), GLib.PRIORITY_DEFAULT,
+                          GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self._on_output)
+        GLib.child_watch_add(GLib.PRIORITY_DEFAULT, self.proc.pid, self._on_exit)
+
+    def _on_output(self, fd, cond):
+        try:
+            chunk = os.read(fd, 8192)
+        except OSError:
+            chunk = b""
+        if not chunk:
+            return False
+        self.buf += chunk
+        parts = re.split(rb"[\r\n]", self.buf)
+        self.buf = parts.pop()
+        for raw in parts:
+            self._line(ANSI.sub("", raw.decode("utf-8", "replace")))
+        return True
+
+    def _line(self, ln):
+        if ln.startswith("@@TC "):
+            self._marker(ln[5:].strip())
+            return
+        if not ln.strip():
+            return
+        if self.current_stage == "copy":
+            m = PCT.search(ln + " ")
+            if m:
+                self.progress.set_fraction(min(1.0, int(m.group(1)) / 100.0))
+                self.progress.set_text("%s%%" % m.group(1)); self.progress.set_show_text(True)
+                return                                  # rsync's progress: not worth logging
+        b = self.log_view.get_buffer()
+        b.insert(b.get_end_iter(), ln + "\n")
+        self.log_view.scroll_to_iter(b.get_end_iter(), 0.0, False, 0, 0)
+
+    def _marker(self, m):
+        word, _, rest = m.partition(" ")
+        if word == "stage":
+            self._stage(rest)
+        elif word == "pairing":
+            self.code_lbl.set_text(rest)
+            self.approval_box.show(); self.otp_row.hide()
+            self.wait_lbl.set_text("Waiting for your administrator to approve this computer…")
+            self.inst_status.set_text("Waiting for approval")
+        elif word == "waiting":
+            mins = int(rest or 0)
+            self.wait_lbl.set_text("Waiting for approval… (%s)" % ("just asked" if mins < 1 else "%d min" % mins))
+        elif word == "approved":
+            self.wait_lbl.set_text("✔ Approved. Enter the one-time password your administrator gave you.")
+        elif word == "need-otp":
+            self.approval_box.show(); self.otp_row.show_all()
+            self.otp_entry.set_sensitive(True); self.otp_btn.set_sensitive(True)
+            self.wait_lbl.set_text("✔ Approved. Enter the one-time password your administrator gave you.")
+            self.otp_entry.grab_focus()
+        elif word == "otp-error":
+            self.otp_err.set_text(rest)
+        elif word == "ask-offline":
+            r = self._msg("Can't reach the manager",
+                          "This computer can't reach %s. You can install now: it asks to join the fleet the "
+                          "first time it has a working network, and you approve it then. Nothing is granted "
+                          "without that approval." % rest,
+                          (("Cancel", Gtk.ResponseType.CANCEL), ("Install anyway", Gtk.ResponseType.OK)))
+            self._write("y" if r == Gtk.ResponseType.OK else "n")
+        elif word == "failed":
+            self.fail_msg = rest
+        elif word == "done":
+            self.done_ok = True
+            self.done_encrypted = "encrypted=1" in rest
+
+    def _write(self, text):
+        try:
+            self.proc.stdin.write((text + "\n").encode()); self.proc.stdin.flush()
+        except Exception:
+            pass
+
+    def _send_otp(self):
+        otp = self.otp_entry.get_text().strip()
+        if not otp:
+            return
+        self.otp_err.set_text("")
+        self.otp_entry.set_text("")
+        self.otp_entry.set_sensitive(False); self.otp_btn.set_sensitive(False)
+        self.wait_lbl.set_text("Checking the password…")
+        self._write(otp)
+
+    def _on_exit(self, pid, status):
+        rc = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else (status >> 8)
+        # Drain anything left.
+        try:
+            rest = self.proc.stdout.read() or b""
+        except Exception:
+            rest = b""
+        for raw in re.split(rb"[\r\n]", self.buf + rest):
+            self._line(ANSI.sub("", raw.decode("utf-8", "replace")))
+        self.buf = b""
+        self._finish(rc)
+
+    def _finish(self, rc):
+        if rc == 0 and self.done_ok:
+            if self.current_stage:
+                self._stage_mark(self.current_stage, "done")
+            self._show_done()
+        else:
+            self.fail_lbl.set_text(self.fail_msg or
+                                   "The installation stopped (exit code %s). Open Details for what it printed." % rc)
+            self.fail_safe.set_text("Nothing was changed on the disk." if not self.started_writing else
+                                    "The disk was partly written. Run the installer again to finish.")
+            self._go("failed")
+
+    # ---- page 5: done ------------------------------------------------------------------
+    def _build_done(self):
+        box = self._page("done", "✔ Installed", "")
+        self.done_lbl = self._label("")
+        box.pack_start(self.done_lbl, False, False, 0)
+
+    def _show_done(self):
+        enc = getattr(self, "done_encrypted", False)
+        text = ["Remove the USB stick, then restart."]
+        if enc:
+            text += ["",
+                     "The FIRST start takes up to 3 minutes while the disk key is sealed into this "
+                     "computer — the screen may stay dark. Do not switch it off.",
+                     "",
+                     "On a computer that has never had ThinClient, a blue screen appears once at that first start:",
+                     "   1.  “Verification failed: Security Violation” → press Enter",
+                     "   2.  “Press any key to perform MOK management” → press a key within 10 seconds",
+                     "   3.  Enroll key from disk → TCEFI → THINCLIENT-ENROLL-ME.der → Continue → Yes → Reboot",
+                     "",
+                     "After that it starts by itself every time. Nobody is ever asked for a disk password."]
+        self.done_lbl.set_text("\n".join(text))
+        self._go("done")
+
+    def _build_failed(self):
+        box = self._page("failed", "Installation stopped", "")
+        self.fail_lbl = self._label("", "err")
+        self.fail_safe = self._label("", "subtitle")
+        box.pack_start(self.fail_lbl, False, False, 0)
+        box.pack_start(self.fail_safe, False, False, 0)
+        # The same log as the install page, open: it is what support will ask for.
+        exp = Gtk.Expander(label="Details"); exp.set_expanded(True)
+        view = Gtk.TextView(buffer=self.log_view.get_buffer()); view.set_editable(False)
+        view.set_wrap_mode(Gtk.WrapMode.CHAR)
+        sw = Gtk.ScrolledWindow(); sw.set_min_content_height(220); sw.add(view)
+        exp.add(sw)
+        box.pack_start(exp, True, True, 6)
+
+    # ---- navigation -----------------------------------------------------------------------
+    def _on_next(self):
+        p = self.page
+        if p == "check":
+            self._fill_disks(); self._go("disk")
+        elif p == "disk":
+            self._go("name"); self.name_entry.grab_focus()
+            self.name_summary.set_text("Installing on: %s — %s (%s)"
+                                       % (self.disk["model"], human_size(self.disk["size"]), self.disk["path"]))
+        elif p == "name":
+            r = self._msg("Erase %s?" % self.disk["model"],
+                          "Everything on %s (%s, %s) will be permanently deleted and ThinClient installed on it."
+                          % (self.disk["model"], human_size(self.disk["size"]), self.disk["path"]),
+                          (("Cancel", Gtk.ResponseType.CANCEL), ("Erase and install", Gtk.ResponseType.OK)),
+                          danger_ok=True)
+            if r == Gtk.ResponseType.OK:
+                self._start_install()
+        elif p == "done":
+            subprocess.Popen(["sudo", "-n", "systemctl", "reboot"])
+        elif p == "failed":
+            self.destroy(); Gtk.main_quit()
+
+    def _on_back(self):
+        self._go({"disk": "check", "name": "disk"}.get(self.page, self.page))
+
+    def _on_cancel(self):
+        if self.page == "install":
+            if self.started_writing:
+                return
+            if self._msg("Cancel the installation?", "Nothing has been changed on the disk yet.",
+                         (("Keep going", Gtk.ResponseType.CANCEL), ("Cancel installation", Gtk.ResponseType.OK))) \
+                    != Gtk.ResponseType.OK:
+                return
+            try:
+                self.proc.stdin.close()
+                self.proc.send_signal(signal.SIGTERM)
+            except Exception:
+                pass
+        self.destroy(); Gtk.main_quit()
+
+    def _on_close(self, *_):
+        if self.page == "install" and self.started_writing:
+            return True                  # never abandon a disk half-written
+        self._on_cancel()
+        return True
+
+
+def main():
+    Wizard()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

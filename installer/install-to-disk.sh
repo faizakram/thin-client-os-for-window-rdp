@@ -18,6 +18,10 @@
 #
 #  Usage:
 #     sudo thinclient-install [/dev/sdX]     # interactive if disk omitted
+#     sudo thinclient-install --ui --disk /dev/X --confirm /dev/X --name NAME
+#                                            # driven by the install wizard (thinclient-install-gui):
+#                                            # answers as options, progress as "@@TC ..." lines
+#     sudo thinclient-install --ui --preflight   # only the machine checks, then exit
 # =============================================================================
 set -euo pipefail
 
@@ -31,13 +35,71 @@ die() { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 ok()   { printf '\033[1;32m[OK]\033[0m %s\n' "$*" | tee -a "$LOG"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n'  "$*" | tee -a "$LOG" >&2; }
 
+# --- Arguments (the wizard passes answers as options: sudo strips the environment) --
+UI=0; PREFLIGHT=0; ARG_DISK=""; ARG_CONFIRM=""; ARG_NAME=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --ui)        UI=1; shift ;;
+    --preflight) PREFLIGHT=1; shift ;;
+    --disk)      ARG_DISK="${2:-}"; shift 2 ;;
+    --confirm)   ARG_CONFIRM="${2:-}"; shift 2 ;;
+    --name)      ARG_NAME="${2:-}"; shift 2 ;;
+    *)           ARG_DISK="$1"; shift ;;
+  esac
+done
+# One machine-readable line per milestone for the wizard; nothing in terminal mode.
+ui() { [[ "$UI" == 1 ]] && printf '@@TC %s\n' "$*"; return 0; }
+# thinclient-enroll (pairing code, one-time password) speaks the same protocol.
+[[ "$UI" == 1 ]] && export TC_UI=1
+_die_orig() { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
+die() { ui "failed $*"; _die_orig "$@"; }
+
 [[ "$(id -u)" -eq 0 ]] || die "Run as root: sudo thinclient-install"
+
+# --------------------------------------------------------------------------- #
+# Machine checks for an ENCRYPTED image (security plan Phase B): UEFI + Secure Boot
+# on + TPM 2.0. Sets ENCRYPTED_IMAGE, and WHY (an array, empty = all good). Each
+# result is also reported to the wizard. Every read is guarded: a pen drive started
+# in legacy mode has no EFI variables at all, and under set -e + pipefail a failed
+# read inside $(...) once ended the installer silently.
+# --------------------------------------------------------------------------- #
+PHASEB=/opt/thinclient/phaseb
+ENCRYPTED_IMAGE=0; WHY=()
+machine_checks() {
+  WHY=()
+  [[ -f "$PHASEB/thinclient.efi" ]] && ENCRYPTED_IMAGE=1
+  ui "check image $([[ $ENCRYPTED_IMAGE == 1 ]] && echo encrypted || echo plain)"
+  [[ "$ENCRYPTED_IMAGE" == 1 ]] || return 0
+  if [[ "${TC_INSTALL_TEST:-0}" == "1" ]]; then
+    ui "check uefi ok"; ui "check secureboot ok"; ui "check tpm ok"; return 0
+  fi
+  if [[ -d /sys/firmware/efi ]]; then ui "check uefi ok"
+  else ui "check uefi fail"; WHY+=("the machine did not start in UEFI mode (switch off Legacy/CSM boot)"); fi
+  # The SecureBoot variable is 4 bytes of attributes + 1 byte of state. Read it
+  # SEQUENTIALLY (head, then the 5th byte): `od -j4` SEEKS, and efivarfs files cannot
+  # seek, so on a real machine with Secure Boot ACTIVE that read came back empty.
+  # mokutil (installed in the image) is asked as well.
+  local sb tpmv
+  sb="$(head -c 5 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-e0f84a3cb4bd 2>/dev/null | tail -c 1 | od -An -t u1 2>/dev/null | tr -d ' \n' || true)"
+  if [[ "$sb" != "1" ]] && mokutil --sb-state 2>/dev/null | grep -qi "SecureBoot enabled"; then sb=1; fi
+  if [[ "$sb" == "1" ]]; then ui "check secureboot ok"
+  else ui "check secureboot fail"; WHY+=("Secure Boot is not switched on in the BIOS (or the pen drive was started in legacy mode — use the 'UEFI:' boot entry)"); fi
+  tpmv="$(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null || true)"
+  if [[ -e /dev/tpmrm0 && "$tpmv" == "2" ]]; then ui "check tpm ok"
+  else ui "check tpm fail"; WHY+=("no TPM 2.0 was found (switch on 'AMD fTPM' / 'Intel PTT' / 'Security Chip' in the BIOS)"); fi
+}
+if [[ "$PREFLIGHT" == 1 ]]; then
+  machine_checks
+  ui "preflight-done"
+  ((${#WHY[@]} == 0)) && exit 0 || exit 2
+fi
 mkdir -p "$(dirname "$LOG")"
 
 # --------------------------------------------------------------------------- #
 # 1. Choose the target disk.
 # --------------------------------------------------------------------------- #
-DISK="${1:-}"
+DISK="$ARG_DISK"
+[[ "$UI" == 1 && -z "$DISK" ]] && die "No disk chosen"
 if [[ -z "$DISK" ]]; then
   echo "Available disks:"
   lsblk -d -o NAME,SIZE,MODEL,TYPE | grep -E 'disk$' || true
@@ -56,7 +118,11 @@ echo
 echo "  !!  ALL DATA ON ${DISK} WILL BE DESTROYED  !!"
 lsblk "$DISK" || true
 echo
-read -r -p "Type the disk name (${DISK}) to confirm: " CONFIRM
+if [[ "$UI" == 1 ]]; then
+  CONFIRM="$ARG_CONFIRM"        # the wizard's own confirmation dialog
+else
+  read -r -p "Type the disk name (${DISK}) to confirm: " CONFIRM
+fi
 [[ "$CONFIRM" == "$DISK" ]] || die "Confirmation did not match. Aborting."
 
 # --------------------------------------------------------------------------- #
@@ -68,28 +134,11 @@ read -r -p "Type the disk name (${DISK}) to confirm: " CONFIRM
 #     2026-10-03), unless the installer is started with TC_ALLOW_UNENCRYPTED=1 and the
 #     exception is typed out — then it installs unencrypted and the manager is told.
 # --------------------------------------------------------------------------- #
-PHASEB=/opt/thinclient/phaseb
 ENCRYPT=0; UNENCRYPTED_EXCEPTION=0
 TPM2_DEVICE="${TC_TPM2_DEVICE:-auto}"      # a test harness points this at a software TPM
-if [[ -f "$PHASEB/thinclient.efi" ]]; then
-  why=()
-  if [[ "${TC_INSTALL_TEST:-0}" != "1" ]]; then
-    [[ -d /sys/firmware/efi ]] || why+=("the machine did not start in UEFI mode (switch off Legacy/CSM boot)")
-    # Every read here may legitimately fail — a pen drive started in legacy/BIOS mode has
-    # no EFI variables at all — and under set -e + pipefail a failed read inside $(...)
-    # ENDED the installer silently, right after the disk confirmation (seen on a real
-    # machine). Each read is guarded so the operator is told WHAT is missing.
-    # The SecureBoot variable is 4 bytes of attributes + 1 byte of state. Read it
-    # SEQUENTIALLY (head, then the 5th byte): `od -j4` SEEKS, and efivarfs files cannot
-    # seek, so on a real machine with Secure Boot ACTIVE that read came back empty and the
-    # installer refused it. mokutil (installed in the image) is asked as well.
-    sb="$(head -c 5 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-e0f84a3cb4bd 2>/dev/null | tail -c 1 | od -An -t u1 2>/dev/null | tr -d ' \n' || true)"
-    if [[ "$sb" != "1" ]] && mokutil --sb-state 2>/dev/null | grep -qi "SecureBoot enabled"; then sb=1; fi
-    [[ "$sb" == "1" ]] || why+=("Secure Boot is not switched on in the BIOS (or the pen drive was started in legacy mode — use the 'UEFI:' boot entry)")
-    tpmv="$(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null || true)"
-    { [[ -e /dev/tpmrm0 ]] && [[ "$tpmv" == "2" ]]; } \
-      || why+=("no TPM 2.0 was found (switch on 'AMD fTPM' / 'Intel PTT' / 'Security Chip' in the BIOS)")
-  fi
+machine_checks
+why=("${WHY[@]}")
+if [[ "$ENCRYPTED_IMAGE" == 1 ]]; then
   if ((${#why[@]} == 0)); then
     ENCRYPT=1
     ok "Encrypted install: UEFI, Secure Boot and TPM 2.0 found"
@@ -98,7 +147,8 @@ if [[ -f "$PHASEB/thinclient.efi" ]]; then
     echo "  This image installs ENCRYPTED, and this machine can't be encrypted:"
     printf '    - %s\n' "${why[@]}"
     echo "  Fix it in the BIOS and run 'sudo thinclient-install' again. ${DISK} has NOT been changed."
-    if [[ "${TC_ALLOW_UNENCRYPTED:-0}" == "1" ]]; then
+    ui "failed This machine can't be encrypted: ${why[*]}"
+    if [[ "${TC_ALLOW_UNENCRYPTED:-0}" == "1" && "$UI" != 1 ]]; then
       read -r -p "  To install WITHOUT encryption anyway, type INSTALL UNENCRYPTED: " _ans
       [[ "$_ans" == "INSTALL UNENCRYPTED" ]] || die "Not confirmed. ${DISK} has NOT been changed."
       warn "Installing UNENCRYPTED by explicit exception — the manager will show it"
@@ -115,7 +165,8 @@ echo
 # Require a device name so the machine shows up in the dashboard by a real name
 # instead of the default hostname. Loop until something non-empty is entered, and
 # echo it back so the installer can SEE it was captured.
-DEVNAME=""
+DEVNAME="$(printf '%s' "$ARG_NAME" | tr -d '\r' | sed 's/^ *//; s/ *$//')"
+[[ "$UI" == 1 && -z "$DEVNAME" ]] && die "No device name given"
 while [[ -z "$DEVNAME" ]]; do
   read -r -p "Device name for the dashboard (e.g. Reception-PC): " DEVNAME || true
   DEVNAME="$(printf '%s' "${DEVNAME:-}" | tr -d '\r' | sed 's/^ *//; s/ *$//')"
@@ -180,6 +231,7 @@ if [[ -n "$CTRL_URL" && -n "$TEN_TOKEN" ]]; then
     # parse silently yields "https" on any non-GNU sed. Strip scheme, then path,
     # then port.
     MGR_HOST="${CTRL_URL#*://}"; MGR_HOST="${MGR_HOST%%/*}"; MGR_HOST="${MGR_HOST%%:*}"
+    ui "stage approval"
     log "Waiting for the manager (${MGR_HOST}) to be reachable"
     NET_OK=0
     NET_TRIES=12
@@ -231,7 +283,11 @@ if [[ -n "$CTRL_URL" && -n "$TEN_TOKEN" ]]; then
       # /dev/tty means that wherever it is absent the question cannot be answered at
       # all and the operator is refused whatever they wanted.
       _off=""
-      if [[ -r /dev/tty ]]; then
+      if [[ "$UI" == 1 ]]; then
+        # The wizard asks with a dialog and answers on stdin.
+        ui "ask-offline ${MGR_HOST}"
+        read -r _off || _off=""
+      elif [[ -r /dev/tty ]]; then
         read -r -p "  Install anyway, and join the fleet later? [y/N] " _off < /dev/tty || _off=""
       else
         read -r -p "  Install anyway, and join the fleet later? [y/N] " _off || _off=""
@@ -244,6 +300,7 @@ if [[ -n "$CTRL_URL" && -n "$TEN_TOKEN" ]]; then
           ;;
         *)
           echo
+          ui "failed Cannot reach the manager. Nothing was changed — fix the network and try again."
           echo "  Nothing has been changed — ${DISK} is untouched."
           echo "  Fix the network and run 'sudo thinclient-install' again."
           echo
@@ -272,6 +329,7 @@ if [[ -n "$CTRL_URL" && -n "$TEN_TOKEN" ]]; then
       *)
          rm -f "$ENROLL_CREDS"
          echo
+         ui "failed This machine was not approved. Nothing was changed — ask your administrator to approve it, then try again."
          echo "  Installation cancelled: this machine was not approved."
          echo
          echo "  NOTHING has been changed — ${DISK} has not been touched and still"
@@ -354,6 +412,7 @@ disk_holders() {
   printf '%b' "$out"
 }
 
+ui "stage partition"
 log "Partitioning ${DISK} (EFI=${EFI_PART}, root=${ROOT_PART})"
 umount -R "$TARGET_MNT" 2>/dev/null || true
 log "Releasing ${DISK} (unmounting partitions, swap off, RAID/LVM down)"
@@ -391,6 +450,7 @@ if [[ "$ENCRYPT" == "1" ]]; then
   sgdisk -n2:0:0   -t2:8304 -c2:"THINCLIENT_ROOT" "$DISK"
   partprobe "$DISK"; sleep 2
 
+  ui "stage encrypt"
   log "Formatting: boot partition + encrypted root (LUKS2, AES-256-XTS)"
   mkfs.vfat -F32 -n TCEFI "$EFI_PART"
   LUKS_UUID="$(cat "$PHASEB/LUKS_UUID")"
@@ -411,6 +471,7 @@ if [[ "$ENCRYPT" == "1" ]]; then
   # system boots through a different chain than the installed one. First boot re-seals
   # it to Secure Boot + our signed boot images and wipes this seal (tc-tpm-enroll).
   # Then the install passphrase goes: from here on only this TPM opens the disk.
+  ui "stage seal"
   log "Sealing the disk key into this machine's TPM"
   systemd-cryptenroll "$ROOT_PART" --unlock-key-file="$INSTALL_KEY" --tpm2-device="$TPM2_DEVICE" --tpm2-pcrs= \
     || die "Could not seal the key into the TPM. Is the TPM switched on in the BIOS?"
@@ -438,6 +499,7 @@ mount "$ROOT_DEV" "$TARGET_MNT"
 mkdir -p "$TARGET_MNT/boot/efi"
 mount "$EFI_PART" "$TARGET_MNT/boot/efi"
 
+ui "stage copy"
 log "Copying system (rsync) — this takes a few minutes"
 rsync -aHAXx --info=progress2 \
   --exclude=/dev/* --exclude=/proc/* --exclude=/sys/* --exclude=/tmp/* \
@@ -461,6 +523,7 @@ rsync -aHAXx --info=progress2 \
 # --------------------------------------------------------------------------- #
 # NEW_MACHINE_ID / DEVICE_HWID were generated in §1b, before the disk was touched,
 # because the approval is bound to this hwid. Here we only persist it.
+ui "stage configure"
 log "Assigning the unique per-device identity"
 printf '%s\n' "$NEW_MACHINE_ID" >"$TARGET_MNT/etc/machine-id"
 rm -f "$TARGET_MNT/var/lib/dbus/machine-id" \
@@ -546,6 +609,7 @@ done
 
 UEFI_MODE=0; [[ -d /sys/firmware/efi ]] && UEFI_MODE=1
 
+ui "stage boot"
 log "Installing bootloader inside chroot (UEFI_MODE=${UEFI_MODE})"
 CHROOT_LOG="$(mktemp)"
 set +e
@@ -687,6 +751,7 @@ rm -f "$CHROOT_LOG"
 
 if [[ "$BOOT_OK" -eq 0 ]]; then
   echo
+  ui "failed The bootloader did not install, so this disk would not boot. See /var/log/thinclient/install-chroot.log on it."
   echo "  INSTALLATION FAILED — this disk would NOT boot."
   echo
   echo "  The system was copied, but the bootloader did not install, so the machine"
@@ -757,6 +822,7 @@ umount -R "$TARGET_MNT" 2>/dev/null || true
 [[ "$ENCRYPT" == "1" ]] && { cryptsetup close "$MAPPER" 2>/dev/null || true; }
 
 log "Installation complete on ${DISK}."
+ui "done encrypted=${ENCRYPT}"
 printf '\n\033[1;32mInstall complete.\033[0m\n'
 if [[ "$ENCRYPT" == "1" ]]; then cat <<MSG
   ENCRYPTED INSTALL — one step at the FIRST power-on, at this machine's screen:

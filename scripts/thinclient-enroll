@@ -41,6 +41,17 @@ def _say(msg=""):
     print(msg, flush=True)
 
 
+# The install wizard (thinclient-install-gui) runs this through the installer with
+# TC_UI=1: milestones become "@@TC ..." lines, and the one-time password arrives on
+# stdin from the wizard's own entry box instead of a terminal.
+UI = os.environ.get("TC_UI") == "1"
+
+
+def _ui(msg):
+    if UI:
+        print("@@TC %s" % msg, flush=True)
+
+
 def _curl(url, payload=None, timeout=30):
     """POST json (or GET when payload is None). Returns (http_status, dict|None)."""
     cmd = ["curl", "-sS", "--connect-timeout", "10", "--max-time", str(timeout),
@@ -122,6 +133,7 @@ def banner(pairing_code):
     _say("  Give your administrator this code:")
     _say()
     _say("        >>>   %s   <<<" % pairing_code)
+    _ui("pairing %s" % pairing_code)
     _say()
     _say("  They will check it matches what you just read out, approve")
     _say("  this machine, and give you a one-time password.")
@@ -142,15 +154,18 @@ def wait_for_approval(url, req_id, hwid):
             if st == "approved":
                 _say()
                 _say("  Approved by your administrator.")
+                _ui("approved")
                 return True
             if st in ("denied", "expired", "claimed"):
                 _say()
                 _say("  %s" % body.get("message", "This request can no longer be used."))
+                _ui("failed %s" % body.get("message", "This request can no longer be used."))
                 return False
             if st != last:
                 last = st
                 mins = int((time.time() - started) / 60)
                 _say("  Waiting for approval… (%s)" % ("just asked" if mins < 1 else "%d min" % mins))
+                _ui("waiting %d" % mins)
         elif code == 0:
             _say("  Can't reach the manager — retrying…")
         # A quiet dot keeps the operator confident it hasn't hung.
@@ -164,12 +179,19 @@ def wait_for_approval(url, req_id, hwid):
 
 def claim(url, req_id, hwid):
     """Prompt for the one-time password and exchange it for credentials."""
-    if not sys.stdin.isatty():
+    if not UI and not sys.stdin.isatty():
         _say("  No terminal to read the one-time password from — aborting.")
         return None
     for attempt in range(1, OTP_TRIES + 1):
         try:
-            otp = input("  One-time password from your administrator: ").strip()
+            if UI:
+                _ui("need-otp %d %d" % (attempt, OTP_TRIES))
+                line = sys.stdin.readline()
+                if line == "":          # the wizard closed: cancelled
+                    return None
+                otp = line.strip()
+            else:
+                otp = input("  One-time password from your administrator: ").strip()
         except (EOFError, KeyboardInterrupt):
             _say()
             return None
@@ -192,6 +214,7 @@ def claim(url, req_id, hwid):
                 time.sleep(wait)
         msg = (body or {}).get("error") or _LAST_ERR[0] or "That didn't work."
         _say("  %s" % msg)
+        _ui("otp-error %s" % msg)
         if code in (409, 404) or "expired" in msg.lower() or "Too many" in msg:
             return None
         if attempt == OTP_TRIES:

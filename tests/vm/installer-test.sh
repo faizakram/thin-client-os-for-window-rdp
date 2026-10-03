@@ -23,7 +23,10 @@ chroot /live test -f /opt/thinclient/phaseb/thinclient.efi || { echo "NOT an enc
 if [ "${TC_USE_REPO_INSTALLER:-0}" = 1 ]; then
   install -m 0755 /project/installer/install-to-disk.sh "$(chroot /live readlink -f /opt/thinclient/bin)/thinclient-install" 2>/dev/null \
     || install -m 0755 /project/installer/install-to-disk.sh "/live$(chroot /live readlink -f /opt/thinclient/bin/thinclient-install)"
-  echo "   (using the repo's installer)"
+  BIN="/live$(chroot /live readlink -f /opt/thinclient/bin)"
+  install -m 0755 /project/scripts/thinclient-enroll "$BIN/thinclient-enroll"
+  install -m 0755 /project/tools/phaseb/tc-tpm-enroll "/live$(chroot /live readlink -f /opt/thinclient/phaseb)/tc-tpm-enroll"
+  echo "   (using the repo's installer, enroll and first-boot seal)"
 fi
 
 echo "== virtual disk + a tiny udev (containers create no partition nodes)"
@@ -49,9 +52,17 @@ chroot /live bash -c 'ls /usr/lib/x86_64-linux-gnu/libtss2-tcti-swtpm.so.0* >/de
 
 echo "== run the installer (answers: confirm disk, device name)"
 set +e
+if [ "${TC_UI_MODE:-0}" = 1 ]; then
+  # Exactly what the install wizard runs: answers as options, "@@TC" lines back, no prompts.
+  chroot /live env TC_INSTALL_TEST=1 TC_TPM2_DEVICE=swtpm:path=/run/tpm/sock \
+    /opt/thinclient/bin/thinclient-install --ui --disk "$LOOP" --confirm "$LOOP" --name PhaseB-Test-01 </dev/null >/tmp/ui.out 2>&1
+  RC=$?
+  echo "-- @@TC lines:"; tr '\r' '\n' </tmp/ui.out | grep '^@@TC' ; echo "-- tail:"; tr '\r' '\n' </tmp/ui.out | grep -vE "^\s+[0-9,]+\s+[0-9]+%|to-chk|^@@TC" | tail -15
+else
 printf '%s\nPhaseB-Test-01\n' "$LOOP" | chroot /live env TC_INSTALL_TEST=1 TC_TPM2_DEVICE=swtpm:path=/run/tpm/sock \
   /opt/thinclient/bin/thinclient-install "$LOOP" 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -vE "^\s+[0-9,]+\s+[0-9]+%|to-chk" | tail -40
 RC=${PIPESTATUS[1]}
+fi
 set -e
 echo "== installer exit: $RC"
 

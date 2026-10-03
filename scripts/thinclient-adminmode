@@ -107,11 +107,14 @@ while :; do
                  yad --text-info --center --width=680 --height=500 --title="Diagnostics" \
                      --fontname="Monospace 9" <<<"$rpt" --button="Save to USB!gtk-save:10" --button="gtk-close:0" 2>/dev/null
                  [[ $? -eq 10 ]] && /opt/thinclient/bin/thinclient-diagnostics --save ;;
-    Install)     yad --question --center --title="Install to this computer" --width=480 \
-                     --text="<b>Install ThinClient onto this computer's disk?</b>\n\nThis makes the machine boot ThinClient from its internal drive (no USB needed). It ERASES a disk you choose. A terminal will open — follow the prompts and type the disk name to confirm." \
-                     --button="Cancel:1" --button="Open installer:0" 2>/dev/null \
-                 && xterm -title "ThinClient Installer" -fa "Monospace" -fs 11 -geometry 100x32 \
-                       -e "sudo /opt/thinclient/bin/thinclient-install; echo; echo '--- Press Enter to close ---'; read _" 2>/dev/null ;;
+    Install)     # The wizard asks every question and shows progress; the terminal is only a
+                 # fallback for an image that predates it.
+                 if [[ -x /opt/thinclient/bin/thinclient-install-gui ]]; then
+                   /opt/thinclient/bin/thinclient-install-gui 2>>"${TC_LOG_DIR}/install.log"
+                 else
+                   xterm -title "ThinClient Installer" -fa "Monospace" -fs 11 -geometry 100x32 \
+                     -e "sudo /opt/thinclient/bin/thinclient-install; echo; echo '--- Press Enter to close ---'; read _" 2>/dev/null
+                 fi ;;
     Update)      _run_update ;;
     Restart)     $ADMINCTL restart-session 2>/dev/null || true; break ;;
     Reboot)      yad --question --center --title="Reboot" --text="Reboot this thin client now?" 2>/dev/null \
