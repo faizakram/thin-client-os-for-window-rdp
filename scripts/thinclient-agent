@@ -5586,10 +5586,14 @@ def gather_hardware_facts(root=""):
         efi + "/efivars/MemoryOverwriteRequestControl-e20939be-32d4-41be-a150-897f85d49829")
     cmdline = _read(root + "/proc/cmdline")
     f["kernel_hardening"] = all(x in cmdline for x in ("init_on_free=1", "init_on_alloc=1"))
+    # The kernel's own word first: on some Intel machines (seen on a Pentium Silver
+    # N5000 with intel_iommu=on,igfx_off) DMA translation is on — "DMAR: IOMMU enabled",
+    # "Default domain type: Translated" — while /sys/class/iommu stays empty.
     try:
-        f["iommu_active"] = bool(os.listdir(root + "/sys/class/iommu"))
+        sysfs = bool(os.listdir(root + "/sys/class/iommu"))
     except OSError:
-        f["iommu_active"] = False
+        sysfs = False
+    f["iommu_active"] = sysfs or "Default domain type: Translated" in klog or "DMAR: IOMMU enabled" in klog
     f["live_medium"] = os.path.exists(root + "/run/live/medium")
     return f
 

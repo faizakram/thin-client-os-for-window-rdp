@@ -52,6 +52,10 @@ check("memory encryption not supported", f["mem_enc_supported"] is False and f["
 check("no TPM", f["tpm"] == {"present": False})
 check("Secure Boot off", f["secure_boot"] is False)
 check("not hardened", f["kernel_hardening"] is False and f["iommu_active"] is False)
+f = m.gather_hardware_facts(fake_root("fpu", "DMAR: IOMMU enabled\niommu: Default domain type: Translated\n"))
+check("IOMMU on per the kernel log even with an empty /sys/class/iommu (Intel N5000)", f["iommu_active"] is True)
+f = m.gather_hardware_facts(fake_root("fpu", "iommu: Default domain type: Passthrough\n"))
+check("passthrough (no translation) is NOT counted as active", f["iommu_active"] is False)
 
 print("== supported but switched off in the BIOS ==")
 f = m.gather_hardware_facts(fake_root("sme", "tpm_tis MSFT0101:00\n", tpm="2"))
