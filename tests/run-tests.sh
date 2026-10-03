@@ -79,6 +79,7 @@ if python3 "$HERE/test-license-perms.py"; then :; else fail_total=$((fail_total+
 # A non-ASCII character in a GTK CSS blob that gets .encode("ascii") kills the GUI
 # app at import — that is how the chat panel vanished from a live device.
 if bash "$HERE/check-gui-ascii.sh"; then :; else fail_total=$((fail_total+1)); fi
+if bash "$HERE/check-iso-scripts.sh"; then :; else fail_total=$((fail_total+1)); fi
 banner "summary"
 if (( fail_total == 0 )); then
   printf '%sALL TEST SUITES PASSED%s\n' "$green" "$off"; exit 0

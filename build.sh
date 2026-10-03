@@ -186,18 +186,14 @@ populate() {
   say "Staging appliance files into the root filesystem"
 
   # --- Executables -> /opt/thinclient/bin --------------------------------
-  local bins="thinclient-splash thinclient-session thinclient-watchdog \
-              thinclient-xsession thinclient-config thinclient-adminctl \
-              thinclient-test-connection thinclient-admin thinclient-adminmode \
-              thinclient-netctl thinclient-diagnostics thinclient-firstboot \
-              thinclient-wifi thinclient-netwait thinclient-connect \
-              thinclient-lock thinclient-audio-default thinclient-chat \
-              thinclient-netbadge \
-              thinclient-update thinclient-agent thinclient-provision \
-              thinclient-enroll"
-  local b
-  for b in $bins; do
-    stage "scripts/${b}" "/opt/thinclient/bin/${b}" 0755
+  # EVERY scripts/thinclient-*, exactly as make-update-bundle.sh ships them. This was a
+  # hand-kept list, and a new script added to the OTA but not here (secpolicy, ospatch)
+  # made a fresh install silently lack it — while already claiming the version that
+  # has it, so no update would ever bring it. tests/check-iso-scripts.sh guards this.
+  local f
+  for f in "${PROJECT_ROOT}"/scripts/thinclient-*; do
+    [[ -f "$f" ]] || continue
+    stage "scripts/$(basename "$f")" "/opt/thinclient/bin/$(basename "$f")" 0755
   done
 
   # --- Libraries -> /opt/thinclient/lib ----------------------------------
