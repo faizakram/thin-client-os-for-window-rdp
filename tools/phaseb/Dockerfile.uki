@@ -1,0 +1,10 @@
+# Builds the Phase B boot image (UKI): Debian kernel + a dracut initrd that can unlock
+# the LUKS root with the TPM, signed with our boot key and carrying a signed TPM PCR
+# policy. Separate from the ISO build because live-boot needs initramfs-tools and
+# dracut conflicts with it.
+FROM debian:trixie
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      dracut dracut-core systemd systemd-cryptsetup systemd-ukify systemd-boot-efi \
+      cryptsetup-bin tpm2-tools libtss2-dev sbsigntool e2fsprogs kmod binutils \
+      python3-pefile ca-certificates && \
+    rm -rf /var/lib/apt/lists/*

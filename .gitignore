@@ -25,3 +25,7 @@ __pycache__/
 
 # Build-machine settings (manager URL etc.) — never in the public source
 config/build.local.env
+
+# Phase B signing keys (boot-signing MOK + TPM PCR policy) — build host ONLY, never committed
+keys/
+build-phaseb/
