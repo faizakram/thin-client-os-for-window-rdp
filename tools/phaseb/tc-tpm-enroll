@@ -9,6 +9,11 @@ set -euo pipefail
 DEV="${LUKS_DEV:?}"
 MARK=/etc/thinclient-tpm-firstboot
 log(){ echo "tc-tpm-enroll: $*" | systemd-cat -t tc-tpm-enroll -p info; echo "$*"; }
+# The boot is silent (no splash), so without this the first start is minutes of black
+# screen and people switch it off. Best effort: a missing console never blocks the seal.
+say(){ { printf '\033[2J\033[H\n\n'; printf '    %s\n' "$@"; } >/dev/tty1 2>/dev/null || true; }
+say "Securing this device - please wait, do NOT switch it off." "" \
+    "This happens once, on the first start, and takes up to 3 minutes."
 
 # Unlock with the existing (unconditional) seal, enrol the bound one, and wipe every
 # other TPM slot — systemd-cryptenroll never wipes the slot it just created.
@@ -23,3 +28,4 @@ grep -qE 'tpm2-hash-pcrs:\s+7' <<<"$dump" || { log "seal is not bound to PCR 7";
 grep -qE 'tpm2-pubkey-pcrs:\s+11' <<<"$dump" || { log "seal is not bound to the signed PCR 11 policy"; exit 1; }
 rm -f "$MARK"; sync
 log "disk key sealed to Secure Boot state + signed boot images; temporary seal wiped"
+say "Device secured. Starting..."
