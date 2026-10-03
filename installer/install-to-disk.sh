@@ -75,10 +75,15 @@ if [[ -f "$PHASEB/thinclient.efi" ]]; then
   why=()
   if [[ "${TC_INSTALL_TEST:-0}" != "1" ]]; then
     [[ -d /sys/firmware/efi ]] || why+=("the machine did not start in UEFI mode (switch off Legacy/CSM boot)")
-    sb="$(od -An -t u1 -j4 -N1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-e0f84a3cb4bd 2>/dev/null | tr -d ' ')"
-    [[ "$sb" == "1" ]] || why+=("Secure Boot is not switched on in the BIOS")
-    { [[ -e /dev/tpmrm0 ]] && [[ "$(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null)" == "2" ]]; } \
-      || why+=("no TPM 2.0 was found (absent, or switched off in the BIOS)")
+    # Every read here may legitimately fail — a pen drive started in legacy/BIOS mode has
+    # no EFI variables at all — and under set -e + pipefail a failed read inside $(...)
+    # ENDED the installer silently, right after the disk confirmation (seen on a real
+    # machine). Each read is guarded so the operator is told WHAT is missing.
+    sb="$(od -An -t u1 -j4 -N1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-e0f84a3cb4bd 2>/dev/null | tr -d ' ' || true)"
+    [[ "$sb" == "1" ]] || why+=("Secure Boot is not switched on in the BIOS (or the pen drive was started in legacy mode — use the 'UEFI:' boot entry)")
+    tpmv="$(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null || true)"
+    { [[ -e /dev/tpmrm0 ]] && [[ "$tpmv" == "2" ]]; } \
+      || why+=("no TPM 2.0 was found (switch on 'AMD fTPM' / 'Intel PTT' / 'Security Chip' in the BIOS)")
   fi
   if ((${#why[@]} == 0)); then
     ENCRYPT=1
