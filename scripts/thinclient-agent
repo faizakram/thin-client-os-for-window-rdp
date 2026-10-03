@@ -5260,9 +5260,42 @@ def _grub_default_rewritten(text, enable):
     return "\n".join(out) + "\n"
 
 
+# An ENCRYPTED machine has no GRUB: its command line is sealed inside the signed boot
+# image. It takes the same parameters from a small signed systemd-boot add-on on the
+# boot partition instead — placed to switch hardening on, removed to switch it off.
+# The add-on is measured outside the TPM's unlock policy, so it never locks the disk.
+ESP_ADDONS = os.environ.get("TC_ESP_ADDONS", "/boot/efi/loader/addons")
+MEM_ADDON_SRC = os.environ.get("TC_MEM_ADDON", "/usr/local/lib/thinclient/tc-mem-harden.addon.efi")
+MEM_ADDON_NAME = "tc-mem-harden.addon.efi"
+
+
+def _apply_mem_addon(enable):
+    dest = os.path.join(ESP_ADDONS, MEM_ADDON_NAME)
+    try:
+        if enable:
+            if not os.path.exists(MEM_ADDON_SRC):
+                print("agent: memory hardening: signed add-on missing (%s)" % MEM_ADDON_SRC, file=sys.stderr)
+                return False
+            os.makedirs(ESP_ADDONS, exist_ok=True)
+            tmp = dest + ".new"
+            shutil.copyfile(MEM_ADDON_SRC, tmp)
+            os.replace(tmp, dest)
+        elif os.path.exists(dest):
+            os.remove(dest)
+        subprocess.run(["sync"], capture_output=True, timeout=60)
+        print("agent: boot parameters %s via signed add-on (effective after restart)"
+              % ("hardened" if enable else "restored"), file=sys.stderr)
+        return True
+    except OSError as e:
+        print("agent: memory hardening add-on: %s" % e, file=sys.stderr)
+        return False
+
+
 def _apply_kernel_params(enable):
     """Rewrite the boot parameters safely. Returns True if the boot config now matches
     `enable` (effective from the next restart)."""
+    if _install_generation() == "encrypted":
+        return _apply_mem_addon(enable)
     if os.path.exists("/run/live/medium") or not os.path.exists(GRUB_DEFAULT):
         return False
     try:

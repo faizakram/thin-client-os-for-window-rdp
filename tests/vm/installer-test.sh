@@ -29,7 +29,10 @@ if [ "${TC_USE_REPO_INSTALLER:-0}" = 1 ]; then
   install -m 0755 /project/tools/phaseb/tc-tpm-enroll "$PB/tc-tpm-enroll"
   install -m 0755 /project/tools/phaseb/tc-boot-bless "$PB/tc-boot-bless"
   # Newer boot-image files than the ISO carries (TC_PHASEB_DIR=/project/build-phaseb...).
-  [ -s /project/build-phaseb/systemd-bootx64.efi.signed ] && install -m 0644 /project/build-phaseb/systemd-bootx64.efi.signed "$PB/"
+  PBD="${TC_PHASEB_DIR:-/project/build-phaseb}"
+  for f in systemd-bootx64.efi.signed tc-mem-harden.addon.efi; do
+    [ -s "$PBD/$f" ] && install -m 0644 "$PBD/$f" "$PB/"
+  done
   if [ -n "${TC_UKI_OVERRIDE:-}" ]; then install -m 0644 "$TC_UKI_OVERRIDE" "$PB/thinclient.efi"; fi
   echo "   (using the repo's installer, enroll and first-boot seal)"
 fi

@@ -199,4 +199,23 @@ os.remove(gen); calls.clear(); osp.hold_kernels()
 check("plain machine: nothing held", not calls)
 osp.subprocess.run = fake_run
 
+print("== memory hardening on an ENCRYPTED machine: a signed boot add-on, never GRUB ==")
+agent.INSTALL_GEN = os.path.join(tmp, "gen-agent"); open(agent.INSTALL_GEN, "w").write("encrypted=1\n")
+agent.ESP_ADDONS = os.path.join(tmp, "esp", "loader", "addons")
+agent.MEM_ADDON_SRC = os.path.join(tmp, "tc-mem-harden.addon.efi")
+dest = os.path.join(agent.ESP_ADDONS, agent.MEM_ADDON_NAME)
+grub_touched = []
+real_grub = agent._grub_default_rewritten
+agent._grub_default_rewritten = lambda *a: grub_touched.append(1) or real_grub(*a)
+check("add-on missing: NOT reported as applied", agent._apply_kernel_params(True) is False and not os.path.exists(dest))
+open(agent.MEM_ADDON_SRC, "wb").write(b"signed-addon")
+check("on: the signed add-on is placed on the boot partition",
+      agent._apply_kernel_params(True) is True and open(dest, "rb").read() == b"signed-addon")
+check("off: it is removed", agent._apply_kernel_params(False) is True and not os.path.exists(dest))
+check("GRUB is never touched on an encrypted machine", not grub_touched)
+open(agent.INSTALL_GEN, "w").write("")
+agent._apply_kernel_params(True)
+check("a plain machine never gets the add-on (it uses GRUB)", not os.path.exists(dest))
+agent._grub_default_rewritten = real_grub
+
 print("\n  %d passed" % ok)

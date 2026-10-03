@@ -222,6 +222,8 @@ populate() {
     stage "tools/phaseb/tc-boot-bless"           "/opt/thinclient/phaseb/tc-boot-bless" 0755
     [[ -s "$PB/systemd-bootx64.efi.signed" ]] || die "missing build-phaseb/systemd-bootx64.efi.signed — rerun tools/phaseb/build-uki.sh"
     stage "build-phaseb/systemd-bootx64.efi.signed" "/opt/thinclient/phaseb/systemd-bootx64.efi.signed" 0644
+    [[ -s "$PB/tc-mem-harden.addon.efi" ]] || die "missing build-phaseb/tc-mem-harden.addon.efi — rerun tools/phaseb/build-uki.sh"
+    stage "build-phaseb/tc-mem-harden.addon.efi"  "/opt/thinclient/phaseb/tc-mem-harden.addon.efi" 0644
     ok "Encrypted image: signed boot image for kernel ${kver} staged"
   fi
 

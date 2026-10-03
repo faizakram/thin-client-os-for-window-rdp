@@ -742,6 +742,10 @@ WantedBy=multi-user.target
 UNIT
   ln -sf /etc/systemd/system/tc-tpm-enroll.service "$TARGET_MNT/etc/systemd/system/multi-user.target.wants/tc-tpm-enroll.service"
 
+  # Memory hardening on this machine = a signed systemd-boot add-on the agent places on
+  # the boot partition (no GRUB here). Kept outside /opt/thinclient, which an OTA replaces.
+  install -D -m 0644 "$PHASEB/tc-mem-harden.addon.efi" "$TARGET_MNT/usr/local/lib/thinclient/tc-mem-harden.addon.efi"
+
   # Confirm a newly delivered kernel image once the kiosk is on screen (see tc-boot-bless).
   install -D -m 0755 "$PHASEB/tc-boot-bless" "$TARGET_MNT/usr/local/sbin/tc-boot-bless"
   cat >"$TARGET_MNT/etc/systemd/system/tc-boot-bless.service" <<'UNIT'

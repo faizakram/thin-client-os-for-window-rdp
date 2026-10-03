@@ -46,6 +46,13 @@ ukify build \
   --output "$OUT/thinclient-$KVER.efi"
 sbverify --cert /keys/secureboot/MOK.crt "$OUT/thinclient-$KVER.efi"
 echo "$KVER" > "$OUT/KVER"; echo "$LUKS_UUID" > "$OUT/LUKS_UUID"
+# Memory hardening for encrypted machines: their command line is sealed in the image, so
+# the parameters ship as a signed systemd-boot add-on the agent places or removes on the
+# boot partition (\loader\addons). Same parameters as the GRUB machines get.
+ukify build --cmdline "init_on_alloc=1 init_on_free=1 intel_iommu=on,igfx_off" \
+  --secureboot-private-key /keys/secureboot/MOK.key --secureboot-certificate /keys/secureboot/MOK.crt \
+  --output "$OUT/tc-mem-harden.addon.efi"
+sbverify --cert /keys/secureboot/MOK.crt "$OUT/tc-mem-harden.addon.efi"
 # The boot manager between shim and the image: Debian-signed (shim trusts Debian's CA).
 cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi.signed "$OUT/systemd-bootx64.efi.signed"
 # The kernel package whose modules this image loads: delivered with the image when it
