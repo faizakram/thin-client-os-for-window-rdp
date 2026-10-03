@@ -203,6 +203,23 @@ populate() {
   # --- Disk installer (available inside the live session) ----------------
   stage "installer/install-to-disk.sh" "/opt/thinclient/bin/thinclient-install" 0755
 
+  # --- Encrypted installs (security plan Phase B) -------------------------------
+  # TC_ENCRYPTED=1: carry the SIGNED boot image (built by tools/phaseb/build-uki.sh
+  # into build-phaseb/) plus the PUBLIC certificate and PCR-policy key. Their presence
+  # is what makes the installer install encrypted. Private keys never enter the image.
+  if [[ "${TC_ENCRYPTED:-0}" == "1" ]]; then
+    local PB="${PROJECT_ROOT}/build-phaseb" kver
+    kver="$(cat "$PB/KVER" 2>/dev/null)" || die "TC_ENCRYPTED=1 but no build-phaseb/KVER — run tools/phaseb/build-uki.sh first"
+    [[ -s "$PB/thinclient-${kver}.efi" ]] || die "missing signed boot image build-phaseb/thinclient-${kver}.efi"
+    stage "build-phaseb/thinclient-${kver}.efi"   "/opt/thinclient/phaseb/thinclient.efi" 0644
+    stage "build-phaseb/KVER"                    "/opt/thinclient/phaseb/KVER" 0644
+    stage "build-phaseb/LUKS_UUID"               "/opt/thinclient/phaseb/LUKS_UUID" 0644
+    stage "keys/secureboot/MOK.der"              "/opt/thinclient/phaseb/MOK.der" 0644
+    stage "keys/pcr/tpm2-pcr-public.pem"         "/opt/thinclient/phaseb/tpm2-pcr-public-key.pem" 0644
+    stage "tools/phaseb/tc-tpm-enroll"           "/opt/thinclient/phaseb/tc-tpm-enroll" 0755
+    ok "Encrypted image: signed boot image for kernel ${kver} staged"
+  fi
+
   # --- Config ------------------------------------------------------------
   stage "config/server.conf"          "/etc/thinclient/server.conf"                    0644
   stage "config/admin.conf"           "/etc/thinclient/admin.conf"                     0600
@@ -323,6 +340,17 @@ build() {
   produced="$(ls -1 "${BUILD_DIR}"/live-image-*.hybrid.iso 2>/dev/null | head -n1 || true)"
   [[ -n "$produced" ]] || die "Build finished but no ISO was produced. See build/build.log."
 
+  # An encrypted image boots INSTALLED machines through the signed boot image, whose
+  # kernel must be the one whose modules are in the image. A mismatch installs machines
+  # that boot a kernel with no matching modules — refuse rather than ship that.
+  if [[ "${TC_ENCRYPTED:-0}" == "1" ]]; then
+    local want have
+    want="$(cat "${PROJECT_ROOT}/build-phaseb/KVER")"
+    have="$(ls "${BUILD_DIR}/chroot/lib/modules" 2>/dev/null | sort -V | tail -1)"
+    [[ "$want" == "$have" ]] || die "Kernel mismatch: signed boot image is ${want}, image has ${have}. Rebuild the boot image (tools/phaseb/build-uki.sh) and the ISO on the same day."
+    ok "Kernel check: signed boot image and image both ${want}"
+  fi
+
   install -d "${PROJECT_ROOT}/iso"
   # Unlink first, then copy. `cp -f` opens the existing file and truncates it, so it
   # writes THROUGH to the same inode — and every previously named tenant ISO is a hard
@@ -347,7 +375,7 @@ build() {
   fi
   local NAMED_ISO=""
   if [[ -n "$tenant_slug" ]]; then
-    NAMED_ISO="${PROJECT_ROOT}/iso/thinclient-${VERSION}-${tenant_slug}.iso"
+    NAMED_ISO="${PROJECT_ROOT}/iso/thinclient-${VERSION}-${tenant_slug}$([[ "${TC_ENCRYPTED:-0}" == "1" ]] && echo -encrypted).iso"
     ln -f "$OUTPUT_ISO" "$NAMED_ISO" 2>/dev/null || cp -f "$OUTPUT_ISO" "$NAMED_ISO"
     ( cd "${PROJECT_ROOT}/iso" && sha256sum "$(basename "$NAMED_ISO")" >"$(basename "$NAMED_ISO").sha256" )
   fi

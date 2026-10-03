@@ -24,3 +24,13 @@ grub-efi-amd64-signed
 #if ARCHITECTURES arm64
 grub-efi-arm64-bin
 #endif
+
+# Encrypted installs (security plan Phase B): LUKS2 + sealing the disk key into the TPM.
+# systemd-cryptenroll lives in systemd-cryptsetup on Debian, not in systemd; tpm2-tools
+# brings the TSS2 libraries systemd loads to talk to the TPM. Copied onto every
+# installed machine with the rest of the live system.
+cryptsetup
+cryptsetup-bin
+systemd-cryptsetup
+tpm2-tools
+mokutil

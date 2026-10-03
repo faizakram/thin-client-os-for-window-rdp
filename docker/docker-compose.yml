@@ -44,6 +44,8 @@ services:
       - TC_CONTROL_URL=${TC_CONTROL_URL:-}
       - TC_LICENSE_ENFORCE=${TC_LICENSE_ENFORCE:-}
       - TC_DEBUG_SSH=${TC_DEBUG_SSH:-0}
+      # Encrypted (Phase B) image: needs build-phaseb/ from tools/phaseb/build-uki.sh.
+      - TC_ENCRYPTED=${TC_ENCRYPTED:-0}
     command: ["bash", "-lc", "bash ./build.sh ${BUILD_ARGS:-}"]
 
   # --- Lint + logic tests (no privileges, fast) ------------------------------

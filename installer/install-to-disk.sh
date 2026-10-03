@@ -59,6 +59,46 @@ echo
 read -r -p "Type the disk name (${DISK}) to confirm: " CONFIRM
 [[ "$CONFIRM" == "$DISK" ]] || die "Confirmation did not match. Aborting."
 
+# --------------------------------------------------------------------------- #
+# 1a. Encrypted install (security plan Phase B) — decided BEFORE anything is erased.
+#
+#     An image that carries the signed boot image (/opt/thinclient/phaseb) installs
+#     ENCRYPTED: LUKS2 root, key sealed into this machine's TPM, Secure Boot. That needs
+#     UEFI + Secure Boot on + a TPM 2.0. A machine without them is REFUSED (decision
+#     2026-10-03), unless the installer is started with TC_ALLOW_UNENCRYPTED=1 and the
+#     exception is typed out — then it installs unencrypted and the manager is told.
+# --------------------------------------------------------------------------- #
+PHASEB=/opt/thinclient/phaseb
+ENCRYPT=0; UNENCRYPTED_EXCEPTION=0
+TPM2_DEVICE="${TC_TPM2_DEVICE:-auto}"      # a test harness points this at a software TPM
+if [[ -f "$PHASEB/thinclient.efi" ]]; then
+  why=()
+  if [[ "${TC_INSTALL_TEST:-0}" != "1" ]]; then
+    [[ -d /sys/firmware/efi ]] || why+=("the machine did not start in UEFI mode (switch off Legacy/CSM boot)")
+    sb="$(od -An -t u1 -j4 -N1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-e0f84a3cb4bd 2>/dev/null | tr -d ' ')"
+    [[ "$sb" == "1" ]] || why+=("Secure Boot is not switched on in the BIOS")
+    { [[ -e /dev/tpmrm0 ]] && [[ "$(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null)" == "2" ]]; } \
+      || why+=("no TPM 2.0 was found (absent, or switched off in the BIOS)")
+  fi
+  if ((${#why[@]} == 0)); then
+    ENCRYPT=1
+    ok "Encrypted install: UEFI, Secure Boot and TPM 2.0 found"
+  else
+    echo
+    echo "  This image installs ENCRYPTED, and this machine can't be encrypted:"
+    printf '    - %s\n' "${why[@]}"
+    echo "  Fix it in the BIOS and run 'sudo thinclient-install' again. ${DISK} has NOT been changed."
+    if [[ "${TC_ALLOW_UNENCRYPTED:-0}" == "1" ]]; then
+      read -r -p "  To install WITHOUT encryption anyway, type INSTALL UNENCRYPTED: " _ans
+      [[ "$_ans" == "INSTALL UNENCRYPTED" ]] || die "Not confirmed. ${DISK} has NOT been changed."
+      warn "Installing UNENCRYPTED by explicit exception — the manager will show it"
+      UNENCRYPTED_EXCEPTION=1
+    else
+      exit 1
+    fi
+  fi
+fi
+
 # Device name shown in the Manager dashboard (optional; agent falls back to the
 # hostname if left blank). Collected now, written to the target after the copy.
 echo
@@ -333,20 +373,58 @@ if ! wipefs -a "$DISK" 2>/dev/null; then
   fi
 fi
 sgdisk --zap-all "$DISK"
-sgdisk -n1:0:+512M -t1:ef00 -c1:"EFI" "$DISK"
-sgdisk -n2:0:0     -t2:8300 -c2:"THINCLIENT_ROOT" "$DISK"
-partprobe "$DISK"; sleep 2
+ROOT_DEV="$ROOT_PART"
+if [[ "$ENCRYPT" == "1" ]]; then
+  # ESP 1 GiB (label TCEFI: holds shim + the signed boot image) + a LUKS2 root with
+  # the "Linux root (x86-64)" type.
+  sgdisk -n1:0:+1G -t1:ef00 -c1:"TCEFI" "$DISK"
+  sgdisk -n2:0:0   -t2:8304 -c2:"THINCLIENT_ROOT" "$DISK"
+  partprobe "$DISK"; sleep 2
 
-log "Formatting partitions"
-mkfs.vfat -F32 -n EFI "$EFI_PART"
-mkfs.ext4 -F -L THINCLIENT_ROOT "$ROOT_PART"
+  log "Formatting: boot partition + encrypted root (LUKS2, AES-256-XTS)"
+  mkfs.vfat -F32 -n TCEFI "$EFI_PART"
+  LUKS_UUID="$(cat "$PHASEB/LUKS_UUID")"
+  # A random passphrase exists only for the minutes of this install, in RAM.
+  INSTALL_KEY="$(mktemp -p /dev/shm)"; head -c 64 /dev/urandom >"$INSTALL_KEY"
+  cryptsetup luksFormat --batch-mode --type luks2 --cipher aes-xts-plain64 --key-size 512 \
+    --pbkdf argon2id --uuid "$LUKS_UUID" --label THINCLIENT_ROOT "$ROOT_PART" "$INSTALL_KEY"
+  # Our own mapping name, and a stale one from an earlier failed attempt in this live
+  # session is closed first (cryptsetup refuses an existing name: exit 5). The INSTALLED
+  # system calls it "root" — the signed boot image's command line says so.
+  MAPPER=tc-install-root
+  cryptsetup close "$MAPPER" 2>/dev/null || true
+  cryptsetup open --key-file "$INSTALL_KEY" "$ROOT_PART" "$MAPPER"
+  ROOT_DEV="/dev/mapper/$MAPPER"
+  mkfs.ext4 -F -L TCROOT "$ROOT_DEV"
+
+  # Seal the key into THIS machine's TPM — no PCR conditions yet, because this live
+  # system boots through a different chain than the installed one. First boot re-seals
+  # it to Secure Boot + our signed boot images and wipes this seal (tc-tpm-enroll).
+  # Then the install passphrase goes: from here on only this TPM opens the disk.
+  log "Sealing the disk key into this machine's TPM"
+  systemd-cryptenroll "$ROOT_PART" --unlock-key-file="$INSTALL_KEY" --tpm2-device="$TPM2_DEVICE" --tpm2-pcrs= \
+    || die "Could not seal the key into the TPM. Is the TPM switched on in the BIOS?"
+  systemd-cryptenroll "$ROOT_PART" --unlock-tpm2-device="$TPM2_DEVICE" --wipe-slot=password \
+    || die "Could not remove the install passphrase"
+  shred -u "$INSTALL_KEY"
+  cryptsetup luksDump "$ROOT_PART" | grep -q systemd-tpm2 || die "No TPM seal on the disk — aborting"
+  ok "Disk key sealed into the TPM; no password exists for this disk"
+else
+  sgdisk -n1:0:+512M -t1:ef00 -c1:"EFI" "$DISK"
+  sgdisk -n2:0:0     -t2:8300 -c2:"THINCLIENT_ROOT" "$DISK"
+  partprobe "$DISK"; sleep 2
+
+  log "Formatting partitions"
+  mkfs.vfat -F32 -n EFI "$EFI_PART"
+  mkfs.ext4 -F -L THINCLIENT_ROOT "$ROOT_PART"
+fi
 
 # --------------------------------------------------------------------------- #
 # 3. Mount + copy the live root filesystem.
 # --------------------------------------------------------------------------- #
 log "Mounting target"
 mkdir -p "$TARGET_MNT"
-mount "$ROOT_PART" "$TARGET_MNT"
+mount "$ROOT_DEV" "$TARGET_MNT"
 mkdir -p "$TARGET_MNT/boot/efi"
 mount "$EFI_PART" "$TARGET_MNT/boot/efi"
 
@@ -425,12 +503,16 @@ fi
 # 4. fstab.
 # --------------------------------------------------------------------------- #
 log "Writing /etc/fstab"
-ROOT_UUID="$(blkid -s UUID -o value "$ROOT_PART")"
-EFI_UUID="$(blkid -s UUID -o value "$EFI_PART")"
+if [[ "$ENCRYPT" == "1" ]]; then
+  # The signed boot image opens the LUKS root as /dev/mapper/root before this runs.
+  ROOT_SPEC="/dev/mapper/root"; EFI_SPEC="LABEL=TCEFI"
+else
+  ROOT_SPEC="UUID=$(blkid -s UUID -o value "$ROOT_PART")"; EFI_SPEC="UUID=$(blkid -s UUID -o value "$EFI_PART")"
+fi
 cat >"$TARGET_MNT/etc/fstab" <<EOF
 # ThinClient OS — generated by thinclient-install
-UUID=${ROOT_UUID}  /          ext4  errors=remount-ro,noatime  0 1
-UUID=${EFI_UUID}   /boot/efi  vfat  umask=0077                 0 1
+${ROOT_SPEC}  /          ext4  errors=remount-ro,noatime  0 1
+${EFI_SPEC}   /boot/efi  vfat  umask=0077                 0 1
 # /tmp is tmpfs (RAM): recording segments are staged here for the seconds between
 # ffmpeg writing them and S3 confirming the upload, then deleted. Pin the size —
 # tmpfs otherwise defaults to HALF of physical memory, which on a small machine is
@@ -464,6 +546,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get -y purge live-boot live-boot-initramfs-tools live-config live-config-systemd 2>/dev/null || true
 apt-get -y autoremove 2>/dev/null || true
 
+if [ "${ENCRYPT}" != "1" ]; then
 # GRUB defaults: silent, kiosk-friendly kernel command line.
 # Live images don't ship /etc/default/grub — create it so the tweaks below apply
 # (otherwise sed/grep error out and the boot stays verbose).
@@ -511,6 +594,8 @@ grub-install --target=i386-pc --recheck ${DISK} || true
 # the outer script verifies the RESULT instead of trusting the exit code.
 update-grub || grub-mkconfig -o /boot/grub/grub.cfg || echo "WARN: grub config generation failed"
 update-initramfs -u -k all || update-initramfs -u || echo "WARN: initramfs rebuild failed"
+fi   # ENCRYPT: no GRUB at all — it would overwrite shim on the ESP; the signed boot
+     # image carries the kernel, initrd and command line (copied in after the chroot).
 
 # Make sure the CURRENT services are enabled on the installed system.
 # (The display path is LightDM now — the old thinclient-x.service must stay off,
@@ -537,10 +622,53 @@ fi
 #     never something the operator discovers by unplugging the stick.
 # --------------------------------------------------------------------------- #
 BOOT_OK=1
-[[ -s "$TARGET_MNT/boot/grub/grub.cfg" ]] || { BOOT_OK=0; warn "MISSING /boot/grub/grub.cfg"; }
-if [[ "$UEFI_MODE" = "1" ]]; then
-  ls "$TARGET_MNT"/boot/efi/EFI/*/*.efi >/dev/null 2>&1 \
-    || { BOOT_OK=0; warn "MISSING UEFI bootloader under /boot/efi/EFI"; }
+if [[ "$ENCRYPT" == "1" ]]; then
+  # Boot chain on the ESP: Microsoft-signed shim -> our signed boot image (shim's second
+  # stage) -> TPM unlock. MokManager is next to shim, and our PUBLIC certificate is on
+  # the ESP for the one-time "Enroll key from disk" at the first power-on.
+  log "Installing the signed boot chain"
+  E="$TARGET_MNT/boot/efi"
+  mkdir -p "$E/EFI/BOOT"
+  cp /usr/lib/shim/shimx64.efi.signed "$E/EFI/BOOT/BOOTX64.EFI"
+  cp /usr/lib/shim/mmx64.efi.signed   "$E/EFI/BOOT/mmx64.efi"
+  cp "$PHASEB/thinclient.efi"         "$E/EFI/BOOT/grubx64.efi"
+  cp "$PHASEB/MOK.der"                "$E/THINCLIENT-ENROLL-ME.der"
+  efibootmgr -c -d "$DISK" -p 1 -L "ThinClient" -l '\EFI\BOOT\BOOTX64.EFI' >/dev/null 2>&1 || true
+
+  # First boot: re-seal to Secure Boot + our signed boot images, wipe the install seal.
+  install -D -m 0644 "$PHASEB/tpm2-pcr-public-key.pem" "$TARGET_MNT/etc/systemd/tpm2-pcr-public-key.pem"
+  install -D -m 0755 "$PHASEB/tc-tpm-enroll" "$TARGET_MNT/usr/local/sbin/tc-tpm-enroll"
+  cat >"$TARGET_MNT/etc/systemd/system/tc-tpm-enroll.service" <<UNIT
+[Unit]
+Description=Thin Client: seal the disk key to Secure Boot + signed boot images (first boot)
+ConditionPathExists=/etc/thinclient-tpm-firstboot
+After=local-fs.target
+Before=display-manager.service lightdm.service
+
+[Service]
+Type=oneshot
+Environment=LUKS_DEV=/dev/disk/by-uuid/$LUKS_UUID
+ExecStart=/usr/local/sbin/tc-tpm-enroll
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  ln -sf /etc/systemd/system/tc-tpm-enroll.service "$TARGET_MNT/etc/systemd/system/multi-user.target.wants/tc-tpm-enroll.service"
+  touch "$TARGET_MNT/etc/thinclient-tpm-firstboot"
+  mkdir -p "$TARGET_MNT/etc/thinclient"; echo "encrypted=1" >"$TARGET_MNT/etc/thinclient/install-generation"
+
+  for f in EFI/BOOT/BOOTX64.EFI EFI/BOOT/mmx64.efi EFI/BOOT/grubx64.efi THINCLIENT-ENROLL-ME.der; do
+    [[ -s "$E/$f" ]] || { BOOT_OK=0; warn "MISSING $f on the boot partition"; }
+  done
+else
+  [[ -s "$TARGET_MNT/boot/grub/grub.cfg" ]] || { BOOT_OK=0; warn "MISSING /boot/grub/grub.cfg"; }
+  if [[ "$UEFI_MODE" = "1" ]]; then
+    ls "$TARGET_MNT"/boot/efi/EFI/*/*.efi >/dev/null 2>&1 \
+      || { BOOT_OK=0; warn "MISSING UEFI bootloader under /boot/efi/EFI"; }
+  fi
+  if [[ "$UNENCRYPTED_EXCEPTION" == "1" ]]; then
+    mkdir -p "$TARGET_MNT/etc/thinclient"; echo "encrypted=0 exception=1" >"$TARGET_MNT/etc/thinclient/install-generation"
+  fi
 fi
 # Keep the log ON the installed system so a failure can be diagnosed after reboot.
 mkdir -p "$TARGET_MNT/var/log/thinclient" 2>/dev/null || true
@@ -566,7 +694,9 @@ ok "Bootloader verified — this disk will boot on its own"
 #     bake it into the installed licence config so the machine self-registers on
 #     first boot — no manual step per device.
 # --------------------------------------------------------------------------- #
-ACT="$(find /run/live/medium /media /run/media /mnt -maxdepth 4 -name thinclient-activate.conf -type f 2>/dev/null | head -1)"
+# `|| true`: find exits non-zero when ANY of these paths is missing (often /run/media),
+# and under set -e + pipefail that ended the whole install right after the bootloader.
+ACT="$(find /run/live/medium /media /run/media /mnt -maxdepth 4 -name thinclient-activate.conf -type f 2>/dev/null | head -1 || true)"
 if [[ -n "$ACT" ]]; then
   log "Baking activation config from ${ACT}"
   TCONF="$TARGET_MNT/etc/thinclient/license.conf"
@@ -614,9 +744,19 @@ fi
 log "Unmounting"
 for fs in run sys proc dev/pts dev; do umount -R -l "$TARGET_MNT/$fs" 2>/dev/null || true; done
 umount -R "$TARGET_MNT" 2>/dev/null || true
+[[ "$ENCRYPT" == "1" ]] && { cryptsetup close "$MAPPER" 2>/dev/null || true; }
 
 log "Installation complete on ${DISK}."
 printf '\n\033[1;32mInstall complete.\033[0m\n'
+if [[ "$ENCRYPT" == "1" ]]; then cat <<MSG
+  ENCRYPTED INSTALL — one step at the FIRST power-on, at this machine's screen:
+    1. A blue "Verification failed: Security Violation" box appears -> press Enter.
+    2. "Press any key to perform MOK management" -> press a key within 10 seconds.
+    3. Enroll key from disk -> TCEFI -> THINCLIENT-ENROLL-ME.der -> Continue -> Yes -> Reboot.
+  After that the machine starts by itself, every time. Nobody will ever be asked for a
+  disk password: only this machine's TPM can open its disk.
+MSG
+fi
 cat <<EOF
   * Remove the USB stick and reboot: sudo reboot
   * The machine now boots the ThinClient appliance from ${DISK}.

@@ -18,7 +18,10 @@ echo "kernel: $KVER"
 # the unconditional seal. No key file is ever written to disk. (A key file plus
 # tpm2-device=auto crashed systemd-cryptsetup 257 while no TPM token existed yet, and a
 # key file alone never falls back to the token once the file is gone.)
-CMDLINE="rd.luks.name=${LUKS_UUID}=root rd.luks.options=${LUKS_UUID}=tpm2-device=auto,headless=true root=/dev/mapper/root rw quiet splash lockdown=confidentiality loglevel=3"
+# The rest mirrors what the GRUB installer sets on unencrypted machines (there is no GRUB
+# here): a silent kiosk boot, and usbcore.autosuspend=-1 — the camera fix (a suspended
+# webcam that fails to resume drops off the bus mid-recording).
+CMDLINE="rd.luks.name=${LUKS_UUID}=root rd.luks.options=${LUKS_UUID}=tpm2-device=auto,headless=true root=/dev/mapper/root rw lockdown=confidentiality quiet splash loglevel=0 vt.global_cursor_default=0 rd.systemd.show_status=false systemd.show_status=false usbcore.autosuspend=-1"
 # Debug build only (TC_UKI_DEBUG=1): everything to the serial console as well.
 [ "${TC_UKI_DEBUG:-0}" = 1 ] && CMDLINE="$CMDLINE console=tty0 console=ttyS0,115200 systemd.log_level=debug systemd.log_target=console rd.udev.log_level=info"
 dracut --force --no-hostonly --kver "$KVER" \
