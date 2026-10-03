@@ -30,3 +30,5 @@ config/build.local.env
 keys/
 build-phaseb/
 build-phaseb-debug/
+build-phaseb-attack/
+tests/vm/*.png
