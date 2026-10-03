@@ -79,7 +79,12 @@ if [[ -f "$PHASEB/thinclient.efi" ]]; then
     # no EFI variables at all — and under set -e + pipefail a failed read inside $(...)
     # ENDED the installer silently, right after the disk confirmation (seen on a real
     # machine). Each read is guarded so the operator is told WHAT is missing.
-    sb="$(od -An -t u1 -j4 -N1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-e0f84a3cb4bd 2>/dev/null | tr -d ' ' || true)"
+    # The SecureBoot variable is 4 bytes of attributes + 1 byte of state. Read it
+    # SEQUENTIALLY (head, then the 5th byte): `od -j4` SEEKS, and efivarfs files cannot
+    # seek, so on a real machine with Secure Boot ACTIVE that read came back empty and the
+    # installer refused it. mokutil (installed in the image) is asked as well.
+    sb="$(head -c 5 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-e0f84a3cb4bd 2>/dev/null | tail -c 1 | od -An -t u1 2>/dev/null | tr -d ' \n' || true)"
+    if [[ "$sb" != "1" ]] && mokutil --sb-state 2>/dev/null | grep -qi "SecureBoot enabled"; then sb=1; fi
     [[ "$sb" == "1" ]] || why+=("Secure Boot is not switched on in the BIOS (or the pen drive was started in legacy mode — use the 'UEFI:' boot entry)")
     tpmv="$(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null || true)"
     { [[ -e /dev/tpmrm0 ]] && [[ "$tpmv" == "2" ]]; } \
