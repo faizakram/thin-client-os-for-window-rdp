@@ -34,7 +34,9 @@ STAGE = os.path.join(STATE_DIR, "stage.json")         # what the next boot insta
 RESULT = os.path.join(STATE_DIR, "result.json")       # what the last boot installed
 OS_RELEASE = os.environ.get("TC_OS_RELEASE", "/etc/os-release")
 MIRROR = os.environ.get("TC_OSPATCH_MIRROR", "http://security.debian.org/debian-security")
-DL_LIMIT_KBPS = os.environ.get("TC_OSPATCH_DL_LIMIT", "400")   # never starve the RDP session
+# KB/s per device. Low on purpose: a site's devices share one uplink with their RDP
+# sessions, and a kernel update (~100 MB) still arrives within ~10 minutes.
+DL_LIMIT_KBPS = os.environ.get("TC_OSPATCH_DL_LIMIT", "200")
 APT_TIMEOUT = int(os.environ.get("TC_OSPATCH_TIMEOUT", "1200"))
 NO_REBOOT = os.environ.get("TC_OSPATCH_NOREBOOT") == "1"
 # A change to any of these is only real after a restart.

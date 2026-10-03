@@ -105,6 +105,12 @@ check("…only once", not any("applied" in p for p in posts))
 rep = agent._os_updates_report()["os_updates"]
 check("security report carries it", rep["enabled"] is True and rep["result"] == "ok" and rep["installed"] == 1)
 
+print("== a site booting together doesn't download together ==")
+ds = [agent._os_patch_first_delay() for _ in range(500)]
+check("first check 15 min - 3 h after start", min(ds) >= 900 and max(ds) <= 3 * 3600)
+check("…spread out, not all at once", max(ds) - min(ds) > 3600)
+check("download capped at 200 KB/s per device", osp.DL_LIMIT_KBPS == "200")
+
 print("== MOR: the firmware's own RAM wipe ==")
 check("no variable on this firmware -> unsupported, nothing written", agent.apply_mor(True) == "unsupported")
 os.makedirs(os.environ["TC_EFIVARS"], exist_ok=True)

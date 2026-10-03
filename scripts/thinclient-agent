@@ -6020,8 +6020,16 @@ def os_patch_cycle():
         print("agent: %d OS security update(s) staged for the next restart" % len(allow), file=sys.stderr)
 
 
+def _os_patch_first_delay():
+    """When the first check runs after a start. A whole site boots at shift start, and
+    every device downloading in the same minute would share the site's uplink with its
+    Windows sessions — so each waits a random 15 minutes to 3 hours."""
+    import random
+    return random.uniform(15 * 60, 3 * 3600)
+
+
 def _os_patch_loop():
-    time.sleep(15 * 60)               # never compete with a device's first minutes
+    time.sleep(_os_patch_first_delay())
     while True:
         try:
             os_patch_cycle()
