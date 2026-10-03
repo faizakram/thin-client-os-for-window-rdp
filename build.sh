@@ -33,7 +33,9 @@ BOOTAPPEND="boot=live components \
 live-config.username=thinclient live-config.hostname=thinclient live-config.noautologin \
 quiet splash loglevel=0 vt.global_cursor_default=0 \
 rd.systemd.show_status=false systemd.show_status=false udev.log_level=0 \
-usbcore.autosuspend=-1"
+usbcore.autosuspend=-1 noeject"
+# noeject: live-tools otherwise stops every shutdown at "remove the live medium and
+# press ENTER" - on a black screen, so a restart looked frozen until a hard power-off.
 # NOTE: hardware KMS (native graphics) is the default so the display runs at the
 # panel's true resolution. The AMD box that black-screened before now has its
 # GPU firmware (firmware-amd-graphics) in the image, so amdgpu KMS initialises

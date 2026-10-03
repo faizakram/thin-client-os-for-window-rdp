@@ -839,3 +839,26 @@ cat <<EOF
   * To deploy to the fleet, clone ${DISK} with Clonezilla — see
     /opt/thinclient/docs/CLONEZILLA.md
 EOF
+
+# UI mode: stay alive (already in memory, already root) and restart the machine when the
+# wizard says so. The live system runs FROM the USB stick, and the instructions say to
+# pull it before restarting: after copying the whole system the page cache no longer
+# holds sudo or systemctl, so a fresh "sudo systemctl reboot" could not even be loaded
+# and the machine sat there until someone held the power button. From here on only
+# bash builtins run. The new disk is already unmounted, so a forced restart loses nothing.
+if [[ "$UI" == 1 ]]; then
+  sync
+  ui "await-reboot"
+  IFS= read -r answer || answer=""
+  if [[ "$answer" == "reboot" ]]; then
+    ui "rebooting"
+    systemctl reboot 2>/dev/null &               # clean restart when it can still load
+    # Wait 20 s on a private pipe nobody writes to (builtin-only sleep). Not stdin: when
+    # a clean shutdown closes the wizard, stdin hits EOF at once and would cut it short.
+    exec 9<> <(:)
+    read -r -t 20 -u 9 _ || true
+    echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
+    echo b > /proc/sysrq-trigger 2>/dev/null || true
+  fi
+fi
+exit 0

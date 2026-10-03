@@ -24,4 +24,7 @@ echo "@@TC stage copy"
 for p in 5 40 77 100; do printf '  1,234,567  %d%%   12.3MB/s    0:00:01 (xfr#1, to-chk=0/9)\r' $p; sleep 0.3; done; echo
 for s in configure boot; do echo "@@TC stage $s"; sleep 0.3; done
 echo "@@TC done encrypted=1"
+echo "@@TC await-reboot"
+IFS= read -r answer || answer=""
+echo "restart answer: $answer" >> "${FAKE_LOG:-/tmp/fake-installer.args}"
 exit 0

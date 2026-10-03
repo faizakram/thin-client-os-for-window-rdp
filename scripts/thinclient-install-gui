@@ -60,6 +60,13 @@ progressbar trough { background: #16223c; border-radius: 6px; min-height: 10px; 
 progressbar progress { background: #2f6fed; border-radius: 6px; min-height: 10px; }
 progressbar text { color: #e6edf7; font-size: 12px; }
 .running { color: #fbbf24; font-weight: bold; }
+.stepnum { background: #2f6fed; color: #ffffff; font-weight: bold; font-size: 14px; border-radius: 15px; min-width: 30px; min-height: 30px; }
+.stephead { color: #e6edf7; font-size: 16px; font-weight: bold; }
+.stepbody { color: #9fb0cc; font-size: 13px; }
+.panel { background: #101a2e; border: 1px solid #28395c; border-radius: 8px; padding: 10px 16px; }
+.panel label { color: #c3cee3; font-size: 13px; }
+.warn { background: #2a2110; border: 1px solid #b7791f; border-radius: 8px; padding: 10px 16px; }
+.warn label { color: #fbd38d; font-size: 14px; font-weight: bold; }
 textview, textview text { background: #070d18; color: #9fb0cc; font-family: monospace; font-size: 11px; }
 dialog, messagedialog { background-color: #0b1220; }
 dialog label, messagedialog label { color: #e6edf7; }
@@ -140,7 +147,7 @@ def list_disks():
 class Wizard(Gtk.Window):
     def __init__(self):
         super().__init__(title="Install ThinClient")
-        self.set_default_size(860, 620)
+        self.set_default_size(900, 700)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.connect("delete-event", self._on_close)
         prov = Gtk.CssProvider(); prov.load_from_data(CSS)
@@ -254,8 +261,9 @@ class Wizard(Gtk.Window):
         area.pack_start(self._label(text), False, False, 0)
         for label, resp in buttons:
             b = d.add_button(label, resp)
-            if danger_ok and resp == Gtk.ResponseType.OK:
-                b.get_style_context().add_class("danger")
+            b.get_style_context().add_class(
+                "danger" if danger_ok and resp == Gtk.ResponseType.OK else
+                "primary" if resp == Gtk.ResponseType.OK else "secondary")
         d.show_all()
         r = d.run(); d.destroy()
         return r
@@ -534,6 +542,11 @@ class Wizard(Gtk.Window):
         elif word == "done":
             self.done_ok = True
             self.done_encrypted = "encrypted=1" in rest
+            if self.current_stage:
+                self._stage_mark(self.current_stage, "done")
+            self._show_done()
+        elif word == "await-reboot":
+            self.await_reboot = True
 
     def _write(self, text):
         try:
@@ -564,6 +577,8 @@ class Wizard(Gtk.Window):
         self._finish(rc)
 
     def _finish(self, rc):
+        if self.page == "done":
+            return                       # the installer only waited to restart the machine
         if rc == 0 and self.done_ok:
             if self.current_stage:
                 self._stage_mark(self.current_stage, "done")
@@ -577,26 +592,94 @@ class Wizard(Gtk.Window):
 
     # ---- page 5: done ------------------------------------------------------------------
     def _build_done(self):
-        box = self._page("done", "✔ Installed", "")
-        self.done_lbl = self._label("")
-        box.pack_start(self.done_lbl, False, False, 0)
+        box = self._page("done", "✔ ThinClient is installed", "")
+        self.done_sub = self._label("", "subtitle")
+        box.pack_start(self.done_sub, False, False, 0)
+        self.done_steps = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        sw = Gtk.ScrolledWindow(); sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw.add(self.done_steps)
+        box.pack_start(sw, True, True, 8)
+        # Outside the scrolled steps so it can never be scrolled out of sight.
+        self.done_warn = Gtk.Box(); self.done_warn.get_style_context().add_class("warn")
+        self.done_warn.pack_start(self._label(
+            "\u26a0  The first start takes up to 3 minutes. Do NOT switch it off while "
+            "\u201cSecuring this device\u201d is on screen.", wrap=True), True, True, 0)
+        self.done_warn.set_no_show_all(True)
+        box.pack_start(self.done_warn, False, False, 0)
+        self.restart_lbl = self._label("", "hint")
+        box.pack_start(self.restart_lbl, False, False, 0)
+
+    def _step(self, n, head, body=None, extra=None):
+        row = Gtk.Box(spacing=14)
+        num = Gtk.Label(label=str(n)); num.get_style_context().add_class("stepnum")
+        num.set_valign(Gtk.Align.START)
+        row.pack_start(num, False, False, 0)
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        col.pack_start(self._label(head, "stephead"), False, False, 0)
+        if body:
+            col.pack_start(self._label(body, "stepbody"), False, False, 0)
+        if extra is not None:
+            col.pack_start(extra, False, False, 4)
+        row.pack_start(col, True, True, 0)
+        return row
 
     def _show_done(self):
         enc = getattr(self, "done_encrypted", False)
-        text = ["Remove the USB stick, then restart."]
+        for c in self.done_steps.get_children():
+            self.done_steps.remove(c)
+        d = self.disk or {}
+        self.done_sub.set_text("Installed on %s (%s) as \u201c%s\u201d. Follow these steps to start it."
+                               % (d.get("model", "the disk"), human_size(d.get("size", 0)),
+                                  self.name_entry.get_text().strip()))
+        n = 1
+        self.done_steps.pack_start(self._step(n, "Remove the USB stick",
+                                              "Unplug it now, before restarting."), False, False, 0)
+        n += 1
+        self.done_steps.pack_start(self._step(n, "Click \u201cRestart now\u201d",
+                                              "The computer restarts by itself."), False, False, 0)
         if enc:
-            text += ["",
-                     "The FIRST start takes up to 3 minutes while the disk key is sealed into this "
-                     "computer — the screen may stay dark. Do not switch it off.",
-                     "",
-                     "On a computer that has never had ThinClient, a blue screen appears once at that first start:",
-                     "   1.  “Verification failed: Security Violation” → press Enter",
-                     "   2.  “Press any key to perform MOK management” → press a key within 10 seconds",
-                     "   3.  Enroll key from disk → TCEFI → THINCLIENT-ENROLL-ME.der → Continue → Yes → Reboot",
-                     "",
-                     "After that it starts by itself every time. Nobody is ever asked for a disk password."]
-        self.done_lbl.set_text("\n".join(text))
+            n += 1
+            panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            panel.get_style_context().add_class("panel")
+            for line in ("a.  \u201cVerification failed: Security Violation\u201d  \u2192  press Enter",
+                         "b.  \u201cPress any key to perform MOK management\u201d  \u2192  press any key within 10 seconds",
+                         "c.  Enroll key from disk  \u2192  TCEFI  \u2192  THINCLIENT-ENROLL-ME.der",
+                         "      \u2192  Continue  \u2192  Yes  \u2192  Reboot"):
+                panel.pack_start(self._label(line, wrap=True), False, False, 0)
+            self.done_steps.pack_start(self._step(
+                n, "Approve the security key (new computers only)",
+                "A blue screen appears once, the first time this computer starts ThinClient. "
+                "Use the keyboard:", panel), False, False, 0)
+            n += 1
+            self.done_steps.pack_start(self._step(
+                n, "Wait for the first start",
+                "It takes up to 3 minutes while the disk key is sealed into this computer. "
+                "After that it starts by itself every time, with no disk password."), False, False, 0)
+        else:
+            n += 1
+            self.done_steps.pack_start(self._step(
+                n, "ThinClient starts", "It starts from the internal disk from now on."), False, False, 0)
+        self.done_steps.show_all()
+        if enc:
+            # no-show-all turns show_all() into a no-op: show the box AND its label.
+            self.done_warn.show()
+            for c in self.done_warn.get_children():
+                c.show()
+        else:
+            self.done_warn.hide()
         self._go("done")
+
+    def _restart(self):
+        self.btn_next.set_sensitive(False); self.btn_next.set_label("Restarting\u2026")
+        self.restart_lbl.set_text("Restarting\u2026 If the screen has not gone dark within a minute, "
+                                  "hold the power button for 5 seconds.")
+        if self.proc and self.proc.poll() is None and getattr(self, "await_reboot", False):
+            self._write("reboot")        # the installer is still in memory and root
+        else:
+            try:
+                subprocess.Popen(["sudo", "-n", "systemctl", "reboot"])
+            except Exception:
+                pass
 
     def _build_failed(self):
         box = self._page("failed", "Installation stopped", "")
@@ -630,7 +713,7 @@ class Wizard(Gtk.Window):
             if r == Gtk.ResponseType.OK:
                 self._start_install()
         elif p == "done":
-            subprocess.Popen(["sudo", "-n", "systemctl", "reboot"])
+            self._restart()
         elif p == "failed":
             self.destroy(); Gtk.main_quit()
 
