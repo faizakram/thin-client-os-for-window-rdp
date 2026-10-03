@@ -41,6 +41,14 @@ APT_TIMEOUT = int(os.environ.get("TC_OSPATCH_TIMEOUT", "1200"))
 NO_REBOOT = os.environ.get("TC_OSPATCH_NOREBOOT") == "1"
 # A change to any of these is only real after a restart.
 REBOOT_PKGS = re.compile(r"^(linux-image-|libc6$|systemd$|libsystemd0$|dbus$)")
+# An ENCRYPTED machine does not boot Debian's kernel: it boots our signed boot image,
+# which has its own kernel built in, and loads that kernel's modules from the disk.
+# A Debian kernel package there is never booted — and a same-version rebuild would
+# swap the modules under the built-in kernel (no graphics, no network after the next
+# restart). Its kernels arrive as signed boot images instead (thinclient-kernel), so
+# the patch channel leaves every kernel package alone on it, at every step.
+KERNEL_PKGS = re.compile(r"^linux-(image|headers|modules|kbuild)-")
+INSTALL_GEN = os.environ.get("TC_INSTALL_GEN", "/etc/thinclient/install-generation")
 
 
 def _now():
@@ -72,6 +80,39 @@ def codename():
     except OSError:
         pass
     return None
+
+
+def encrypted():
+    try:
+        return "encrypted=1" in open(INSTALL_GEN).read()
+    except OSError:
+        return False
+
+
+def without_kernels(specs):
+    """The specs this machine may install: on an encrypted machine, never a kernel."""
+    if not encrypted():
+        return list(specs)
+    return [s for s in specs if not KERNEL_PKGS.match(s.split("=")[0])]
+
+
+def hold_kernels():
+    """Last guard on an encrypted machine: apt itself will not move a kernel package,
+    whatever asks it to. Idempotent; only the packages actually installed."""
+    if not encrypted():
+        return
+    try:
+        r = subprocess.run(["dpkg-query", "-W", "-f", "${Package} ${Status}\n"],
+                           capture_output=True, text=True, timeout=60)
+        pkgs = [l.split()[0] for l in r.stdout.splitlines()
+                if l.endswith("install ok installed") and KERNEL_PKGS.match(l.split()[0])]
+        meta = [l.split()[0] for l in r.stdout.splitlines()
+                if l.endswith("install ok installed") and re.match(r"^linux-(image|headers)-(amd64|arm64)$", l.split()[0])]
+        if pkgs or meta:
+            subprocess.run(["apt-mark", "hold"] + sorted(set(pkgs + meta)),
+                           capture_output=True, text=True, timeout=60)
+    except Exception:
+        pass
 
 
 def ensure_sources():
@@ -141,6 +182,7 @@ def cmd_check():
     st["checked_at"] = _now()
     try:
         ensure_sources()
+        hold_kernels()
         # apt update exits 0 when a source can't be reached — it warns and quietly keeps
         # the OLD index, so an unreachable mirror would look like "nothing to install".
         # --error-on=any makes that a failure; the warning is checked too, belt and braces.
@@ -150,7 +192,7 @@ def cmd_check():
         r = apt(["-s", "-q", "upgrade", "--with-new-pkgs"])
         if r.returncode != 0:
             raise RuntimeError("apt simulate: " + _err(r))
-        st["pending"] = parse_simulation(r.stdout)
+        st["pending"] = without_kernels(parse_simulation(r.stdout))
         st["error"] = None
     except Exception as e:
         st["error"] = str(e)[:300]
@@ -181,7 +223,7 @@ _PKG_SPEC = re.compile(r"^[a-z0-9][a-z0-9+.\-]*=[A-Za-z0-9.+~:\-]+$")
 
 def cmd_stage(specs):
     """Name exactly what the next boot installs. Only well-formed name=version specs."""
-    specs = sorted({s for s in specs if _PKG_SPEC.match(s)})
+    specs = sorted({s for s in without_kernels(specs) if _PKG_SPEC.match(s)})
     if not specs:
         try:
             os.remove(STAGE)
@@ -281,7 +323,15 @@ def cmd_apply():
             _write(RESULT, {"applied_at": _now(), "result": "ok" if _healthy() else "failed",
                             "installed": [], "error": None, "repaired": True, "reported": False})
         return 0
-    pkgs = stage["packages"]
+    # A stage written before this guard existed (or by hand) gets the same filter.
+    pkgs = without_kernels(stage["packages"])
+    if not pkgs:
+        try:
+            os.remove(STAGE)
+        except OSError:
+            pass
+        return 0
+    hold_kernels()
     _say("Installing security updates — this can take a few minutes…")
     res = {"applied_at": _now(), "installed": [], "error": None, "repaired": repaired, "reported": False}
     try:

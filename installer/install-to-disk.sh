@@ -730,6 +730,12 @@ UNIT
   ln -sf /etc/systemd/system/tc-tpm-enroll.service "$TARGET_MNT/etc/systemd/system/multi-user.target.wants/tc-tpm-enroll.service"
   touch "$TARGET_MNT/etc/thinclient-tpm-firstboot"
   mkdir -p "$TARGET_MNT/etc/thinclient"; echo "encrypted=1" >"$TARGET_MNT/etc/thinclient/install-generation"
+  # This machine boots the kernel built into the signed image and loads ITS modules from
+  # disk. No apt run (Admin Mode -> Update, a security update) may replace them; new
+  # kernels arrive as signed boot images (thinclient-kernel).
+  KPKGS=$(chroot "$TARGET_MNT" dpkg-query -W -f '${Package} ${Status}\n' 2>/dev/null \
+          | awk '$NF=="installed" && $1 ~ /^linux-(image|headers|modules|kbuild)-/ {print $1}')
+  [[ -n "$KPKGS" ]] && chroot "$TARGET_MNT" apt-mark hold $KPKGS >/dev/null 2>&1 || true
 
   for f in EFI/BOOT/BOOTX64.EFI EFI/BOOT/mmx64.efi EFI/BOOT/grubx64.efi THINCLIENT-ENROLL-ME.der; do
     [[ -s "$E/$f" ]] || { BOOT_OK=0; warn "MISSING $f on the boot partition"; }

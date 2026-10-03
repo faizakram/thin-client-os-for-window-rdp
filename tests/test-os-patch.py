@@ -161,4 +161,42 @@ d = os.path.join(r, "sys/bus/thunderbolt/devices/domain0"); os.makedirs(d)
 open(os.path.join(d, "security"), "w").write("user\n"); open(os.path.join(d, "iommu_dma_protection"), "w").write("1\n")
 check("level and DMA protection read", agent.thunderbolt_facts(r) == {"present": True, "security": "user", "dma_protection": True})
 
+print("== encrypted machine: the patch channel never touches a kernel ==")
+gen = os.path.join(tmp, "install-generation"); osp.INSTALL_GEN = gen
+mixed = ["libssl3t64=3.5.7-1~deb13u3", "linux-image-6.12.110+deb13-amd64=6.12.110-1",
+         "linux-image-amd64=6.12.110-1", "linux-headers-6.12.110+deb13-amd64=6.12.110-1",
+         "linux-kbuild-6.12.110+deb13=6.12.110-1", "linux-base=4.12", "firmware-amd-graphics=20250410-2"]
+check("plain machine: kernels kept (it boots Debian's kernel)", osp.without_kernels(mixed) == mixed)
+open(gen, "w").write("encrypted=1\n")
+check("encrypted: every kernel package filtered, everything else kept",
+      osp.without_kernels(mixed) == ["libssl3t64=3.5.7-1~deb13u3", "linux-base=4.12", "firmware-amd-graphics=20250410-2"])
+osp.cmd_stage(["linux-image-6.12.110+deb13-amd64=6.12.110-1"])
+check("encrypted: a kernel-only approval stages nothing", not os.path.exists(osp.STAGE))
+osp.cmd_stage(["libssl3t64=3.5.7-1~deb13u3", "linux-image-amd64=6.12.110-1"])
+check("encrypted: a mixed approval stages the rest", json.load(open(osp.STAGE))["packages"] == ["libssl3t64=3.5.7-1~deb13u3"])
+# A stage file from before the guard (kernel inside) must not install the kernel.
+osp._write(osp.STAGE, {"packages": ["linux-image-6.12.110+deb13-amd64=6.12.110-1"]})
+real_exists = os.path.exists
+calls.clear(); os.path.exists = lambda p: False if p == "/run/live/medium" else real_exists(p)
+osp._dpkg_interrupted = lambda: False
+try:
+    osp.cmd_apply()
+finally:
+    os.path.exists = real_exists
+check("encrypted: an old kernel-only stage is dropped without running apt",
+      not os.path.exists(osp.STAGE) and not any("apt-get" in c for c in calls))
+def dpkg_run(argv, **kw):
+    calls.append(list(argv))
+    if argv[0] == "dpkg-query":
+        return R(0, "linux-image-6.12.111+deb13-amd64 install ok installed\nlinux-image-amd64 install ok installed\n"
+                    "linux-image-6.12.100+deb13-amd64 deinstall ok config-files\nopenssl install ok installed\n")
+    return R()
+osp.subprocess.run = dpkg_run; calls.clear(); osp.hold_kernels()
+hold = [c for c in calls if c[:2] == ["apt-mark", "hold"]]
+check("encrypted: installed kernel + meta package held, removed ones and others not",
+      hold == [["apt-mark", "hold", "linux-image-6.12.111+deb13-amd64", "linux-image-amd64"]])
+os.remove(gen); calls.clear(); osp.hold_kernels()
+check("plain machine: nothing held", not calls)
+osp.subprocess.run = fake_run
+
 print("\n  %d passed" % ok)
