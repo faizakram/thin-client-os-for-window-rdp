@@ -1,0 +1,35 @@
+#!/bin/bash
+# Encrypted machines: mark the kernel this machine started with as GOOD.
+#
+# systemd-boot starts a newly delivered kernel image with a try counter in its file name
+# (thinclient-<kver>+2.efi). Every start decrements it; a kernel that never gets here
+# (panic, initrd failure, black screen that someone powers off) runs out of tries and
+# systemd-boot goes back to the previous image by itself. "Good" means the kiosk is on
+# screen — not merely that the kernel booted: a kernel that black-screens must fall back.
+#
+# Run by tc-boot-bless.timer a few minutes after boot; exits 1 (retried) until the kiosk
+# is up, and 0 at once when the image started has no counter (already good).
+set -euo pipefail
+ESP="${TC_ESP:-/boot/efi}"
+VARS="${TC_EFIVARS:-/sys/firmware/efi/efivars}"
+VAR="$VARS/LoaderBootCountPath-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
+STATE="${TC_KERNEL_DIR:-/var/lib/thinclient/kernel}"
+
+[ -e "$VAR" ] || exit 0          # started without a counter: nothing to confirm
+
+# The kiosk (connect window or lock screen) running for the session user.
+if [ "${TC_BLESS_SKIP_KIOSK_CHECK:-0}" != 1 ]; then
+  pgrep -u thinclient -f 'thinclient-(connect|lock|session)' >/dev/null || exit 1
+fi
+
+# efivarfs cannot seek: read it through a pipe. 4 bytes of attributes, then a UTF-16LE
+# path like \EFI\Linux\thinclient-6.12.120+deb13-amd64+1-1.efi (ASCII only).
+path=$(cat "$VAR" | tail -c +5 | tr -d '\000' | tr '\\' '/')
+case "$path" in /EFI/Linux/thinclient-*.efi) ;; *) exit 0 ;; esac
+f="$ESP$path"
+[ -f "$f" ] || exit 0
+good="$(dirname "$f")/$(basename "$f" | sed -E 's/\+[0-9]+(-[0-9]+)?\.efi$/.efi/')"
+[ "$f" = "$good" ] && exit 0
+mv -f "$f" "$good"; sync
+mkdir -p "$STATE"; basename "$good" > "$STATE/blessed"
+echo "tc-boot-bless: $(basename "$good") confirmed good" | systemd-cat -t tc-boot-bless -p info 2>/dev/null || true

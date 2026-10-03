@@ -219,6 +219,9 @@ populate() {
     stage "keys/secureboot/MOK.der"              "/opt/thinclient/phaseb/MOK.der" 0644
     stage "keys/pcr/tpm2-pcr-public.pem"         "/opt/thinclient/phaseb/tpm2-pcr-public-key.pem" 0644
     stage "tools/phaseb/tc-tpm-enroll"           "/opt/thinclient/phaseb/tc-tpm-enroll" 0755
+    stage "tools/phaseb/tc-boot-bless"           "/opt/thinclient/phaseb/tc-boot-bless" 0755
+    [[ -s "$PB/systemd-bootx64.efi.signed" ]] || die "missing build-phaseb/systemd-bootx64.efi.signed — rerun tools/phaseb/build-uki.sh"
+    stage "build-phaseb/systemd-bootx64.efi.signed" "/opt/thinclient/phaseb/systemd-bootx64.efi.signed" 0644
     ok "Encrypted image: signed boot image for kernel ${kver} staged"
   fi
 

@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+# =============================================================================
+#  ThinClient OS — kernel updates for ENCRYPTED machines (security plan Phase B, M5)
+#  Installed to: /opt/thinclient/bin/thinclient-kernel      (runs as root)
+#
+#  An encrypted machine does not boot Debian's kernel: it boots our SIGNED boot image
+#  (kernel + initrd + command line, signed for Secure Boot, with a signed TPM policy)
+#  from the boot partition, through systemd-boot. The patch channel therefore never
+#  touches a kernel there (thinclient-ospatch). New kernels come from us instead, named
+#  in the signed update manifest:
+#
+#      kernel_version=6.12.120+deb13-amd64
+#      kernel_image=<url or file name>         kernel_image_sha256=<hex>
+#      kernel_pkg=<url or file name>           kernel_pkg_sha256=<hex>
+#
+#    offer MANIFEST URL   (thinclient-update --check, after the manifest's signature is
+#                         verified) download both, check the hashes, stage them.
+#    apply                at boot, before the kiosk (tc-kernel-apply.service): unpack the
+#                         kernel's modules, put the image on the boot partition with TWO
+#                         tries (thinclient-<kver>+2.efi), restart once.
+#    settle               after every boot (tc-boot-bless confirms good images): a new
+#                         kernel that reached the kiosk is kept and older ones pruned
+#                         (always keeping one previous good image); one that ran out of
+#                         tries is removed and never offered again. systemd-boot itself
+#                         already started the previous image — settle only tidies up.
+#    status               JSON for the agent.
+#
+#  Modules are unpacked, not dpkg-installed: no kernel postinst hooks (initramfs,
+#  GRUB) run on a machine that has neither, and nothing apt does can remove them.
+#  The image the machine is running from, and the last good one, are never deleted.
+# =============================================================================
+import hashlib, json, os, re, shutil, subprocess, sys, tempfile, time
+
+ESP = os.environ.get("TC_ESP", "/boot/efi")
+LINUX = os.path.join(ESP, "EFI", "Linux")
+STATE_DIR = os.environ.get("TC_KERNEL_DIR", "/var/lib/thinclient/kernel")
+STAGED = os.path.join(STATE_DIR, "staged.json")
+TRYING = os.path.join(STATE_DIR, "trying.json")
+FAILED = os.path.join(STATE_DIR, "failed.json")
+OURS = os.path.join(STATE_DIR, "installed.json")     # kernels whose modules WE unpacked
+RESULT = os.path.join(STATE_DIR, "result.json")      # last outcome, for the agent
+MODULES = os.environ.get("TC_MODULES_DIR", "/usr/lib/modules")
+INSTALL_GEN = os.environ.get("TC_INSTALL_GEN", "/etc/thinclient/install-generation")
+DL_LIMIT = os.environ.get("TC_KERNEL_DL_LIMIT", "200k")     # same courtesy as OS updates
+NO_REBOOT = os.environ.get("TC_KERNEL_NOREBOOT") == "1"
+TRIES = 2
+
+KVER_RE = re.compile(r"^[0-9][0-9A-Za-z.+~_-]{2,63}$")
+IMG_RE = re.compile(r"^thinclient-(?P<kver>.+?)(?:\+(?P<left>\d+)(?:-(?P<done>\d+))?)?\.efi$")
+SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _now():
+    return int(time.time())
+
+
+def _read(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def _write(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def encrypted():
+    try:
+        return "encrypted=1" in open(INSTALL_GEN).read()
+    except OSError:
+        return False
+
+
+def running_kver():
+    return os.environ.get("TC_UNAME") or os.uname().release
+
+
+def images():
+    """Kernel images on the boot partition: [{file, kver, left, done}] (left None = good)."""
+    out = []
+    try:
+        names = sorted(os.listdir(LINUX))
+    except OSError:
+        return out
+    for n in names:
+        m = IMG_RE.match(n)
+        if m:
+            out.append({"file": n, "kver": m.group("kver"),
+                        "left": int(m.group("left")) if m.group("left") is not None else None,
+                        "done": int(m.group("done") or 0) if m.group("left") is not None else None})
+    return out
+
+
+def _image_for(kver):
+    for i in images():
+        if i["kver"] == kver:
+            return i
+    return None
+
+
+def _failed():
+    return _read(FAILED, []) or []
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _manifest(path):
+    kv = {}
+    for ln in open(path):
+        if "=" in ln and not ln.lstrip().startswith("#"):
+            k, v = ln.split("=", 1)
+            kv[k.strip()] = v.strip()
+    return kv
+
+
+def _download(url, dest):
+    tmp = dest + ".part"
+    r = subprocess.run(["curl", "-fsSL", "--retry", "3", "--connect-timeout", "20",
+                        "--limit-rate", DL_LIMIT, "-o", tmp, url],
+                       capture_output=True, text=True, timeout=4 * 3600)
+    if r.returncode != 0:
+        raise RuntimeError("download failed (%s): %s" % (os.path.basename(url), (r.stderr or "").strip()[:200]))
+    os.replace(tmp, dest)
+
+
+def cmd_offer(manifest, base_url):
+    """Stage the manifest's kernel if this machine should get it. Installs nothing."""
+    if not encrypted():
+        return _out({"offered": False, "reason": "not an encrypted machine"})
+    m = _manifest(manifest)
+    kver = m.get("kernel_version", "")
+    if not kver:
+        return _out({"offered": False, "reason": "no kernel in this release"})
+    if not KVER_RE.match(kver):
+        return _out({"offered": False, "reason": "malformed kernel_version"})
+    if kver == running_kver() or _image_for(kver):
+        return _out({"offered": False, "reason": "already installed"})
+    if kver in _failed():
+        return _out({"offered": False, "reason": "failed to start here before"})
+    if (_read(STAGED) or {}).get("kver") == kver:
+        return _out({"offered": False, "reason": "already staged"})
+    newest = sorted([running_kver()] + [i["kver"] for i in images()], key=_vkey)[-1]
+    if _vkey(kver) <= _vkey(newest):
+        return _out({"offered": False, "reason": "not newer than %s" % newest})
+    files = {}
+    for part in ("image", "pkg"):
+        ref, sha = m.get("kernel_" + part, ""), m.get("kernel_%s_sha256" % part, "").lower()
+        if not ref or not SHA_RE.match(sha):
+            return _out({"offered": False, "reason": "manifest kernel_%s incomplete" % part})
+        url = ref if "://" in ref else base_url.rstrip("/") + "/" + ref
+        files[part] = (url, sha)
+    d = os.path.join(STATE_DIR, "dl", kver)
+    os.makedirs(d, exist_ok=True)
+    got = {}
+    try:
+        for part, (url, sha) in files.items():
+            dest = os.path.join(d, part + (".efi" if part == "image" else ".deb"))
+            if not (os.path.exists(dest) and _sha256(dest) == sha):
+                _download(url, dest)
+                if _sha256(dest) != sha:
+                    os.remove(dest)
+                    raise RuntimeError("%s does not match the signed manifest" % part)
+            got[part] = dest
+    except Exception as e:
+        _write(RESULT, {"at": _now(), "kver": kver, "result": "download-failed", "error": str(e)[:300]})
+        return _out({"offered": False, "reason": str(e)[:300]}, rc=1)
+    _write(STAGED, {"kver": kver, "image": got["image"], "pkg": got["pkg"], "staged_at": _now()})
+    return _out({"offered": True, "kver": kver})
+
+
+def _vkey(v):
+    return [int(p) if p.isdigit() else p for p in re.split(r"[.+~_-]", v)]
+
+
+def _unpack_modules(pkg, kver):
+    """The kernel's modules, straight from the Debian package — no maintainer scripts."""
+    tmp = tempfile.mkdtemp(prefix="tc-kernel-")
+    try:
+        r = subprocess.run(["dpkg-deb", "-x", pkg, tmp], capture_output=True, text=True, timeout=900)
+        if r.returncode != 0:
+            raise RuntimeError("unpack: " + (r.stderr or "").strip()[:200])
+        src = None
+        for cand in ("usr/lib/modules", "lib/modules"):
+            p = os.path.join(tmp, cand, kver)
+            if os.path.isdir(p):
+                src = p
+        if not src:
+            raise RuntimeError("package has no modules for %s" % kver)
+        dest = os.path.join(MODULES, kver)
+        if os.path.exists(dest):
+            shutil.rmtree(dest)
+        shutil.copytree(src, dest, symlinks=True)
+        # depmod indexes <base>/lib/modules/<kver>; without modules.dep nothing would load
+        # (no graphics, no network) — refuse here rather than start the kernel blind.
+        base = MODULES
+        for suffix in ("/usr/lib/modules", "/lib/modules"):
+            if base.rstrip("/").endswith(suffix):
+                base = base.rstrip("/")[: -len(suffix)] or "/"
+                break
+        r = subprocess.run(["depmod", "-b", base, kver], capture_output=True, text=True, timeout=300)
+        if r.returncode != 0 or not os.path.exists(os.path.join(dest, "modules.dep")):
+            shutil.rmtree(dest, ignore_errors=True)
+            raise RuntimeError("depmod failed: " + (r.stderr or "").strip()[:200])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def cmd_apply():
+    """Boot time, before the kiosk. A fast no-op unless a kernel is staged."""
+    st = _read(STAGED)
+    if not st or not encrypted() or os.path.exists("/run/live/medium"):
+        return 0
+    kver = st.get("kver", "")
+    try:
+        os.remove(STAGED)                  # once: a failure is reported, not retried every boot
+    except OSError:
+        pass
+    try:
+        if not KVER_RE.match(kver):
+            raise RuntimeError("malformed staged kernel")
+        _unpack_modules(st["pkg"], kver)
+        ours = _read(OURS, []) or []
+        if kver not in ours:
+            _write(OURS, ours + [kver])
+        os.makedirs(LINUX, exist_ok=True)
+        tmp = os.path.join(LINUX, ".incoming.efi")
+        shutil.copyfile(st["image"], tmp)
+        os.replace(tmp, os.path.join(LINUX, "thinclient-%s+%d.efi" % (kver, TRIES)))
+        subprocess.run(["sync"], timeout=60)
+        _write(TRYING, {"kver": kver, "since": _now(), "from": running_kver()})
+        _write(RESULT, {"at": _now(), "kver": kver, "result": "trying"})
+    except Exception as e:
+        _write(RESULT, {"at": _now(), "kver": kver, "result": "failed", "error": str(e)[:300]})
+        return 1
+    shutil.rmtree(os.path.dirname(st["image"]), ignore_errors=True)
+    if not NO_REBOOT:
+        subprocess.run(["systemctl", "reboot"], capture_output=True, timeout=30)
+    return 0
+
+
+def _remove_kernel(kver):
+    """An image and — only for a kernel we unpacked — its modules. Never the running one."""
+    if kver == running_kver():
+        return
+    for i in images():
+        if i["kver"] == kver:
+            try:
+                os.remove(os.path.join(LINUX, i["file"]))
+            except OSError:
+                pass
+    ours = _read(OURS, []) or []
+    if kver in ours:
+        shutil.rmtree(os.path.join(MODULES, kver), ignore_errors=True)
+        _write(OURS, [k for k in ours if k != kver])
+
+
+def cmd_settle():
+    """After a boot: keep a new kernel that made it, drop one that did not, prune old."""
+    if not encrypted():
+        return _out({"settled": False})
+    tr = _read(TRYING)
+    now_k = running_kver()
+    outcome = None
+    if tr:
+        k = tr.get("kver")
+        img = _image_for(k)
+        if now_k == k and img and img["left"] is None:
+            outcome = {"at": _now(), "kver": k, "result": "ok"}            # blessed: it reached the kiosk
+        elif now_k != k and (not img or img["left"] == 0):
+            # Ran out of tries; systemd-boot already started the previous image.
+            _remove_kernel(k)
+            _write(FAILED, sorted(set(_failed() + [k])))
+            outcome = {"at": _now(), "kver": k, "result": "failed",
+                       "error": "the new kernel did not reach the kiosk; back on %s" % now_k}
+        if outcome:
+            os.remove(TRYING)
+            _write(RESULT, outcome)
+    # Prune: keep the running image, plus the newest OTHER good image as the fallback.
+    if not _read(TRYING):
+        good = [i for i in images() if i["left"] is None]
+        others = sorted([i["kver"] for i in good if i["kver"] != now_k], key=_vkey)
+        if _image_for(now_k) and _image_for(now_k)["left"] is None:
+            for k in others[:-1]:
+                _remove_kernel(k)
+    return _out({"settled": True, "outcome": outcome})
+
+
+def cmd_status():
+    return _out({"encrypted": encrypted(), "running": running_kver(), "images": images(),
+                 "staged": (_read(STAGED) or {}).get("kver"), "trying": (_read(TRYING) or {}).get("kver"),
+                 "failed": _failed(), "last": _read(RESULT)})
+
+
+def _out(obj, rc=0):
+    print(json.dumps(obj))
+    return rc
+
+
+def main(argv):
+    if not argv:
+        print("usage: thinclient-kernel offer MANIFEST URL | apply | settle | status", file=sys.stderr)
+        return 2
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "offer" and len(rest) == 2:
+        return cmd_offer(rest[0], rest[1])
+    if cmd == "apply":
+        return cmd_apply()
+    if cmd == "settle":
+        return cmd_settle()
+    if cmd == "status":
+        return cmd_status()
+    print("unknown command", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

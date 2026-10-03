@@ -109,6 +109,19 @@ elif [[ "$(tc_bool "$(conf_get UPDATE_ALLOW_UNSIGNED false)")" != "true" ]]; the
   die "no public key at ${PUBKEY} and UPDATE_ALLOW_UNSIGNED!=true — refusing unsigned update"
 fi
 
+# Encrypted machines: a newer signed kernel named in this (verified) manifest is
+# downloaded and staged for the next boot. Independent of the app update below — a
+# kernel can never hold up, or be held up by, a ThinClient release.
+# Only from a manifest whose signature was VERIFIED above (never the unsigned fallback),
+# and in the background: ~100 MB at the polite rate is minutes, and this check must not
+# hold the update lock that long.
+KBIN="${TC_BIN:-/opt/thinclient/bin}/thinclient-kernel"
+if [[ "$MODE" == "check" && -x "$KBIN" && -s "$PUBKEY" ]] && grep -q '^kernel_version=' "${tmp}/manifest"; then
+  install -D -m 0644 "${tmp}/manifest" /var/lib/thinclient/kernel/offer.manifest 2>/dev/null \
+    && systemd-run --quiet --no-block --unit=tc-kernel-offer --collect \
+         "$KBIN" offer /var/lib/thinclient/kernel/offer.manifest "$URL" >/dev/null 2>&1 || true
+fi
+
 mget() { tc_conf_get "${tmp}/manifest" "$1" "${2:-}"; }
 new_ver="$(mget version)"
 bundle="$(mget bundle)"

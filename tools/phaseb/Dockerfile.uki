@@ -5,6 +5,7 @@
 FROM debian:trixie
 RUN apt-get update && apt-get install -y --no-install-recommends \
       dracut dracut-core systemd systemd-cryptsetup systemd-ukify systemd-boot-efi \
+      systemd-boot-efi-amd64-signed \
       cryptsetup-bin tpm2-tools libtss2-dev sbsigntool e2fsprogs kmod binutils \
       python3-pefile ca-certificates && \
     rm -rf /var/lib/apt/lists/*

@@ -26,7 +26,12 @@ echo "kernel: $KVER"
 # then never became ready and the screen stayed black (the VM, no amdgpu, was fine).
 #
 # webcam that fails to resume drops off the bus mid-recording).
-CMDLINE="rd.luks.name=${LUKS_UUID}=root rd.luks.options=${LUKS_UUID}=tpm2-device=auto,headless=true root=/dev/mapper/root rw lockdown=confidentiality quiet plymouth.enable=0 loglevel=0 vt.global_cursor_default=0 rd.systemd.show_status=false systemd.show_status=false usbcore.autosuspend=-1"
+#
+# panic=10 rd.shell=0 rd.emergency=reboot: a kernel that cannot start restarts instead of
+# hanging, so systemd-boot's try counter runs down and the previous image starts again
+# (kernel updates, see tc-boot-bless). An unlock the TPM refuses (disk moved, Secure Boot
+# off) therefore restarts in a loop instead of hanging - the disk stays locked either way.
+CMDLINE="rd.luks.name=${LUKS_UUID}=root rd.luks.options=${LUKS_UUID}=tpm2-device=auto,headless=true root=/dev/mapper/root rw lockdown=confidentiality quiet plymouth.enable=0 loglevel=0 vt.global_cursor_default=0 rd.systemd.show_status=false systemd.show_status=false usbcore.autosuspend=-1 panic=10 rd.shell=0 rd.emergency=reboot"
 # Debug build only (TC_UKI_DEBUG=1): everything to the serial console as well.
 [ "${TC_UKI_DEBUG:-0}" = 1 ] && CMDLINE="$CMDLINE console=tty0 console=ttyS0,115200 systemd.log_level=debug systemd.log_target=console rd.udev.log_level=info"
 dracut --force --no-hostonly --kver "$KVER" \
@@ -41,4 +46,9 @@ ukify build \
   --output "$OUT/thinclient-$KVER.efi"
 sbverify --cert /keys/secureboot/MOK.crt "$OUT/thinclient-$KVER.efi"
 echo "$KVER" > "$OUT/KVER"; echo "$LUKS_UUID" > "$OUT/LUKS_UUID"
+# The boot manager between shim and the image: Debian-signed (shim trusts Debian's CA).
+cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi.signed "$OUT/systemd-bootx64.efi.signed"
+# The kernel package whose modules this image loads: delivered with the image when it
+# ships as a kernel update (thinclient-kernel installs it before the image).
+apt-get download -qq "linux-image-$KVER" >/dev/null 2>&1 && mv linux-image-"$KVER"_*.deb "$OUT/" || true
 ls -la "$OUT"

@@ -697,15 +697,28 @@ fi
 # --------------------------------------------------------------------------- #
 BOOT_OK=1
 if [[ "$ENCRYPT" == "1" ]]; then
-  # Boot chain on the ESP: Microsoft-signed shim -> our signed boot image (shim's second
-  # stage) -> TPM unlock. MokManager is next to shim, and our PUBLIC certificate is on
-  # the ESP for the one-time "Enroll key from disk" at the first power-on.
+  # Boot chain on the ESP: Microsoft-signed shim -> Debian-signed systemd-boot (shim's
+  # second stage) -> our signed boot image from EFI/Linux -> TPM unlock. systemd-boot is
+  # there for kernel updates: a new image gets two tries and, if it never reaches the
+  # kiosk, the previous one starts again by itself (tc-boot-bless confirms a good one).
+  # No menu, no editor. MokManager is next to shim, and our PUBLIC certificate is on the
+  # ESP for the one-time "Enroll key from disk" at the first power-on.
   log "Installing the signed boot chain"
   E="$TARGET_MNT/boot/efi"
-  mkdir -p "$E/EFI/BOOT"
+  KVER_IMG="$(cat "$PHASEB/KVER")"
+  mkdir -p "$E/EFI/BOOT" "$E/EFI/Linux" "$E/loader"
   cp /usr/lib/shim/shimx64.efi.signed "$E/EFI/BOOT/BOOTX64.EFI"
   cp /usr/lib/shim/mmx64.efi.signed   "$E/EFI/BOOT/mmx64.efi"
-  cp "$PHASEB/thinclient.efi"         "$E/EFI/BOOT/grubx64.efi"
+  cp "$PHASEB/systemd-bootx64.efi.signed" "$E/EFI/BOOT/grubx64.efi"
+  cp "$PHASEB/thinclient.efi"         "$E/EFI/Linux/thinclient-${KVER_IMG}.efi"
+  cat >"$E/loader/loader.conf" <<LOADER
+timeout 0
+editor no
+auto-entries no
+auto-firmware no
+console-mode keep
+default thinclient-*
+LOADER
   cp "$PHASEB/MOK.der"                "$E/THINCLIENT-ENROLL-ME.der"
   efibootmgr -c -d "$DISK" -p 1 -L "ThinClient" -l '\EFI\BOOT\BOOTX64.EFI' >/dev/null 2>&1 || true
 
@@ -728,6 +741,50 @@ ExecStart=/usr/local/sbin/tc-tpm-enroll
 WantedBy=multi-user.target
 UNIT
   ln -sf /etc/systemd/system/tc-tpm-enroll.service "$TARGET_MNT/etc/systemd/system/multi-user.target.wants/tc-tpm-enroll.service"
+
+  # Confirm a newly delivered kernel image once the kiosk is on screen (see tc-boot-bless).
+  install -D -m 0755 "$PHASEB/tc-boot-bless" "$TARGET_MNT/usr/local/sbin/tc-boot-bless"
+  cat >"$TARGET_MNT/etc/systemd/system/tc-boot-bless.service" <<'UNIT'
+[Unit]
+Description=Thin Client: confirm this kernel image started the kiosk
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/tc-boot-bless
+# Then keep a confirmed kernel and prune old ones, or drop one that ran out of tries.
+ExecStartPost=-/opt/thinclient/bin/thinclient-kernel settle
+Restart=on-failure
+RestartSec=60
+UNIT
+  # A kernel staged by the update check is installed at boot, before the kiosk.
+  cat >"$TARGET_MNT/etc/systemd/system/tc-kernel-apply.service" <<'UNIT'
+[Unit]
+Description=Thin Client: install a staged kernel update (encrypted machines)
+ConditionPathExists=/var/lib/thinclient/kernel/staged.json
+After=local-fs.target tc-tpm-enroll.service
+Before=display-manager.service lightdm.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/thinclient/bin/thinclient-kernel apply
+TimeoutStartSec=20min
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  ln -sf /etc/systemd/system/tc-kernel-apply.service "$TARGET_MNT/etc/systemd/system/multi-user.target.wants/tc-kernel-apply.service"
+  cat >"$TARGET_MNT/etc/systemd/system/tc-boot-bless.timer" <<'UNIT'
+[Unit]
+Description=Thin Client: confirm this kernel image a few minutes after boot
+
+[Timer]
+OnBootSec=3min
+
+[Install]
+WantedBy=timers.target
+UNIT
+  mkdir -p "$TARGET_MNT/etc/systemd/system/timers.target.wants"
+  ln -sf /etc/systemd/system/tc-boot-bless.timer "$TARGET_MNT/etc/systemd/system/timers.target.wants/tc-boot-bless.timer"
   touch "$TARGET_MNT/etc/thinclient-tpm-firstboot"
   mkdir -p "$TARGET_MNT/etc/thinclient"; echo "encrypted=1" >"$TARGET_MNT/etc/thinclient/install-generation"
   # This machine boots the kernel built into the signed image and loads ITS modules from
@@ -737,7 +794,8 @@ UNIT
           | awk '$NF=="installed" && $1 ~ /^linux-(image|headers|modules|kbuild)-/ {print $1}')
   [[ -n "$KPKGS" ]] && chroot "$TARGET_MNT" apt-mark hold $KPKGS >/dev/null 2>&1 || true
 
-  for f in EFI/BOOT/BOOTX64.EFI EFI/BOOT/mmx64.efi EFI/BOOT/grubx64.efi THINCLIENT-ENROLL-ME.der; do
+  for f in EFI/BOOT/BOOTX64.EFI EFI/BOOT/mmx64.efi EFI/BOOT/grubx64.efi "EFI/Linux/thinclient-${KVER_IMG}.efi" \
+           loader/loader.conf THINCLIENT-ENROLL-ME.der; do
     [[ -s "$E/$f" ]] || { BOOT_OK=0; warn "MISSING $f on the boot partition"; }
   done
 else
