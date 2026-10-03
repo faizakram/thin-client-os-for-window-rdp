@@ -5991,6 +5991,7 @@ def os_patch_cycle():
     if not base:
         return
     result_path = os.path.join(OSPATCH_DIR, "result.json")
+    _ospatch("recheck", timeout=180)     # a false "post-install check failed" becomes ok
     res = _read_json(result_path)
     if res and not res.get("reported"):
         sent = _curl_json("%s/api/agent/os-patch" % base, dict(creds, applied={

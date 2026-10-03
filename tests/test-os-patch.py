@@ -87,7 +87,8 @@ agent._ospatch = fake_ospatch; agent._curl_json = fake_curl
 agent.conf_get = lambda k, d="": {"CONTROL_URL": "https://m.example", "ENROLL_CODE": "E1", "DEVICE_SECRET": "S1"}.get(k, d)
 agent._OSPATCH_ON[0] = False
 agent.os_patch_cycle()
-check("switched off: no check, no download, nothing staged", "calls" not in seen)
+check("switched off: no check, no download, nothing staged",
+      not any(c[0] in ("check", "download", "stage") for c in seen.get("calls", [])))
 agent._OSPATCH_ON[0] = True
 agent.os_patch_cycle()
 check("fleet device: only what the manager APPROVED is staged", seen["staged"] == ["libssl3t64=3.5.7-1~deb13u3"])
@@ -104,6 +105,25 @@ posts.clear(); agent.os_patch_cycle()
 check("…only once", not any("applied" in p for p in posts))
 rep = agent._os_updates_report()["os_updates"]
 check("security report carries it", rep["enabled"] is True and rep["result"] == "ok" and rep["installed"] == 1)
+
+print("== the 1.0.159/160 false alarm: re-checked, then re-reported ==")
+RES = osp.RESULT
+def put(**kw):
+    os.makedirs(os.path.dirname(RES), exist_ok=True)
+    json.dump(dict({"applied_at": 1000, "result": "failed", "installed": ["libssl3t64=3.5.7-1~deb13u3"],
+                    "error": osp.CHECK_FAILED + " (FreeRDP / Python / dpkg)", "reported": True}, **kw), open(RES, "w"))
+osp._healthy = lambda: True; osp._boot_time = lambda: 500
+put(); osp.cmd_recheck(); r = json.load(open(RES))
+check("healthy now: marked ok and queued to report again", r["result"] == "ok" and r["reported"] is False and r["error"] is None)
+put(installed=["linux-image-6.12.110+deb13-amd64=6.12.110-1"]); osp.cmd_recheck()
+check("a kernel among them: NOT ok until the machine has booted since", json.load(open(RES))["result"] == "failed")
+osp._boot_time = lambda: 2000; osp.cmd_recheck()
+check("…ok once it has", json.load(open(RES))["result"] == "ok")
+put(error="apt install: E: broken"); osp.cmd_recheck()
+check("a REAL install failure is never re-marked", json.load(open(RES))["result"] == "failed")
+osp._healthy = lambda: False; put(); osp.cmd_recheck()
+check("still unhealthy: stays failed", json.load(open(RES))["result"] == "failed")
+os.remove(RES)
 
 print("== a site booting together doesn't download together ==")
 ds = [agent._os_patch_first_delay() for _ in range(500)]

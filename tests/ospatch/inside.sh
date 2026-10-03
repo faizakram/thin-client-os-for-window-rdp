@@ -34,12 +34,24 @@ echo "== fleet device: only the APPROVED subset is installed"
 SUB=$(printf '%s\n' $PENDING | grep -E '^(libssl3t64|openssl|openssl-provider-legacy)=' | tr '\n' ' ')
 OTHER=$(printf '%s\n' $PENDING | grep -vE '^(libssl3t64|openssl|openssl-provider-legacy)=' | head -1)
 echo "# THINCLIENT-LOCAL-EDIT" >> /etc/ssl/openssl.cnf
-python3 $P stage $SUB >/dev/null; python3 $P apply 2>/dev/null
+python3 $P stage $SUB >/dev/null
+# EXACTLY as the boot-time service runs it: no HOME, minimal environment. FreeRDP 3
+# exits 1 on --version without HOME — 1.0.159/160 reported every clean install failed.
+env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin TC_OSPATCH_NOREBOOT=1 python3 $P apply 2>/dev/null
 ok "subset installed ok" "[ \"\$(res result)\" = ok ]"
 for s in $SUB; do ok "  $s" "[ \"\$(ver ${s%%=*})\" = \"${s#*=}\" ]"; done
 [ -n "$OTHER" ] && ok "a NOT-approved update stays uninstalled (${OTHER%%=*})" "[ \"\$(ver ${OTHER%%=*})\" != \"${OTHER#*=}\" ]"
 ok "our config file kept (--force-confold)" "grep -q THINCLIENT-LOCAL-EDIT /etc/ssl/openssl.cnf"
 ok "FreeRDP still runs" "xfreerdp3 --version >/dev/null 2>&1"
+
+echo "== an install marked failed by the old check alone is re-checked and re-marked ok"
+python3 - <<PY
+import json; r=json.load(open("$D/result.json")); r.update(result="failed", reported=True,
+  error="installed, but the post-install check failed (FreeRDP / Python / dpkg)"); json.dump(r, open("$D/result.json","w"))
+PY
+env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin python3 $P recheck >/dev/null
+ok "re-marked ok in a service environment" "[ \"\$(res result)\" = ok ]"
+ok "…and queued to be reported again" "[ \"\$(res reported)\" = False ]"
 
 echo "== power cut mid-install: repaired at the next boot"
 if [ -n "$OTHER" ]; then
