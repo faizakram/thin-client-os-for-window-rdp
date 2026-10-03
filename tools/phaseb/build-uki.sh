@@ -20,8 +20,13 @@ echo "kernel: $KVER"
 # key file alone never falls back to the token once the file is gone.)
 # The rest mirrors what the GRUB installer sets on unencrypted machines (there is no GRUB
 # here): a silent kiosk boot, and usbcore.autosuspend=-1 — the camera fix (a suspended
+# NO boot splash (plymouth.enable=0): GRUB machines start Plymouth inside the initramfs
+# together with the GPU driver; this initrd has neither, so Plymouth started LATE on the
+# firmware framebuffer and collided with amdgpu taking over — on a real AMD machine X
+# then never became ready and the screen stayed black (the VM, no amdgpu, was fine).
+#
 # webcam that fails to resume drops off the bus mid-recording).
-CMDLINE="rd.luks.name=${LUKS_UUID}=root rd.luks.options=${LUKS_UUID}=tpm2-device=auto,headless=true root=/dev/mapper/root rw lockdown=confidentiality quiet splash loglevel=0 vt.global_cursor_default=0 rd.systemd.show_status=false systemd.show_status=false usbcore.autosuspend=-1"
+CMDLINE="rd.luks.name=${LUKS_UUID}=root rd.luks.options=${LUKS_UUID}=tpm2-device=auto,headless=true root=/dev/mapper/root rw lockdown=confidentiality quiet plymouth.enable=0 loglevel=0 vt.global_cursor_default=0 rd.systemd.show_status=false systemd.show_status=false usbcore.autosuspend=-1"
 # Debug build only (TC_UKI_DEBUG=1): everything to the serial console as well.
 [ "${TC_UKI_DEBUG:-0}" = 1 ] && CMDLINE="$CMDLINE console=tty0 console=ttyS0,115200 systemd.log_level=debug systemd.log_target=console rd.udev.log_level=info"
 dracut --force --no-hostonly --kver "$KVER" \
