@@ -5547,12 +5547,22 @@ def wipe_device():
     # No message on the lock itself: both screens read a non-empty message as working-
     # hours text. They check WIPED_MARK first and say what actually happened.
     set_admin_lock(True, "permanent", 24, "")
+    # Encrypted disk: destroy the key slots as well, then power off — the key still in
+    # memory goes with the power, and the whole disk is unreadable from then on (a
+    # reinstall is the only way back). The wipe message stays on screen for a minute.
+    erased = _crypto_erase()
     try:
         with open(WIPED_MARK, "w") as f:
-            f.write("%d\n" % int(time.time()))
+            f.write("%d%s\n" % (int(time.time()), " crypto-erased" if erased else ""))
     except OSError:
         pass
-    print("agent: remote wipe complete", file=sys.stderr)
+    print("agent: remote wipe complete%s" % (" (disk key destroyed)" if erased else ""), file=sys.stderr)
+    if erased and os.environ.get("TC_WIPE_NO_POWEROFF") != "1":
+        try:
+            subprocess.Popen(["sh", "-c", "sync; sleep 60; systemctl poweroff"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except Exception:
+            pass
 
 
 # --- Hardware & security facts (security plan A1) ---------------------------------
@@ -5634,6 +5644,74 @@ def gather_hardware_facts(root=""):
     return f
 
 
+INSTALL_GEN = os.environ.get("TC_INSTALL_GEN", "/etc/thinclient/install-generation")
+KERNEL_BIN = os.environ.get("TC_KERNEL_BIN", "/opt/thinclient/bin/thinclient-kernel")
+
+
+def _install_generation():
+    """How this machine was installed: "encrypted" (Phase B image), "unencrypted-exception"
+    (the named exception for a machine without TPM / Secure Boot), or "plain" (installed
+    before encrypted images existed — reinstall it to protect it)."""
+    try:
+        t = open(INSTALL_GEN).read()
+    except OSError:
+        return "plain"
+    if "encrypted=1" in t:
+        return "encrypted"
+    if "exception=1" in t:
+        return "unencrypted-exception"
+    return "plain"
+
+
+def _kernel_status():
+    """Encrypted machines: which signed kernel runs, and how the last update went."""
+    if _install_generation() != "encrypted" or not os.path.exists(KERNEL_BIN):
+        return None
+    try:
+        r = subprocess.run([KERNEL_BIN, "status"], capture_output=True, text=True, timeout=30)
+        st = json.loads(r.stdout or "{}")
+        return {"running": st.get("running"), "images": len(st.get("images") or []),
+                "trying": st.get("trying"), "failed": st.get("failed") or [], "last": st.get("last")}
+    except Exception:
+        return None
+
+
+def _luks_device():
+    """The partition under /dev/mapper/root (the encrypted root), or None."""
+    try:
+        r = subprocess.run(["cryptsetup", "status", os.environ.get("TC_LUKS_MAPPER", "root")],
+                           capture_output=True, text=True, timeout=20)
+        for ln in (r.stdout or "").splitlines():
+            ln = ln.strip()
+            if ln.startswith("device:"):
+                return ln.split(":", 1)[1].strip() or None
+    except Exception:
+        pass
+    return None
+
+
+def _crypto_erase():
+    """Encrypted disk: destroy EVERY key slot. The running system keeps working on the key
+    already in memory; from the next power-off nothing — no TPM, no password, no
+    recovery key (there is none) — can open this disk again. True when done."""
+    if _install_generation() != "encrypted":
+        return False
+    dev = _luks_device()
+    if not dev:
+        return False
+    try:
+        r = subprocess.run(["cryptsetup", "luksErase", "--batch-mode", dev],
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            print("agent: crypto-erase failed: %s" % (r.stderr or "").strip()[:200], file=sys.stderr)
+            return False
+        d = subprocess.run(["cryptsetup", "luksDump", dev], capture_output=True, text=True, timeout=30).stdout or ""
+        return not re.search(r"^\s+\d+: luks2", d, re.M)          # no key slot left
+    except Exception as e:
+        print("agent: crypto-erase failed: %s" % e, file=sys.stderr)
+        return False
+
+
 def _disk_encrypted():
     try:
         out = subprocess.run(["lsblk", "-rno", "TYPE"], capture_output=True, text=True, timeout=10).stdout
@@ -5648,6 +5726,8 @@ def _refresh_hardware_facts():
         try:
             facts = gather_hardware_facts()
             facts["disk_encrypted"] = _disk_encrypted()
+            facts["install_generation"] = _install_generation()
+            facts["kernel"] = _kernel_status()
             _HW_FACTS.clear(); _HW_FACTS.update(facts)
             _HW_FACTS_AT[0] = time.time()
         except Exception as e:
