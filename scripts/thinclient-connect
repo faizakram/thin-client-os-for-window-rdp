@@ -12,6 +12,7 @@
 #
 #  The FreeRDP argv here is the exact, verified-working command:
 #    xfreerdp3 /v:H:P /u:U [/d:D] /from-stdin:force /f /cert:ignore /sec:S
+#              (/cert:deny instead when the server is pinned — see freerdp_cert_arg)
 #              /clipboard /dynamic-resolution [/scale-desktop:N /scale-device:M]
 #              /sound:sys:pulse /microphone:sys:pulse /log-level:INFO
 #
@@ -94,6 +95,9 @@ def pending_update_version():
 # this window refuses RDP when locked — but ONLY if enforcement is switched on,
 # so an unconfigured/unlicensed appliance behaves exactly as before (fail-safe).
 LICENSE_CONF = os.environ.get("TC_LICENSE_CONF", "/etc/thinclient/license.conf")
+# license.conf is root-only (it holds the device secret); the agent publishes the one
+# switch this screen needs here. Older agents didn't, so license.conf is the fallback.
+LICENSE_PUBLIC = os.environ.get("TC_LICENSE_PUBLIC", "/var/lib/thinclient/license/public.conf")
 LICENSE_STATE = os.environ.get("TC_LICENSE_STATE", "/var/lib/thinclient/license/state")
 LICENSE_ADMIN_LOCK = os.environ.get("TC_LICENSE_ADMIN_LOCK", "/var/lib/thinclient/license/admin-lock")
 WIPED_MARK = os.environ.get("TC_WIPED_MARK", "/var/lib/thinclient/wiped")
@@ -134,7 +138,8 @@ def license_block_reason():
         return "⛔ This device has been reset for security reasons. Contact your administrator."
     if os.path.exists(LICENSE_ADMIN_LOCK):
         return _admin_lock_message()
-    enforce = (_read_kv(LICENSE_CONF).get("LICENSE_ENFORCE", "false") or "false").lower()
+    pub = _read_kv(LICENSE_PUBLIC) if os.path.exists(LICENSE_PUBLIC) else _read_kv(LICENSE_CONF)
+    enforce = (pub.get("LICENSE_ENFORCE", "false") or "false").lower()
     if enforce not in ("true", "1", "yes", "on"):
         return None
     st = _read_kv(LICENSE_STATE)
@@ -400,7 +405,14 @@ def _recv_exact(sock, n):
 
 def rdp_cert_fingerprint(host, port, timeout=5.0):
     """(sha256-hex, None) for the TLS certificate an RDP server presents, or
-    (None, reason). Speaks only the opening of RDP: the same X.224 connection request
+    (None, reason)."""
+    fp, _der, err = rdp_cert(host, port, timeout)
+    return fp, err
+
+
+def rdp_cert(host, port, timeout=5.0):
+    """(sha256-hex, DER, None) for the TLS certificate an RDP server presents, or
+    (None, None, reason). Speaks only the opening of RDP: the same X.224 connection request
     FreeRDP sends (asking for TLS or NLA), then the TLS handshake — and hangs up. No
     credentials are ever sent. Pure standard library."""
     import hashlib, socket, ssl, struct
@@ -415,20 +427,20 @@ def rdp_cert_fingerprint(host, port, timeout=5.0):
             s.sendall(req)
             hdr = _recv_exact(s, 4)
             if hdr[0] != 0x03:
-                return None, "not-rdp"
+                return None, None, "not-rdp"
             body = _recv_exact(s, struct.unpack(">H", hdr[2:4])[0] - 4)
             if len(body) >= 15 and body[7] == 0x03:
-                return None, "negotiation-failed"
+                return None, None, "negotiation-failed"
             if len(body) >= 15 and body[7] == 0x02 and struct.unpack("<I", body[11:15])[0] == 0:
-                return None, "no-tls"          # legacy "RDP security": there is no certificate
+                return None, None, "no-tls"    # legacy "RDP security": there is no certificate
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE    # self-signed is normal for RDP: we PIN, not trust
             with ctx.wrap_socket(s) as t:
                 der = t.getpeercert(binary_form=True)
-            return (hashlib.sha256(der).hexdigest(), None) if der else (None, "no-certificate")
+            return (hashlib.sha256(der).hexdigest(), der, None) if der else (None, None, "no-certificate")
     except (OSError, ssl.SSLError, ValueError) as e:
-        return None, "unreachable" if isinstance(e, (socket.timeout, ConnectionError)) else "tls-error"
+        return None, None, "unreachable" if isinstance(e, (socket.timeout, ConnectionError)) else "tls-error"
 
 
 CERT_SEEN = os.environ.get("TC_CERT_SEEN", "/run/thinclient/cert-seen.json")
@@ -465,10 +477,9 @@ def server_identity_decision(host, port):
     server whose certificate does not match the one the manager learned for it, and
     one whose identity could not be checked at all.
 
-    Known limit: FreeRDP opens its own connection a moment later with /cert:ignore,
-    and reconnects mid-session the same way. An attacker able to let this check pass
-    and intercept only FreeRDP's connection is not stopped here; one who sits on the
-    path — the normal case — intercepts this check too, and is."""
+    In ENFORCE mode a server that matches its pin also has that exact certificate
+    handed to FreeRDP (freerdp_cert_arg), so FreeRDP's own connection — and every
+    reconnect mid-session — is held to it too, not just this check."""
     sp = secpolicy()
     if not sp:
         return "allow"
@@ -478,7 +489,7 @@ def server_identity_decision(host, port):
         return "allow"
     if policy["cert_pin"] == "off":
         return "allow"
-    fp, err = rdp_cert_fingerprint(host, port)
+    fp, der, err = rdp_cert(host, port)
     if fp is None:
         record_cert(host, port, None, "unverified", err)
         if policy["cert_pin"] == "enforce":
@@ -490,7 +501,47 @@ def server_identity_decision(host, port):
     if decision == "refuse":
         return ("This server is not the one your device knows, so your password was not sent. "
                 "Your administrator has been notified.")
+    if policy["cert_pin"] == "enforce" and decision == "allow" and seed_freerdp_store(host, port, der):
+        _CERT_HELD.add(_store_key(host, port))
     return "allow"
+
+
+# FreeRDP keeps the certificates it trusts as PEM files named "<host>_<port>.pem", the
+# host lower-cased, under ~/.config/freerdp/server (checked against FreeRDP 3.15.0).
+# With /cert:deny it accepts ONLY the certificate stored there and aborts on anything
+# else ("certificate not trusted, aborting") — at once, without prompting.
+FREERDP_STORE = os.environ.get("TC_FREERDP_STORE",
+                               os.path.expanduser("~/.config/freerdp/server"))
+_CERT_HELD = set()      # "host_port" pinned + seeded for THIS connect
+
+
+def _store_key(host, port):
+    return "%s_%s" % ((host or "").strip().lower(), int(port or 3389))
+
+
+def seed_freerdp_store(host, port, der):
+    """Write the certificate that just matched its pin where FreeRDP looks for it.
+    True only if it is in place; on any failure the caller keeps today's flags."""
+    import ssl
+    if not der:
+        return False
+    try:
+        os.makedirs(FREERDP_STORE, mode=0o700, exist_ok=True)
+        path = os.path.join(FREERDP_STORE, _store_key(host, port) + ".pem")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(ssl.DER_cert_to_PEM_cert(der))
+        os.replace(tmp, path)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def freerdp_cert_arg(host, port):
+    """/cert:deny when this server was pinned and its certificate handed to FreeRDP —
+    FreeRDP then refuses any other certificate, on reconnects too. Otherwise exactly
+    what it has always been."""
+    return "/cert:deny" if _store_key(host, port) in _CERT_HELD else "/cert:ignore"
 
 
 def clipboard_allowed():
@@ -1274,7 +1325,7 @@ class Connect(Gtk.Window):
         argv = [self.rdp, "/v:%s:%s" % (host, port), "/u:%s" % user]
         if dom:
             argv.append("/d:%s" % dom)
-        argv += ["/from-stdin:force", "/f", "/cert:ignore", "/sec:%s" % sec,
+        argv += ["/from-stdin:force", "/f", freerdp_cert_arg(host, port), "/sec:%s" % sec,
                  # Copy/paste with Windows: on unless the tenant turned it off (an
                  # operator copying customer data out of the session). "-clipboard"
                  # verified against FreeRDP 3.15.0, the version the devices run.
@@ -1351,6 +1402,7 @@ class Connect(Gtk.Window):
         # Is this really OUR server? Checked before the password leaves the device.
         # With pinning off (the default until the manager turns it on) this returns at
         # once without any network traffic.
+        _CERT_HELD.clear()
         verdict = server_identity_decision(host, port)
         if verdict != "allow":
             self.msg(Gtk.MessageType.ERROR, "Can’t connect safely", verdict, retry=True)

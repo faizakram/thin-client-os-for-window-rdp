@@ -15,8 +15,9 @@ A password box appears. Enter the administrator password. On success you get the
 **Maintenance menu**; on failure you're silently returned to the session. Five
 wrong attempts trigger a temporary lockout.
 
-> Default admin password out of the box: **`changeme`** — change it before
-> deployment (see below).
+> Out of the box every device shares the factory password from your service
+> provider. Set your account's own in the manager (account page → **Admin Mode
+> password**); each device picks it up at its next check-in.
 
 The RDP window stays running underneath; closing the menu returns focus to it.
 The Linux desktop is never shown.

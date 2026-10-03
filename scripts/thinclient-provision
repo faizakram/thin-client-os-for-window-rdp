@@ -48,7 +48,7 @@ apply() { # <path to activation file>
   set_key TENANT_TOKEN    "$ttoken"
   [ -n "$url" ] && set_key CONTROL_URL "$url"
   set_key LICENSE_ENFORCE "${enforce:-true}"
-  chmod 0644 "$LICENSE_CONF" 2>/dev/null || true
+  chmod 0600 "$LICENSE_CONF" 2>/dev/null || true   # holds the device secret: root only
   log "activated from ${src} (${ttoken:+tenant token}${code:+enroll_code=$code})"
   systemctl restart thinclient-agent.service 2>/dev/null || true
   return 0

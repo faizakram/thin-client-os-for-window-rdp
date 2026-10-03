@@ -21,7 +21,7 @@
 #    thinclient-agent verify <token_file> <pubkey> [device_id] [now] [grace]
 #                                                     # verify+classify (testing)
 # =============================================================================
-import base64, datetime, glob, hashlib, json, math, os, shutil, subprocess, sys, tempfile, threading, time
+import base64, datetime, glob, hashlib, json, math, os, re, shutil, subprocess, sys, tempfile, threading, time
 
 GRACE_DEFAULT = 3 * 86400            # 3 days after exp before hard-lock
 # Shared runtime signals (created world-writable at boot via tmpfiles.d):
@@ -50,6 +50,11 @@ PUBKEY = os.environ.get("TC_LICENSE_PUBKEY", "/etc/thinclient/license-pubkey.pem
 TOKEN_CACHE = os.path.join(STATE_DIR, "token")
 STATE_FILE = os.path.join(STATE_DIR, "state")
 CONF = os.environ.get("TC_LICENSE_CONF", "/etc/thinclient/license.conf")
+# license.conf holds this device's secret (and the fleet enrolment token), so it is
+# readable by root only. The connect screen runs as the operator and needs just one
+# harmless switch from it; the agent copies that, and nothing else, to this file.
+LICENSE_PUBLIC = os.environ.get("TC_LICENSE_PUBLIC", os.path.join(STATE_DIR, "public.conf"))
+_PUBLIC_KEYS = ("LICENSE_ENFORCE",)
 
 
 def _b64u_decode(s: str) -> bytes:
@@ -124,7 +129,36 @@ def _conf_all() -> dict:
             pass
         _CONF_CACHE["mtime"] = mtime
         _CONF_CACHE["data"] = data
+        # Whoever just wrote it (installer, activation file, this agent), it is made
+        # root-only again here — every change passes through this read within a poll.
+        _protect_license_conf(data)
     return _CONF_CACHE["data"]
+
+
+def _protect_license_conf(data):
+    """license.conf -> 0600, and the operator-readable copy of its public keys."""
+    if os.geteuid() != 0 and not os.environ.get("TC_LICENSE_PUBLIC"):
+        return                                   # not the service: leave files alone
+    try:
+        os.chmod(CONF, 0o600)
+    except OSError:
+        pass
+    try:
+        body = "".join("%s=%s\n" % (k, data.get(k, "")) for k in _PUBLIC_KEYS if k in data)
+        try:
+            with open(LICENSE_PUBLIC) as f:
+                if f.read() == body:
+                    return
+        except OSError:
+            pass
+        os.makedirs(os.path.dirname(LICENSE_PUBLIC), exist_ok=True)
+        tmp = LICENSE_PUBLIC + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(body)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, LICENSE_PUBLIC)
+    except OSError:
+        pass
 
 
 def conf_get(key: str, default: str = "") -> str:
@@ -176,9 +210,10 @@ def _set_conf_key(key: str, value: str):
                 out.append(ln)
         if not found:
             out.append("%s=%s\n" % (key, value))
-        with open(CONF, "w") as f:
+        fd = os.open(CONF, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
             f.writelines(out)
-        os.chmod(CONF, 0o644)
+        os.chmod(CONF, 0o600)                   # holds the device secret: root only
     except OSError:
         pass
 
@@ -5001,6 +5036,8 @@ def cmd_poll() -> int:
     # Security policy: saved for the lock screen / connect window to read, and the
     # manager's clock noted so password expiry cannot be beaten by winding the clock back.
     _apply_security_policy(resp.get("security"), resp.get("server_ms"))
+    # The account's Admin Mode password (as a hash), when the manager has one set.
+    _apply_admin_hash(resp.get("admin_mode_hash"))
     # Support chat: deliver admin replies + send the operator's queued messages.
     _chat_sync(base, dict(creds), resp.get("chat", []), resp.get("chat_reactions"))
     # Prune the local chat log to the tenant's retention (throttled ~6h) so the
@@ -5175,8 +5212,8 @@ _MEM_HARDEN_LOCK = threading.Lock()
 
 
 def cmdline_with(line, enable):
-    """GRUB_CMDLINE_LINUX_DEFAULT="..." with our parameters added or removed, and
-    everything else on it left exactly as it was."""
+    """GRUB_CMDLINE_LINUX="..." with our parameters added or removed, and everything
+    else on it left exactly as it was."""
     key, _, rest = line.partition("=")
     val = rest.strip().strip('"')
     words = [w for w in val.split() if w not in MEM_HARDEN_PARAMS]
@@ -5186,14 +5223,20 @@ def cmdline_with(line, enable):
 
 
 def _grub_default_rewritten(text, enable):
+    """The parameters go on GRUB_CMDLINE_LINUX, which EVERY boot entry uses. The
+    _DEFAULT line is skipped by the recovery entry — found by running the real
+    grub-mkconfig: hardening there would leave "Advanced options > recovery mode"
+    booting without it. Never left on _DEFAULT either."""
     out, seen = [], False
     for ln in text.splitlines():
-        if ln.startswith("GRUB_CMDLINE_LINUX_DEFAULT="):
+        if ln.startswith("GRUB_CMDLINE_LINUX="):
             out.append(cmdline_with(ln, enable)); seen = True
+        elif ln.startswith("GRUB_CMDLINE_LINUX_DEFAULT="):
+            out.append(cmdline_with(ln, False))
         else:
             out.append(ln)
     if not seen:
-        out.append(cmdline_with('GRUB_CMDLINE_LINUX_DEFAULT=""', enable))
+        out.append(cmdline_with('GRUB_CMDLINE_LINUX=""', enable))
     return "\n".join(out) + "\n"
 
 
@@ -5218,8 +5261,11 @@ def _apply_kernel_params(enable):
             f.write(new)
         r = subprocess.run(["grub-mkconfig", "-o", staged], capture_output=True, text=True, timeout=180)
         cfg = open(staged).read() if os.path.exists(staged) else ""
-        good = r.returncode == 0 and "linux" in cfg and \
-            (all(p in cfg for p in MEM_HARDEN_PARAMS) if enable else "init_on_free=1" not in cfg)
+        # EVERY boot entry, the recovery one included — not just "somewhere in the file".
+        entries = [l for l in cfg.splitlines() if l.strip().startswith("linux")]
+        good = r.returncode == 0 and bool(entries) and (
+            all(all(p in l for p in MEM_HARDEN_PARAMS) for l in entries) if enable
+            else not any("init_on_free=1" in l for l in entries))
         if not good:
             raise RuntimeError("grub-mkconfig rc=%s %s" % (r.returncode, (r.stderr or "")[-300:]))
         if os.path.exists(GRUB_CFG):
@@ -5658,17 +5704,62 @@ def _reconcile_lockout(manager_locked, lockout_ack):
 
 # Admin Mode (Ctrl+Alt+Shift+A) ships with a default password that is documented in the
 # public source. Anyone at the keyboard who knows it can repoint the device at another
-# RDP server or run the installer. Report-only here: which devices still have it.
-ADMIN_CONF = "/etc/thinclient/admin.conf"
+# RDP server or run the installer. The account sets its own from the manager, sent as a
+# hash (_apply_admin_hash); the report says which devices still have the factory one.
+ADMIN_CONF = os.environ.get("TC_ADMIN_CONF", "/etc/thinclient/admin.conf")
 _DEFAULT_ADMIN_HASH = ("$6$thinclient00$5UHjCgA9QSMdPfMykia8Q1Inye73MoramQDVWYJYjowv/"
                        "v2EkMKT9FL7X6GlQ.bKRX3tq9e7Ecpky.ofVp.uz.")
 
 
-def _admin_password_report():
+_ADMIN_HASH_RE = re.compile(r"^\$6\$(rounds=\d{4,9}\$)?[./0-9A-Za-z]{1,16}\$[./0-9A-Za-z]{86}$")
+_ADMIN_HASH_MANAGED = {"hash": None}      # the last hash the manager sent
+
+
+def _current_admin_hash():
     for ln in _read(ADMIN_CONF).splitlines():
         if ln.startswith("ADMIN_PASSWORD_HASH="):
-            return {"admin_password_default": ln.split("=", 1)[1].strip() == _DEFAULT_ADMIN_HASH}
-    return {"admin_password_default": None}
+            return ln.split("=", 1)[1].strip()
+    return None
+
+
+def _apply_admin_hash(h):
+    """Install the account's Admin Mode password hash from the manager, replacing the
+    factory one. Only a well-formed SHA-512 crypt hash is accepted; nothing else in
+    admin.conf is touched. No hash sent = leave the device exactly as it is."""
+    if not isinstance(h, str) or not _ADMIN_HASH_RE.match(h):
+        return False
+    _ADMIN_HASH_MANAGED["hash"] = h
+    if _current_admin_hash() == h:
+        return False
+    try:
+        lines = _read(ADMIN_CONF).splitlines(True)
+        out, found = [], False
+        for ln in lines:
+            if ln.startswith("ADMIN_PASSWORD_HASH="):
+                out.append("ADMIN_PASSWORD_HASH=%s\n" % h); found = True
+            else:
+                out.append(ln)
+        if not found:
+            out.append("ADMIN_PASSWORD_HASH=%s\n" % h)
+        tmp = ADMIN_CONF + ".tc-new"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.writelines(out)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, ADMIN_CONF)
+        print("agent: Admin Mode password updated from the manager", file=sys.stderr)
+        return True
+    except OSError as e:
+        print("agent: could not update the Admin Mode password: %s" % e, file=sys.stderr)
+        return False
+
+
+def _admin_password_report():
+    cur = _current_admin_hash()
+    if cur is None:
+        return {"admin_password_default": None}
+    return {"admin_password_default": cur == _DEFAULT_ADMIN_HASH,
+            "admin_password_managed": bool(_ADMIN_HASH_MANAGED["hash"]) and cur == _ADMIN_HASH_MANAGED["hash"]}
 
 
 def _mem_harden_report():

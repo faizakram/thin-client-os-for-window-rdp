@@ -58,8 +58,8 @@ sudo dd if=iso/thinclient.iso of=/dev/rdiskN bs=4m
 Or use balenaEtcher / Rufus (write in **DD/image** mode, not ISO mode).
 
 Boot the target from USB. It comes straight up into the RDP session. If you did
-not bake the server in, open Admin Mode (**Ctrl+Alt+Shift+A**, default password
-`changeme`) → **Configure** and set it.
+not bake the server in, open Admin Mode (**Ctrl+Alt+Shift+A**, factory password
+from your service provider) → **Configure** and set it.
 
 ## 4. Install to the internal disk
 

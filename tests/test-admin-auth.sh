@@ -58,5 +58,16 @@ noncomment="$(grep -vE '^[[:space:]]*#' "$TC_ADMIN_CONF")"
 assert_not_contains "$noncomment" "changeme" "no plaintext password in active config lines"
 assert_contains "$noncomment" 'ADMIN_PASSWORD_HASH=$6$' "password is stored as a SHA-512 crypt hash"
 
+echo "== a hash set from the manager (200 000 rounds) =="
+# Produced by OpenSSL 3.5 (and, byte for byte, by the manager's sha512-crypt).
+MGR_HASH='$6$rounds=200000$abcdefgh$LAoWissqmBviGGtmvhh33m3MI1AfMMQHAECnFb9znI067jygZFqUd6pe.wRlo//vcWImERwkjPfr1l5tPjbsY0'
+sed -i.bak "s|^ADMIN_PASSWORD_HASH=.*|ADMIN_PASSWORD_HASH=${MGR_HASH}|" "$TC_ADMIN_CONF" && rm -f "$TC_ADMIN_CONF.bak"
+out="$(check_pw Pw-Test-1)"; rc=$?
+assert_eq "OK" "$out" "manager-set password (rounds=…) is accepted"
+out="$(check_pw changeme)"
+assert_eq "FAIL" "$out" "the factory password no longer works once replaced"
+out="$(check_pw Pw-Test-2)"
+assert_eq "FAIL" "$out" "a wrong password is still refused"
+
 rm -rf "$TC_LOG_DIR" "$WORK"
 finish_suite

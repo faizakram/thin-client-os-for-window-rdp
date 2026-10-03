@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       bash \
       shellcheck \
       freerdp3-x11 \
+      xvfb \
       openssl \
       whois \
       netcat-openbsd \

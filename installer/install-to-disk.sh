@@ -594,6 +594,8 @@ TCONF="$TARGET_MNT/etc/thinclient/license.conf"
 HAVE_CODE="$(sed -n 's/^ENROLL_CODE=//p'   "$TCONF" 2>/dev/null | head -1 | tr -d '\r')"
 HAVE_SEC="$(sed -n 's/^DEVICE_SECRET=//p' "$TCONF" 2>/dev/null | head -1 | tr -d '\r')"
 HAVE_TOK="$(sed -n 's/^TENANT_TOKEN=//p'  "$TCONF" 2>/dev/null | head -1 | tr -d '\r')"
+# It holds the device secret: root only on the installed system (the agent keeps it so).
+chmod 0600 "$TCONF" 2>/dev/null || true
 
 if [[ -n "$HAVE_CODE" && -n "$HAVE_SEC" ]]; then
   ok "Activation verified — this device will appear in the manager on first boot"

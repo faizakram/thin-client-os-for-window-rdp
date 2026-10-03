@@ -18,7 +18,7 @@ def check(name, cond):
 ORIG = ('GRUB_DEFAULT=0\nGRUB_TIMEOUT=1\n'
         'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash loglevel=0 usbcore.autosuspend=-1"\n'
         'GRUB_CMDLINE_LINUX=""\n')
-WORKING_CFG = "menuentry 'ThinClient' { linux /vmlinuz root=/dev/sda2 quiet splash }\n"
+WORKING_CFG = "menuentry 'ThinClient' {\n\tlinux /vmlinuz root=/dev/sda2 quiet splash\n}\n"
 
 print("== the parameter line ==")
 line = 'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash usbcore.autosuspend=-1"'
@@ -46,9 +46,14 @@ def fake_run(result):
         calls.append(argv)
         if argv[0] == "grub-mkconfig":
             out = argv[argv.index("-o") + 1]
-            params = open(m.GRUB_DEFAULT).read().split('LINUX_DEFAULT="')[1].split('"')[0]
+            # Like the real one: normal entries get GRUB_CMDLINE_LINUX + _DEFAULT,
+            # the recovery entry GRUB_CMDLINE_LINUX alone.
+            g = open(m.GRUB_DEFAULT).read()
+            val = lambda k: (g.split('\n%s="' % k)[1].split('"')[0] if '\n%s="' % k in "\n" + g else "")
+            params = (val("GRUB_CMDLINE_LINUX") + " " + val("GRUB_CMDLINE_LINUX_DEFAULT")).strip()
+            rec = "menuentry 'ThinClient (recovery mode)' {\n\tlinux /vmlinuz root=/dev/sda2 %s single\n}\n" % val("GRUB_CMDLINE_LINUX")
             if result == "ok":
-                open(out, "w").write("menuentry 'ThinClient' { linux /vmlinuz root=/dev/sda2 %s }\n" % params)
+                open(out, "w").write("menuentry 'ThinClient' {\n\tlinux /vmlinuz root=/dev/sda2 %s\n}\n" % params + rec)
                 return types.SimpleNamespace(returncode=0, stderr="")
             if result == "garbage":
                 open(out, "w").write("")              # "succeeds" but writes nothing usable
@@ -56,6 +61,14 @@ def fake_run(result):
             return types.SimpleNamespace(returncode=1, stderr="grub-probe: error")
         return types.SimpleNamespace(returncode=0, stderr="")
     return run
+
+line2 = 'GRUB_CMDLINE_LINUX=""'
+check("they go on GRUB_CMDLINE_LINUX (every entry), never _DEFAULT",
+      all(p in m._grub_default_rewritten(ORIG, True).split('GRUB_CMDLINE_LINUX="')[1].split('"')[0]
+          for p in m.MEM_HARDEN_PARAMS)
+      and "init_on_free" not in m._grub_default_rewritten(ORIG, True).split('LINUX_DEFAULT="')[1].split('"')[0])
+check("switching off restores the installer's file exactly", m._grub_default_rewritten(
+      m._grub_default_rewritten(ORIG, True), False) == ORIG)
 
 print("== success: hardened from the next restart ==")
 d = sandbox(); m.subprocess.run = fake_run("ok")

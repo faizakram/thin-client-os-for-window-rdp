@@ -34,12 +34,15 @@ _verify_password() {
   [[ -n "$hash" ]] || { log_error "No ADMIN_PASSWORD_HASH configured"; return 3; }
   IFS= read -r candidate || true
 
-  # Extract "$6$salt$" prefix and recompute with the same salt.
-  salt="$(printf '%s' "$hash" | awk -F'\\$' '{print "$"$2"$"$3"$"}')"
+  # Recompute with the same salt. The salt spec is everything between "$6$" and the
+  # last "$": "salt", or "rounds=N$salt" for a manager-set hash (200 000 rounds).
+  salt="${hash#\$6\$}"; salt="${salt%\$*}"
   if command -v openssl >/dev/null 2>&1; then
-    computed="$(printf '%s' "$candidate" | openssl passwd -6 -salt "$(printf '%s' "$hash" | cut -d'$' -f3)" -stdin 2>/dev/null)"
+    computed="$(printf '%s' "$candidate" | openssl passwd -6 -salt "$salt" -stdin 2>/dev/null)"
   elif command -v mkpasswd >/dev/null 2>&1; then
-    computed="$(printf '%s' "$candidate" | mkpasswd -m sha-512 -S "$(printf '%s' "$hash" | cut -d'$' -f3)" -s 2>/dev/null)"
+    local rounds=() bare="$salt"
+    if [[ "$salt" == rounds=*'$'* ]]; then rounds=(-R "${salt%%\$*}"); rounds[1]="${rounds[1]#rounds=}"; bare="${salt#*\$}"; fi
+    computed="$(printf '%s' "$candidate" | mkpasswd -m sha-512 "${rounds[@]}" -S "$bare" -s 2>/dev/null)"
   else
     log_error "Neither openssl nor mkpasswd available for password check"; return 3
   fi
