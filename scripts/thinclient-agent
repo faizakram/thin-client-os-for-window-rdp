@@ -796,6 +796,18 @@ def _collect_logs_tar():
     _run("prev-boot.txt", ["journalctl", "-b", "-1", "--no-pager", "-n", "6000"])
     _run("prev-boot-kernel.txt", ["journalctl", "-b", "-1", "-k", "--no-pager"])
     _run("capture-procs.txt", ["pgrep", "-a", "-f", "xfreerdp|ffmpeg|Xorg|thinclient|wireplumber|pipewire"])
+    # --- Why the DISPLAY never comes up -------------------------------------------
+    # A machine can be online, enrolled and healthy while its screen stays black: X
+    # hangs before it is ready, LightDM waits for it, the kiosk never starts. None of
+    # that reaches the journal — it is in X's and LightDM's own logs. On an encrypted
+    # machine these logs are the ONLY way to see it (its disk can't be read elsewhere).
+    _run("display-logs.txt", ["sh", "-c",
+         "for f in /var/log/Xorg.0.log /var/log/Xorg.0.log.old /var/log/lightdm/lightdm.log "
+         "/var/log/lightdm/x-0.log /var/log/lightdm/seat0-greeter.log /home/thinclient/.xsession-errors; do "
+         "echo \"===== $f\"; tail -n 150 \"$f\" 2>&1; done; "
+         "echo '===== loginctl'; loginctl list-sessions --no-legend 2>&1; "
+         "echo '===== plymouth'; plymouth --ping 2>&1 && echo 'plymouth RUNNING' || echo 'plymouth not running'; "
+         "echo '===== lightdm unit'; systemctl status lightdm --no-pager -n 30 2>&1 | head -60"])
     # --- Why a capture input will not deliver -------------------------------------
     # A camera or microphone that ENUMERATES but never produces frames leaves no error
     # anywhere: ffmpeg just blocks, its stderr stays empty, and from outside it is
@@ -5337,6 +5349,15 @@ def apply_mem_harden(enable):
 _USB_BLOCK_CONF = "/etc/modprobe.d/thinclient-no-usb-storage.conf"
 
 
+def boot_transport_from_lsblk(out):
+    """`lsblk -nsP -o NAME,TYPE,TRAN <root source>` -> the physical disk's transport."""
+    for ln in (out or "").splitlines():
+        kv = dict(re.findall(r'(\w+)="([^"]*)"', ln))
+        if kv.get("TYPE") == "disk":
+            return kv.get("TRAN") or None
+    return None
+
+
 def _boot_disk_transport():
     """'usb', 'sata', 'nvme', ... for the disk holding /, or None if unknown."""
     try:
@@ -5344,12 +5365,12 @@ def _boot_disk_transport():
                              text=True, timeout=10).stdout.strip()
         if not src.startswith("/dev/"):
             return None
-        parent = subprocess.run(["lsblk", "-no", "PKNAME", src], capture_output=True,
-                                text=True, timeout=10).stdout.strip().splitlines()
-        disk = "/dev/" + (parent[0].strip() if parent and parent[0].strip() else os.path.basename(src))
-        tran = subprocess.run(["lsblk", "-dno", "TRAN", disk], capture_output=True,
-                              text=True, timeout=10).stdout.strip()
-        return tran or None
+        # Walk DOWN to the physical disk: on an encrypted install / is /dev/mapper/root
+        # on a LUKS partition, whose parent is a PARTITION with no transport of its own —
+        # which read as "unknown" and left USB storage unblocked ("boots from a USB disk").
+        out = subprocess.run(["lsblk", "-nsP", "-o", "NAME,TYPE,TRAN", src], capture_output=True,
+                             text=True, timeout=10).stdout
+        return boot_transport_from_lsblk(out)
     except Exception:
         return None
 
@@ -5590,6 +5611,13 @@ def gather_hardware_facts(root=""):
     sb = _read(efi + "/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-e0f84a3cb4bd", None) \
         if f["uefi"] else None
     f["secure_boot"] = (len(sb) >= 5 and ord(sb[4]) == 1) if sb else (False if f["uefi"] else None)
+    # The kernel decides Secure Boot at boot and says so. That statement wins: two
+    # machines with Secure Boot ACTIVE (one real, one VM) reported the variable read as
+    # off, and the kernel line is what lockdown and module signing actually act on.
+    if "secureboot: Secure boot enabled" in klog:
+        f["secure_boot"] = True
+    elif "secureboot: Secure boot disabled" in klog and f["uefi"]:
+        f["secure_boot"] = False
     f["mor_supported"] = os.path.exists(
         efi + "/efivars/MemoryOverwriteRequestControl-e20939be-32d4-41be-a150-897f85d49829")
     cmdline = _read(root + "/proc/cmdline")

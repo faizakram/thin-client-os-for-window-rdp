@@ -76,4 +76,13 @@ agent.apply_usb_storage_block(True)
 check("turning it off removes the block", agent.apply_usb_storage_block(False) == "allowed"
       and not os.path.exists(agent._USB_BLOCK_CONF))
 
+print("== which disk do we boot from (USB block safety) ==")
+enc = 'NAME="root" TYPE="crypt" TRAN=""\nNAME="nvme0n1p2" TYPE="part" TRAN=""\nNAME="nvme0n1" TYPE="disk" TRAN="nvme"\n'
+check("encrypted root: seen through LUKS to the NVMe disk", agent.boot_transport_from_lsblk(enc) == "nvme")
+plain = 'NAME="sda2" TYPE="part" TRAN=""\nNAME="sda" TYPE="disk" TRAN="sata"\n'
+check("plain root on SATA", agent.boot_transport_from_lsblk(plain) == "sata")
+usb = 'NAME="sdb2" TYPE="part" TRAN=""\nNAME="sdb" TYPE="disk" TRAN="usb"\n'
+check("a USB boot disk is still recognised (and stays unblocked)", agent.boot_transport_from_lsblk(usb) == "usb")
+check("nothing recognisable -> unknown", agent.boot_transport_from_lsblk("") is None)
+
 print("\n  %d passed" % ok)
