@@ -70,6 +70,8 @@ banner "test-hostname"
 if python3 "$HERE/test-hostname.py"; then :; else fail_total=$((fail_total+1)); fi
 banner "test-admin-hash"
 if python3 "$HERE/test-admin-hash.py"; then :; else fail_total=$((fail_total+1)); fi
+banner "test-os-patch"
+if python3 "$HERE/test-os-patch.py"; then :; else fail_total=$((fail_total+1)); fi
 banner "test-license-perms"
 if python3 "$HERE/test-license-perms.py"; then :; else fail_total=$((fail_total+1)); fi
 

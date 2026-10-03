@@ -41,6 +41,9 @@ DEFAULTS = {
     "mem_harden": False,
     "usb_storage_block": False,
     "clipboard": True,               # today: always shared with Windows
+    # Debian security updates for the OS underneath (thinclient-ospatch): downloaded in
+    # the background, installed at the next boot before the kiosk. Off = never touched.
+    "os_updates": False,
 }
 
 DEFAULT_LOCK_PW = "0000"             # the factory password; never acceptable under a policy
@@ -91,7 +94,7 @@ def normalise(raw):
     lo = p["lockout"]
     lo["enabled"] = bool(lo.get("enabled"))
     lo["attempts"] = _clamp(lo.get("attempts"), 3, 10, 3)
-    for k in ("mem_harden", "usb_storage_block", "clipboard"):
+    for k in ("mem_harden", "usb_storage_block", "clipboard", "os_updates"):
         p[k] = bool(p.get(k))
     return p
 

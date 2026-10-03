@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+# =============================================================================
+#  ThinClient OS — operating-system security updates (security plan G2)
+#  Installed to: /opt/thinclient/bin/thinclient-ospatch      (runs as root)
+#
+#  Our OTA replaces ThinClient's own scripts; nothing ever patched the Debian
+#  underneath (kernel, FreeRDP, OpenSSL...). This does, in two halves, so a package
+#  is never replaced under a running session:
+#
+#    check | download | stage    while the device runs (the agent drives these, from
+#                                a background thread every few hours): Debian SECURITY
+#                                updates only, bandwidth-capped, downloaded but NOT
+#                                installed. "stage" names the exact versions the
+#                                manager approved (canary machines approve them by
+#                                installing them first).
+#    apply                       at the next boot, BEFORE the kiosk starts
+#                                (thinclient-os-patch.service): nothing is running
+#                                that a package could be replaced under. Installs the
+#                                staged versions only, keeps our config files, checks
+#                                FreeRDP and Python still work, and restarts once if
+#                                the kernel, libc or systemd changed.
+#
+#  A power cut halfway through is repaired at the following boot (dpkg --configure -a)
+#  before anything else. Every path here is overridable by environment for the tests.
+# =============================================================================
+import json, os, re, subprocess, sys, time
+
+STATE_DIR = os.environ.get("TC_OSPATCH_DIR", "/var/lib/thinclient/os-update")
+LISTS = os.path.join(STATE_DIR, "lists")
+PARTS = os.path.join(STATE_DIR, "sources.list.d")      # deliberately empty
+SOURCE_LIST = os.path.join(STATE_DIR, "security.list")
+STATE = os.path.join(STATE_DIR, "state.json")         # last check / download
+STAGE = os.path.join(STATE_DIR, "stage.json")         # what the next boot installs
+RESULT = os.path.join(STATE_DIR, "result.json")       # what the last boot installed
+OS_RELEASE = os.environ.get("TC_OS_RELEASE", "/etc/os-release")
+MIRROR = os.environ.get("TC_OSPATCH_MIRROR", "http://security.debian.org/debian-security")
+DL_LIMIT_KBPS = os.environ.get("TC_OSPATCH_DL_LIMIT", "400")   # never starve the RDP session
+APT_TIMEOUT = int(os.environ.get("TC_OSPATCH_TIMEOUT", "1200"))
+NO_REBOOT = os.environ.get("TC_OSPATCH_NOREBOOT") == "1"
+# A change to any of these is only real after a restart.
+REBOOT_PKGS = re.compile(r"^(linux-image-|libc6$|systemd$|libsystemd0$|dbus$)")
+
+
+def _now():
+    return int(time.time())
+
+
+def _read(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def _write(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def codename():
+    try:
+        for ln in open(OS_RELEASE):
+            if ln.startswith("VERSION_CODENAME="):
+                return ln.split("=", 1)[1].strip().strip('"') or None
+    except OSError:
+        pass
+    return None
+
+
+def ensure_sources():
+    """Our own list with ONE source: <codename>-security. Kept apart from the device's
+    own apt configuration (lists in our own directory), so a device whose sources were
+    edited — or never set — patches the same way as every other."""
+    cn = codename()
+    if not cn:
+        raise RuntimeError("unknown Debian release (no VERSION_CODENAME)")
+    os.makedirs(os.path.join(LISTS, "partial"), exist_ok=True)
+    os.makedirs(PARTS, exist_ok=True)
+    body = "deb %s %s-security main contrib non-free non-free-firmware\n" % (MIRROR, cn)
+    try:
+        if open(SOURCE_LIST).read() == body:
+            return
+    except OSError:
+        pass
+    with open(SOURCE_LIST, "w") as f:
+        f.write(body)
+
+
+def apt_opts(download=False):
+    o = ["-o", "Dir::Etc::SourceList=%s" % SOURCE_LIST,
+         "-o", "Dir::Etc::SourceParts=%s" % PARTS,
+         "-o", "Dir::State::Lists=%s" % LISTS,
+         "-o", "APT::Install-Recommends=false",
+         "-o", "APT::Get::List-Cleanup=false",
+         "-o", "Acquire::Retries=3",
+         "-o", "Dpkg::Options::=--force-confdef",
+         "-o", "Dpkg::Options::=--force-confold",     # OUR config files win, never a prompt
+         "-o", "Dpkg::Use-Pty=0"]
+    if download:
+        o += ["-o", "Acquire::http::Dl-Limit=%s" % DL_LIMIT_KBPS]
+    return o
+
+
+def apt(args, download=False, timeout=APT_TIMEOUT):
+    env = dict(os.environ, DEBIAN_FRONTEND="noninteractive", APT_LISTCHANGES_FRONTEND="none",
+               NEEDRESTART_MODE="l")
+    cmd = ["nice", "-n", "10", "ionice", "-c", "3", "apt-get"] + apt_opts(download) + args
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+
+
+_INST = re.compile(r"^Inst (\S+) (?:\[[^\]]*\] )?\((\S+)")
+
+
+def parse_simulation(out):
+    """'Inst libssl3t64 [3.5.1-1] (3.5.1-1+deb13u1 Debian-Security:13/stable-security [amd64])'
+    -> ['libssl3t64=3.5.1-1+deb13u1']. New packages (a new kernel) have no [old] part."""
+    pkgs = []
+    for ln in out.splitlines():
+        m = _INST.match(ln.strip())
+        if m:
+            pkgs.append("%s=%s" % (m.group(1), m.group(2)))
+    return sorted(set(pkgs))
+
+
+def _err(r):
+    """The last meaningful line apt printed — what an admin needs to see."""
+    lines = [l for l in ((r.stderr or "") + "\n" + (r.stdout or "")).splitlines() if l.strip()]
+    return (lines[-1] if lines else "rc=%s" % r.returncode)[:300]
+
+
+def cmd_check():
+    """Refresh the security index and list what would be upgraded. Installs nothing."""
+    st = _read(STATE, {}) or {}
+    st["checked_at"] = _now()
+    try:
+        ensure_sources()
+        # apt update exits 0 when a source can't be reached — it warns and quietly keeps
+        # the OLD index, so an unreachable mirror would look like "nothing to install".
+        # --error-on=any makes that a failure; the warning is checked too, belt and braces.
+        r = apt(["update", "-q", "--error-on=any"], download=True)
+        if r.returncode != 0 or "Failed to fetch" in (r.stderr or "") + (r.stdout or ""):
+            raise RuntimeError("apt update: " + _err(r))
+        r = apt(["-s", "-q", "upgrade", "--with-new-pkgs"])
+        if r.returncode != 0:
+            raise RuntimeError("apt simulate: " + _err(r))
+        st["pending"] = parse_simulation(r.stdout)
+        st["error"] = None
+    except Exception as e:
+        st["error"] = str(e)[:300]
+    _write(STATE, st)
+    print(json.dumps({"pending": st.get("pending", []), "error": st["error"]}))
+    return 0 if not st["error"] else 1
+
+
+def cmd_download():
+    """Fetch the pending packages into apt's cache. Still installs nothing."""
+    st = _read(STATE, {}) or {}
+    try:
+        ensure_sources()
+        r = apt(["-d", "-y", "-q", "upgrade", "--with-new-pkgs"], download=True)
+        if r.returncode != 0:
+            raise RuntimeError("apt download: " + _err(r))
+        st["downloaded_at"] = _now()
+        st["error"] = None
+    except Exception as e:
+        st["error"] = str(e)[:300]
+    _write(STATE, st)
+    print(json.dumps({"downloaded": not st["error"], "error": st["error"]}))
+    return 0 if not st["error"] else 1
+
+
+_PKG_SPEC = re.compile(r"^[a-z0-9][a-z0-9+.\-]*=[A-Za-z0-9.+~:\-]+$")
+
+
+def cmd_stage(specs):
+    """Name exactly what the next boot installs. Only well-formed name=version specs."""
+    specs = sorted({s for s in specs if _PKG_SPEC.match(s)})
+    if not specs:
+        try:
+            os.remove(STAGE)
+        except OSError:
+            pass
+        print(json.dumps({"staged": 0}))
+        return 0
+    _write(STAGE, {"packages": specs, "staged_at": _now()})
+    print(json.dumps({"staged": len(specs)}))
+    return 0
+
+
+def _dpkg_interrupted():
+    r = subprocess.run(["dpkg", "--audit"], capture_output=True, text=True, timeout=120)
+    return bool((r.stdout or "").strip())
+
+
+def _healthy():
+    """What the kiosk cannot live without, checked after every install."""
+    checks = []
+    for argv in (["xfreerdp3", "--version"], ["python3", "-c", "import json, ssl"]):
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+            checks.append(r.returncode == 0)
+        except Exception:
+            checks.append(False)
+    return all(checks) and not _dpkg_interrupted()
+
+
+def _say(msg):
+    """On the boot splash when there is one, so a longer boot explains itself."""
+    try:
+        subprocess.run(["plymouth", "display-message", "--text=" + msg], capture_output=True, timeout=5)
+    except Exception:
+        pass
+    print(msg, file=sys.stderr)
+
+
+def cmd_apply():
+    """Boot time, before the kiosk. Fast no-op when nothing is staged."""
+    if os.path.exists("/run/live/medium"):
+        return 0
+    repaired = False
+    try:
+        if _dpkg_interrupted():
+            # A power cut during an earlier install. Finish it before anything else.
+            _say("Finishing an interrupted security update…")
+            subprocess.run(["dpkg", "--configure", "-a"], capture_output=True, text=True, timeout=APT_TIMEOUT,
+                           env=dict(os.environ, DEBIAN_FRONTEND="noninteractive"))
+            repaired = True
+    except Exception:
+        pass
+    stage = _read(STAGE)
+    if not stage or not stage.get("packages"):
+        if repaired:
+            _write(RESULT, {"applied_at": _now(), "result": "ok" if _healthy() else "failed",
+                            "installed": [], "error": None, "repaired": True, "reported": False})
+        return 0
+    pkgs = stage["packages"]
+    _say("Installing security updates — this can take a few minutes…")
+    res = {"applied_at": _now(), "installed": [], "error": None, "repaired": repaired, "reported": False}
+    try:
+        ensure_sources()
+        r = apt(["-y", "-q", "--no-download", "install"] + pkgs)
+        if r.returncode != 0:
+            raise RuntimeError("apt install: " + _err(r))
+        res["installed"] = pkgs
+        res["result"] = "ok" if _healthy() else "failed"
+        if res["result"] != "ok":
+            res["error"] = "installed, but the post-install check failed (FreeRDP / Python / dpkg)"
+    except Exception as e:
+        res["result"] = "failed"
+        res["error"] = str(e)[:300]
+    # Staged work is done either way: a failure is reported, not retried at every boot.
+    try:
+        os.remove(STAGE)
+    except OSError:
+        pass
+    needs_reboot = res["result"] == "ok" and any(REBOOT_PKGS.match(p.split("=")[0]) for p in res["installed"])
+    res["rebooted"] = needs_reboot and not NO_REBOOT
+    _write(RESULT, res)
+    if res["rebooted"]:
+        # Once: the stage is gone, so the next boot goes straight to the kiosk on the
+        # new kernel — and the agent's report then proves that kernel boots.
+        _say("Security updates installed — restarting once…")
+        subprocess.run(["systemctl", "reboot"], capture_output=True, timeout=30)
+    return 0
+
+
+def cmd_status():
+    st = _read(STATE, {}) or {}
+    stage = _read(STAGE) or {}
+    res = _read(RESULT) or {}
+    print(json.dumps({
+        "checked_at": st.get("checked_at"), "downloaded_at": st.get("downloaded_at"),
+        "pending": len(st.get("pending") or []), "error": st.get("error"),
+        "staged": len(stage.get("packages") or []),
+        "applied_at": res.get("applied_at"), "result": res.get("result"),
+        "installed": len(res.get("installed") or []), "apply_error": res.get("error"),
+    }))
+    return 0
+
+
+def main(argv):
+    if not argv:
+        print("usage: thinclient-ospatch check|download|stage PKG=VER...|apply|status", file=sys.stderr)
+        return 2
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "check":
+        return cmd_check()
+    if cmd == "download":
+        return cmd_download()
+    if cmd == "stage":
+        return cmd_stage(rest)
+    if cmd == "apply":
+        return cmd_apply()
+    if cmd == "status":
+        return cmd_status()
+    print("unknown command: %s" % cmd, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

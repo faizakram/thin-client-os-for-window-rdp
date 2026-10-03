@@ -21,7 +21,7 @@
 #    thinclient-agent verify <token_file> <pubkey> [device_id] [now] [grace]
 #                                                     # verify+classify (testing)
 # =============================================================================
-import base64, datetime, glob, hashlib, json, math, os, re, shutil, subprocess, sys, tempfile, threading, time
+import base64, datetime, glob, hashlib, json, math, os, re, shutil, struct, subprocess, sys, tempfile, threading, time
 
 GRACE_DEFAULT = 3 * 86400            # 3 days after exp before hard-lock
 # Shared runtime signals (created world-writable at boot via tmpfiles.d):
@@ -5152,6 +5152,14 @@ def _apply_device_protections(pol):
     except Exception as e:
         print("agent: memory hardening failed: %s" % e, file=sys.stderr)
     try:
+        apply_mem_extras(bool(pol.get("mem_harden")))
+    except Exception as e:
+        print("agent: memory hardening extras failed: %s" % e, file=sys.stderr)
+    try:
+        apply_os_updates(bool(pol.get("os_updates")))
+    except Exception as e:
+        print("agent: OS security updates setup failed: %s" % e, file=sys.stderr)
+    try:
         apply_usb_storage_block(bool(pol.get("usb_storage_block")))
     except Exception as e:
         print("agent: USB storage block failed: %s" % e, file=sys.stderr)
@@ -5176,7 +5184,7 @@ def _security_report():
     the poll goes on. A reporting bug must never cost a device its link to the manager."""
     rep = {}
     for part in (lambda: dict(_SECURITY_FACTS), _hardware_facts, _lockout_report, _mem_harden_report,
-                 _admin_password_report):
+                 _admin_password_report, _mem_extras_report, _os_updates_report):
         try:
             rep.update(part() or {})
         except Exception as e:
@@ -5777,6 +5785,266 @@ def _mem_harden_report():
     return {"mem_harden": {"applied": applied, "running": running}}
 
 
+# --- Memory hardening extras (security plan A3, part 2) ------------------------------
+# On the same switch as the rest of memory hardening, so nothing changes until a tenant
+# turns it on.
+#   MOR  (TCG Platform Reset Attack Mitigation) — a UEFI flag asking the FIRMWARE to wipe
+#        RAM before anything else boots. Defeats "pull the plug, boot a forensic USB stick,
+#        read what was in memory". Written only where the firmware offers the variable,
+#        re-asserted at every agent start (some firmware clears it after wiping).
+#   Shutdown wipe — at every clean shutdown, the page cache (recordings and chat files
+#        the kernel kept in RAM) is dropped and compressed swap is emptied; with
+#        init_on_free=1 both are zeroed on release, so a powered-off machine holds none
+#        of it.
+#   Thunderbolt — REPORTED, not enforced: Linux can only hold a Thunderbolt device for
+#        approval when the BIOS security level asks it to; otherwise the IOMMU (part 1)
+#        is what keeps a port from reading memory. Neither tested model has Thunderbolt.
+EFIVARS = os.environ.get("TC_EFIVARS", "/sys/firmware/efi/efivars")
+MOR_VAR = "MemoryOverwriteRequestControl-e20939be-32d4-41be-a150-897f85d49829"
+MEMWIPE_UNIT = os.environ.get("TC_MEMWIPE_UNIT", "/etc/systemd/system/thinclient-memwipe.service")
+_MEMWIPE_BODY = """[Unit]
+Description=Thin Client: clear cached file data from RAM at shutdown (memory hardening)
+DefaultDependencies=no
+After=local-fs.target
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+# Runs at shutdown: drop cached file contents and empty compressed swap. With
+# init_on_free=1 every page released here is zeroed on the way out.
+ExecStop=/bin/sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches; timeout 30 swapoff -a || true'
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target
+"""
+_MEM_EXTRAS = {"mor": None, "memwipe": None}
+
+
+def _mor_path():
+    return os.path.join(EFIVARS, MOR_VAR)
+
+
+def _mor_value():
+    """1 / 0 as the firmware holds it, or None if this firmware has no MOR variable."""
+    try:
+        with open(_mor_path(), "rb") as f:
+            data = f.read()
+        return data[4] & 1 if len(data) >= 5 else None
+    except OSError:
+        return None
+
+
+def apply_mor(enable):
+    """Returns "set" / "cleared" / "unsupported" / "failed"."""
+    cur = _mor_value()
+    if cur is None:
+        return "unsupported"
+    want = 1 if enable else 0
+    if cur == want:
+        return "set" if want else "cleared"
+    path = _mor_path()
+    # efivarfs marks variables immutable; lift that for the one write, then restore it.
+    subprocess.run(["chattr", "-i", path], capture_output=True, timeout=10)
+    try:
+        with open(path, "wb") as f:
+            # 4 bytes of attributes (non-volatile | boot-service | runtime) + the value.
+            f.write(struct.pack("<I", 0x7) + bytes([want]))
+    except OSError as e:
+        print("agent: MOR write failed: %s" % e, file=sys.stderr)
+        return "failed"
+    finally:
+        subprocess.run(["chattr", "+i", path], capture_output=True, timeout=10)
+    return ("set" if want else "cleared") if _mor_value() == want else "failed"
+
+
+def apply_memwipe_unit(enable):
+    """Install (and enable) or remove the shutdown wipe. Returns its state."""
+    try:
+        cur = open(MEMWIPE_UNIT).read()
+    except OSError:
+        cur = None
+    if enable:
+        if cur != _MEMWIPE_BODY:
+            os.makedirs(os.path.dirname(MEMWIPE_UNIT), exist_ok=True)
+            with open(MEMWIPE_UNIT, "w") as f:
+                f.write(_MEMWIPE_BODY)
+            subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=25)
+        subprocess.run(["systemctl", "enable", "--now", os.path.basename(MEMWIPE_UNIT)],
+                       capture_output=True, timeout=25)
+        return "on"
+    if cur is not None:
+        # disable, NOT --now: stopping it would run the shutdown wipe (emptying swap)
+        # on a live machine mid-shift. It simply never runs again after this boot.
+        subprocess.run(["systemctl", "disable", os.path.basename(MEMWIPE_UNIT)],
+                       capture_output=True, timeout=25)
+        try:
+            os.remove(MEMWIPE_UNIT)
+        except OSError:
+            pass
+        subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=25)
+    return "off"
+
+
+def apply_mem_extras(enable):
+    if os.path.exists("/run/live/medium"):
+        return
+    _MEM_EXTRAS["mor"] = apply_mor(enable)
+    _MEM_EXTRAS["memwipe"] = apply_memwipe_unit(enable)
+
+
+def thunderbolt_facts(root=""):
+    """{'present': bool, 'security': 'none'|'user'|'secure'|'dponly'|None, 'dma_protection': bool|None}"""
+    doms = sorted(glob.glob(root + "/sys/bus/thunderbolt/devices/domain*"))
+    if not doms:
+        return {"present": False}
+    sec = _read(doms[0] + "/security").strip() or None
+    prot = _read(doms[0] + "/iommu_dma_protection").strip()
+    return {"present": True, "security": sec, "dma_protection": (prot == "1") if prot else None}
+
+
+def _mem_extras_report():
+    return {"mem_extras": {"mor": _MEM_EXTRAS["mor"] if _MEM_EXTRAS["mor"] is not None
+                                  else ("unsupported" if _mor_value() is None else ("set" if _mor_value() else "cleared")),
+                           "memwipe": _MEM_EXTRAS["memwipe"] or ("on" if os.path.exists(MEMWIPE_UNIT) else "off"),
+                           "thunderbolt": thunderbolt_facts()}}
+
+
+# --- OS security updates (security plan G2) -------------------------------------------
+# thinclient-ospatch does the apt work; this decides WHEN, and asks the manager WHAT:
+# a "patch canary" device installs every pending security update; every other device
+# installs only the versions a canary has already installed and come back healthy from.
+# Checked every few hours in the background — never on the 5-second poll.
+OSPATCH = os.environ.get("TC_OSPATCH_BIN", "/opt/thinclient/bin/thinclient-ospatch")
+OSPATCH_DIR = os.environ.get("TC_OSPATCH_DIR", "/var/lib/thinclient/os-update")
+OSPATCH_UNIT = os.environ.get("TC_OSPATCH_UNIT", "/etc/systemd/system/thinclient-os-patch.service")
+OSPATCH_EVERY = 6 * 3600
+_OSPATCH_UNIT_BODY = """[Unit]
+Description=Thin Client: install staged OS security updates before the kiosk starts
+DefaultDependencies=no
+After=local-fs.target systemd-remount-fs.service
+Before=display-manager.service lightdm.service thinclient-x.service
+ConditionPathExists=!/run/live/medium
+
+[Service]
+Type=oneshot
+ExecStart=/opt/thinclient/bin/thinclient-ospatch apply
+TimeoutStartSec=1500
+
+[Install]
+WantedBy=multi-user.target
+"""
+_OSPATCH_ON = [False]
+
+
+def apply_os_updates(enable):
+    """Install or remove the boot-time unit. Off also discards anything staged, so
+    switching it off means nothing more is installed — not even at the next boot."""
+    _OSPATCH_ON[0] = bool(enable) and not os.path.exists("/run/live/medium")
+    try:
+        cur = open(OSPATCH_UNIT).read()
+    except OSError:
+        cur = None
+    if _OSPATCH_ON[0]:
+        if cur != _OSPATCH_UNIT_BODY:
+            os.makedirs(os.path.dirname(OSPATCH_UNIT), exist_ok=True)
+            with open(OSPATCH_UNIT, "w") as f:
+                f.write(_OSPATCH_UNIT_BODY)
+            subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=25)
+            subprocess.run(["systemctl", "enable", os.path.basename(OSPATCH_UNIT)],
+                           capture_output=True, timeout=25)
+        return
+    try:
+        os.remove(os.path.join(OSPATCH_DIR, "stage.json"))
+    except OSError:
+        pass
+    if cur is not None:
+        subprocess.run(["systemctl", "disable", os.path.basename(OSPATCH_UNIT)], capture_output=True, timeout=25)
+        try:
+            os.remove(OSPATCH_UNIT)
+        except OSError:
+            pass
+        subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=25)
+
+
+def _ospatch(*args, timeout=1800):
+    r = subprocess.run([OSPATCH] + list(args), capture_output=True, text=True, timeout=timeout)
+    try:
+        return json.loads((r.stdout or "").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {"error": (r.stderr or "").strip()[-300:] or "rc=%s" % r.returncode}
+
+
+def _ospatch_creds():
+    url, code, secret = conf_get("CONTROL_URL"), conf_get("ENROLL_CODE"), conf_get("DEVICE_SECRET")
+    if not (url and code and secret):
+        return None, None
+    return url.rstrip("/"), {"enroll_code": code, "secret": secret, "hwid": device_id()}
+
+
+def os_patch_cycle():
+    """One round: report the last boot's install, check, download, ask, stage."""
+    base, creds = _ospatch_creds()
+    if not base:
+        return
+    result_path = os.path.join(OSPATCH_DIR, "result.json")
+    res = _read_json(result_path)
+    if res and not res.get("reported"):
+        sent = _curl_json("%s/api/agent/os-patch" % base, dict(creds, applied={
+            k: res.get(k) for k in ("applied_at", "result", "installed", "error", "repaired", "rebooted")}))
+        if sent is not None:
+            res["reported"] = True
+            try:
+                with open(result_path + ".tmp", "w") as f:
+                    json.dump(res, f)
+                os.replace(result_path + ".tmp", result_path)
+            except OSError:
+                pass
+    if not _OSPATCH_ON[0]:
+        return
+    chk = _ospatch("check")
+    pending = [p for p in (chk.get("pending") or []) if isinstance(p, str)]
+    if chk.get("error") or not pending:
+        return
+    if _ospatch("download").get("error"):
+        return
+    ans = _curl_json("%s/api/agent/os-patch" % base, dict(creds, pending=pending))
+    if not ans:
+        return
+    allow = [p for p in (ans.get("allow") or []) if p in pending]
+    _ospatch("stage", *allow, timeout=60)
+    if allow:
+        print("agent: %d OS security update(s) staged for the next restart" % len(allow), file=sys.stderr)
+
+
+def _os_patch_loop():
+    time.sleep(15 * 60)               # never compete with a device's first minutes
+    while True:
+        try:
+            os_patch_cycle()
+        except Exception as e:
+            print("agent: OS security update cycle failed: %s" % e, file=sys.stderr)
+        time.sleep(OSPATCH_EVERY)
+
+
+def _os_updates_report():
+    st = _read_json(os.path.join(OSPATCH_DIR, "state.json"))
+    stage = _read_json(os.path.join(OSPATCH_DIR, "stage.json"))
+    res = _read_json(os.path.join(OSPATCH_DIR, "result.json"))
+    if not (_OSPATCH_ON[0] or st or res):
+        return {}
+    return {"os_updates": {
+        "enabled": _OSPATCH_ON[0],
+        "checked_at": st.get("checked_at"), "pending": len(st.get("pending") or []),
+        "check_error": st.get("error"), "staged": len(stage.get("packages") or []),
+        "applied_at": res.get("applied_at"), "result": res.get("result"),
+        "installed": len(res.get("installed") or []), "apply_error": res.get("error"),
+    }}
+
+
 def _lockout_report():
     home = _kiosk_home()
     m = _read_json(os.path.join(home, ".thinclient-lock.meta.json"))
@@ -6261,6 +6529,7 @@ def cmd_daemon() -> int:
         print("agent: hostname update skipped: %s" % e, file=sys.stderr)
     # What this device's hardware can do for security, reported to the manager.
     threading.Thread(target=_refresh_hardware_facts, daemon=True).start()
+    threading.Thread(target=_os_patch_loop, daemon=True).start()
     while True:
         now = time.time()
         if now - last_enforce >= enforce_every:
